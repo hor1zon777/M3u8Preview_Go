@@ -256,7 +256,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	activitySvc := service.NewActivityService(db)
 	thumbQueue := service.NewThumbnailQueue(cfg.ThumbnailConcurrency, nil)
 	posterDL := service.NewPosterDownloader(cfg.UploadsDir, cfg.PosterConcurrency)
-	adminH := handler.NewAdminHandler(adminSvc, activitySvc, proxySvc, thumbQueue, posterDL, newPosterStatsDB(db))
+	adminH := handler.NewAdminHandler(adminSvc, activitySvc, proxySvc, thumbQueue, posterDL, newPosterStatsDB(db, cfg.UploadsDir))
 
 	// 注入真正的 poster resolver 到 media service（替换占位实现）
 	mediaSvc.SetPosterResolver(posterDL)

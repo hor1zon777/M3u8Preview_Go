@@ -25,7 +25,17 @@ type AdminHandler struct {
 // DashboardDB 供 media count / poster stats 使用的最小 DB 访问接口（避免耦合具体 GORM 类型）。
 // 由注入方提供。
 type DashboardDB interface {
-	CountExternalPosters() (int64, int64, int64) // external, local, total
+	CountExternalPosters() (int64, int64, int64) // external, local, total（向后兼容旧签名）
+	PosterStats() PosterStats                    // 前端 /admin/posters/stats 期望的完整结构
+}
+
+// PosterStats 返回给 /admin/posters/stats 的 JSON 结构，与前端 TypeScript 类型对齐。
+type PosterStats struct {
+	Total          int64 `json:"total"`
+	External       int64 `json:"external"`
+	Local          int64 `json:"local"`
+	Missing        int64 `json:"missing"`
+	TotalSizeBytes int64 `json:"totalSizeBytes"`
 }
 
 // NewAdminHandler 构造。thumb / poster / db 可以为 nil（对应端点返回占位结果）。
@@ -284,15 +294,10 @@ func (h *AdminHandler) posterStatus(c *gin.Context) {
 
 func (h *AdminHandler) posterStats(c *gin.Context) {
 	if h.db == nil {
-		c.JSON(http.StatusOK, dto.OK(gin.H{"external": 0, "local": 0, "total": 0}))
+		c.JSON(http.StatusOK, dto.OK(PosterStats{}))
 		return
 	}
-	external, local, total := h.db.CountExternalPosters()
-	c.JSON(http.StatusOK, dto.OK(gin.H{
-		"external": external,
-		"local":    local,
-		"total":    total,
-	}))
+	c.JSON(http.StatusOK, dto.OK(h.db.PosterStats()))
 }
 
 func (h *AdminHandler) retryPosters(c *gin.Context) {
