@@ -1,0 +1,14 @@
+# Node / 构建产物
+node_modules/
+dist/
+dist-image/
+*.tsbuildinfo
+
+# Lock 文件按需保留（默认留 npm 的 package-lock.json）
+# pnpm-lock.yaml
+# yarn.lock
+
+# 本地环境变量
+.env
+.env.local
+.env.*.local

@@ -1,0 +1,42 @@
+# 构建产物 & 编辑器
+/server
+/server.exe
+*.exe
+*.test
+*.out
+
+# air 热重载（本机开发用）
+/tmp/
+build-errors.log
+
+# 运行期数据
+/data/*.db
+/data/*.db-journal
+/data/*.db-wal
+/data/*.db-shm
+/uploads/posters/*
+/uploads/thumbnails/*
+!/uploads/posters/.gitkeep
+!/uploads/thumbnails/.gitkeep
+
+# 环境变量
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.log
+
+# 依赖
+vendor/
+
+# 前端 workspace（web/）
+web/**/node_modules/
+web/**/dist/
+web/**/dist-image/
+web/**/*.tsbuildinfo
+web/.env
+web/.env.local
+web/.env.*.local
+web/package-lock.json

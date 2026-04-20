@@ -1,0 +1,23 @@
+{
+  "name": "m3u8-preview-go-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Frontend workspace for m3u8-preview-go. 与 Go 后端通过 /api/v1 反代通讯。",
+  "workspaces": [
+    "shared",
+    "client"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w client",
+    "build": "npm run build -w shared && npm run build -w client",
+    "build:shared": "npm run build -w shared",
+    "build:client": "npm run build -w client",
+    "preview": "npm run preview -w client",
+    "dev:all": "npm run build:shared && concurrently -n api,web -c cyan,magenta --kill-others-on-fail \"cd .. && go run ./cmd/server\" \"npm run dev -w client\"",
+    "dev:all:hot": "npm run build:shared && concurrently -n api,web -c cyan,magenta --kill-others-on-fail \"cd .. && air\" \"npm run dev -w client\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,51 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: m3u8preview-go:latest
+    container_name: m3u8preview-go-app
+    network_mode: host
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=file:/data/m3u8preview.db
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - PROXY_SECRET=${PROXY_SECRET}
+      - ADMIN_SEED_PASSWORD=${ADMIN_SEED_PASSWORD:-Admin123}
+      - DEMO_SEED_PASSWORD=${DEMO_SEED_PASSWORD:-Demo1234}
+      - PORT=3000
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost}
+      - THUMBNAIL_CONCURRENCY=${THUMBNAIL_CONCURRENCY:-5}
+      - POSTER_MIGRATION_CONCURRENCY=${POSTER_MIGRATION_CONCURRENCY:-2}
+      - TRUST_CDN=${TRUST_CDN:-true}
+    volumes:
+      - db-data:/data
+      - uploads:/app/uploads
+      # 前端构建产物：entrypoint 会把 /app/web/dist-image 每次启动同步到该 volume，
+      # nginx 服务再只读挂到 /usr/share/nginx/html。
+      - client-dist:/app/web/dist
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: m3u8preview-go-nginx
+    network_mode: host
+    environment:
+      - NGINX_PORT=${DOCKER_PORT:-80}
+    volumes:
+      # 本项目自带 nginx.conf（upstream 127.0.0.1:3000 → app 容器）
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+      # 前端静态资源：由 app 容器启动时同步到 client-dist 这个命名卷
+      - client-dist:/usr/share/nginx/html:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  db-data:
+    driver: local
+  uploads:
+    driver: local
+  client-dist:
+    driver: local

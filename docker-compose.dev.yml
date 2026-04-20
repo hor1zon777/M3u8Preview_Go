@@ -1,0 +1,40 @@
+# 仅用于本地开发：启动 Go 后端 + SQLite，不带 nginx / 前端静态资源。
+# 前端建议通过 Vite 的 `packages/client` dev server + proxy 走到 :3000。
+#
+# 用法：
+#   cp .env.example .env   # 然后按需改密钥
+#   docker compose -f docker-compose.dev.yml up --build
+#
+# 退出：
+#   docker compose -f docker-compose.dev.yml down
+#
+# 数据持久化：
+#   data/ 与 uploads/ 直接 bind-mount 到宿主项目目录，方便在 IDE 里查看 SQLite。
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: m3u8preview-go:dev
+    container_name: m3u8preview-go-dev
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - BIND_ADDRESS=0.0.0.0
+      - DATABASE_URL=file:/data/m3u8preview.db
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-32chars-minimum-xxxxxxxxxx}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET:-dev-jwt-refresh-secret-32chars-xxxxx}
+      - PROXY_SECRET=${PROXY_SECRET:-dev-proxy-secret-32chars-minimum-xxxxx}
+      - ADMIN_SEED_PASSWORD=${ADMIN_SEED_PASSWORD:-Admin123}
+      - DEMO_SEED_PASSWORD=${DEMO_SEED_PASSWORD:-Demo1234}
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:5173}
+      - THUMBNAIL_CONCURRENCY=${THUMBNAIL_CONCURRENCY:-5}
+      - POSTER_MIGRATION_CONCURRENCY=${POSTER_MIGRATION_CONCURRENCY:-2}
+      - TRUST_CDN=${TRUST_CDN:-false}
+    volumes:
+      - ./data:/data
+      - ./uploads:/app/uploads
+    restart: unless-stopped

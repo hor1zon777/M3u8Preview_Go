@@ -1,0 +1,43 @@
+# air 热重载配置（本机开发用）
+# 使用方式：
+#   1) go install github.com/air-verse/air@latest
+#   2) 确保 $GOPATH/bin 或 $GOBIN 在 PATH 中
+#   3) 从项目根目录运行：air
+#      或在 web/ 下：npm run dev:all:hot
+#
+# 参考：https://github.com/air-verse/air
+
+root = "."
+tmp_dir = "tmp"
+testdata_dir = "testdata"
+
+[build]
+  cmd = "go build -o ./tmp/server.exe ./cmd/server"
+  bin = "./tmp/server.exe"
+  delay = 1000
+  exclude_dir = ["tmp", "data", "uploads", "web", "docs", "bin", "vendor", ".git", ".idea", ".vscode"]
+  exclude_regex = ["_test\\.go"]
+  exclude_unchanged = true
+  include_ext = ["go"]
+  include_dir = ["cmd", "internal"]
+  kill_delay = "500ms"
+  stop_on_error = true
+  send_interrupt = true
+  log = "build-errors.log"
+
+[log]
+  time = true
+  main_only = false
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  clean_on_exit = true
+
+[screen]
+  clear_on_rebuild = false
+  keep_scroll = true
