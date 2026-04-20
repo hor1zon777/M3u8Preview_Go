@@ -1,9 +1,6 @@
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: m3u8preview-go:latest
+    image: ghcr.io/hor1zon777/m3u8preview_go:main
     container_name: m3u8preview-go-app
     network_mode: host
     environment:
