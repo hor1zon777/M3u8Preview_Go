@@ -26,6 +26,7 @@ import { ArtistsPage } from './pages/ArtistsPage.js';
 import { CategoriesPage } from './pages/CategoriesPage.js';
 import { CategoryDetailPage } from './pages/CategoryDetailPage.js';
 import { AdminCategoriesPage } from './pages/AdminCategoriesPage.js';
+import { AdminTagsPage } from './pages/AdminTagsPage.js';
 import { AdminUserDetailPage } from './pages/AdminUserDetailPage.js';
 import { AdminActivityPage } from './pages/AdminActivityPage.js';
 import './index.css';
@@ -139,6 +140,7 @@ function AppRoutes() {
         <Route path="/admin/users/:userId" element={<ProtectedRoute requireAdmin><AdminUserDetailPage /></ProtectedRoute>} />
         <Route path="/admin/media" element={<ProtectedRoute requireAdmin><AdminMediaPage /></ProtectedRoute>} />
         <Route path="/admin/categories" element={<ProtectedRoute requireAdmin><AdminCategoriesPage /></ProtectedRoute>} />
+        <Route path="/admin/tags" element={<ProtectedRoute requireAdmin><AdminTagsPage /></ProtectedRoute>} />
         <Route path="/import" element={<ProtectedRoute requireAdmin><ImportPage /></ProtectedRoute>} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

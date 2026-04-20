@@ -6,9 +6,20 @@
 package service
 
 import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+
+	"github.com/hor1zon777/m3u8-preview-go/internal/model"
+	"github.com/hor1zon777/m3u8-preview-go/internal/util"
 )
 
 // ThumbnailTask 队列项。
@@ -97,5 +108,47 @@ func (q *ThumbnailQueue) worker() {
 		case <-time.After(24 * time.Hour):
 			// 防 worker 永久泄漏；实际 stop 会提前退出
 		}
+	}
+}
+
+// NewFFmpegProcessor 返回一个真正的 ffmpeg 缩略图生成 processor。
+// 仅在 media.poster_url 为 NULL 时写入，避免覆盖用户上传的封面。
+func NewFFmpegProcessor(uploadsDir string, db *gorm.DB) func(ThumbnailTask) error {
+	thumbDir := filepath.Join(uploadsDir, "thumbnails")
+	return func(task ThumbnailTask) error {
+		ctx := context.Background()
+
+		duration, err := util.FFProbeDuration(ctx, task.URL)
+		if err != nil {
+			return fmt.Errorf("ffprobe media %s: %w", task.MediaID, err)
+		}
+		if duration < 1 {
+			return fmt.Errorf("media %s duration too short: %.2f", task.MediaID, duration)
+		}
+
+		if err := os.MkdirAll(thumbDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir thumbnails: %w", err)
+		}
+
+		filename := uuid.NewString() + ".webp"
+		outPath := filepath.Join(thumbDir, filename)
+
+		seekSec := util.RandomSeekSec(duration)
+		if err := util.FFmpegThumbnail(ctx, task.URL, seekSec, outPath); err != nil {
+			_ = os.Remove(outPath)
+			return fmt.Errorf("ffmpeg media %s: %w", task.MediaID, err)
+		}
+
+		localURL := "/uploads/thumbnails/" + filename
+		result := db.Model(&model.Media{}).
+			Where("id = ? AND poster_url IS NULL", task.MediaID).
+			Update("poster_url", localURL)
+		if result.Error != nil {
+			_ = os.Remove(outPath)
+			return fmt.Errorf("update db media %s: %w", task.MediaID, result.Error)
+		}
+
+		log.Printf("[thumbnail] generated %s for media %s (seek=%.1fs)", filename, task.MediaID, seekSec)
+		return nil
 	}
 }

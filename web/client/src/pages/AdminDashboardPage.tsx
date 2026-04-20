@@ -45,6 +45,15 @@ export function AdminDashboardPage() {
   const settingsLoaded = !!settings;
   const allowRegistration = settings?.find((s) => s.key === 'allowRegistration')?.value !== 'false';
   const enableRateLimit = settings?.find((s) => s.key === 'enableRateLimit')?.value !== 'false';
+  const siteName = settings?.find((s) => s.key === 'siteName')?.value || '';
+  const [siteNameDraft, setSiteNameDraft] = useState('');
+  const siteNameSynced = useRef(false);
+  useEffect(() => {
+    if (settings && !siteNameSynced.current) {
+      setSiteNameDraft(siteName);
+      siteNameSynced.current = true;
+    }
+  }, [settings, siteName]);
   const DEFAULT_PROXY_EXTENSIONS = '.m3u8,.ts,.m4s,.mp4,.aac,.key,.jpg,.jpeg,.png,.webp';
   const DEFAULT_EXTENSIONS = new Set(DEFAULT_PROXY_EXTENSIONS.split(','));
   const proxyAllowedExtensions = settings?.find((s) => s.key === 'proxyAllowedExtensions')?.value || DEFAULT_PROXY_EXTENSIONS;
@@ -172,6 +181,30 @@ export function AdminDashboardPage() {
           <h3 className="text-white font-semibold">系统设置</h3>
         </div>
         <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <p className="text-white text-sm">站点名称</p>
+              <p className="text-emby-text-muted text-xs mt-0.5">自定义显示的站点名称</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={siteNameDraft}
+                onChange={(e) => setSiteNameDraft(e.target.value)}
+                placeholder="M3u8 Preview"
+                className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-48"
+              />
+              {siteNameDraft !== siteName && (
+                <button
+                  onClick={() => updateSettingMutation.mutate({ key: 'siteName', value: siteNameDraft.trim() })}
+                  disabled={updateSettingMutation.isPending}
+                  className="px-3 py-1.5 bg-emby-green text-white text-xs font-medium rounded-md hover:bg-emby-green-dark disabled:opacity-50 transition-colors"
+                >
+                  保存
+                </button>
+              )}
+            </div>
+          </div>
           <div className="flex items-center justify-between">
             <div>
               <p className="text-white text-sm">允许新用户注册</p>

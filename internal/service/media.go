@@ -5,6 +5,8 @@ package service
 import (
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"gorm.io/gorm"
@@ -39,20 +41,21 @@ func (PassthroughPosterResolver) Resolve(in *string) (*string, error) { return i
 
 // MediaService 聚合 media 相关查询与写入。
 type MediaService struct {
-	db     *gorm.DB
-	thumb  ThumbnailEnqueuer
-	poster PosterResolver
+	db         *gorm.DB
+	uploadsDir string
+	thumb      ThumbnailEnqueuer
+	poster     PosterResolver
 }
 
 // NewMediaService 构造。
-func NewMediaService(db *gorm.DB, thumb ThumbnailEnqueuer, poster PosterResolver) *MediaService {
+func NewMediaService(db *gorm.DB, uploadsDir string, thumb ThumbnailEnqueuer, poster PosterResolver) *MediaService {
 	if thumb == nil {
 		thumb = NoopThumbnailEnqueuer{}
 	}
 	if poster == nil {
 		poster = PassthroughPosterResolver{}
 	}
-	return &MediaService{db: db, thumb: thumb, poster: poster}
+	return &MediaService{db: db, uploadsDir: uploadsDir, thumb: thumb, poster: poster}
 }
 
 // SetPosterResolver 替换 poster resolver（app 启动阶段注入真实实现）。
@@ -281,7 +284,12 @@ func (s *MediaService) Delete(id string) error {
 	if err := s.db.Delete(&existing).Error; err != nil {
 		return middleware.WrapAppError(http.StatusInternalServerError, "删除失败", err)
 	}
-	// 阶段 I 会在这里异步清理本地缩略图文件
+	if existing.PosterURL != nil && strings.HasPrefix(*existing.PosterURL, "/uploads/") {
+		go func(relPath, uploadsDir string) {
+			abs := filepath.Join(uploadsDir, strings.TrimPrefix(relPath, "/uploads/"))
+			_ = os.Remove(abs)
+		}(*existing.PosterURL, s.uploadsDir)
+	}
 	return nil
 }
 

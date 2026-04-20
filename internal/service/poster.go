@@ -32,8 +32,9 @@ var posterAllowedExt = map[string]bool{
 
 // PosterDownloader 负责 URL → 本地文件；作为 MediaService.PosterResolver 使用。
 type PosterDownloader struct {
-	postersDir string
-	bucket     *util.TokenBucket
+	postersDir   string
+	bucket       *util.TokenBucket
+	onDownloaded func(mediaID, localPath string) // 异步下载完成后的回调（更新 DB）
 
 	// 队列 + 统计
 	jobs      chan posterJob
@@ -51,16 +52,18 @@ type posterJob struct {
 }
 
 // NewPosterDownloader 构造；postersDir 不存在时会按需创建。
+// onDownloaded 在异步 worker 成功下载后被调用，用于更新 DB。
 // 速率：100 req/min ≈ 1.67 req/s。
-func NewPosterDownloader(uploadsDir string, concurrency int) *PosterDownloader {
+func NewPosterDownloader(uploadsDir string, concurrency int, onDownloaded func(mediaID, localPath string)) *PosterDownloader {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 	d := &PosterDownloader{
-		postersDir: filepath.Join(uploadsDir, "posters"),
-		bucket:     util.NewTokenBucket(100, 100.0/60.0),
-		jobs:       make(chan posterJob, 1024),
-		stop:       make(chan struct{}),
+		postersDir:   filepath.Join(uploadsDir, "posters"),
+		bucket:       util.NewTokenBucket(100, 100.0/60.0),
+		onDownloaded: onDownloaded,
+		jobs:         make(chan posterJob, 1024),
+		stop:         make(chan struct{}),
 	}
 	for i := 0; i < concurrency; i++ {
 		go d.worker()
@@ -180,11 +183,14 @@ func (d *PosterDownloader) worker() {
 			}
 			d.active.Add(1)
 			d.queued.Add(-1)
-			_, err := d.downloadOnce(job.URL)
+			localPath, err := d.downloadOnce(job.URL)
 			d.active.Add(-1)
 			if err != nil {
 				d.failed.Add(1)
 			} else {
+				if d.onDownloaded != nil {
+					d.onDownloaded(job.MediaID, localPath)
+				}
 				d.processed.Add(1)
 			}
 		}

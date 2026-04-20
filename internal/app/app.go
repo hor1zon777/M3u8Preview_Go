@@ -16,6 +16,7 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/config"
 	"github.com/hor1zon777/m3u8-preview-go/internal/handler"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
+	"github.com/hor1zon777/m3u8-preview-go/internal/model"
 	"github.com/hor1zon777/m3u8-preview-go/internal/service"
 	"github.com/hor1zon777/m3u8-preview-go/internal/util"
 )
@@ -133,9 +134,15 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	authAuthed.Use(middleware.Authenticate(authDeps))
 	authH.RegisterAuthed(authAuthed)
 
+	// ---- 队列服务（需要在 media/admin handler 之前初始化）----
+	thumbQueue := service.NewThumbnailQueue(cfg.ThumbnailConcurrency, service.NewFFmpegProcessor(cfg.UploadsDir, db))
+	posterDL := service.NewPosterDownloader(cfg.UploadsDir, cfg.PosterConcurrency, func(mediaID, localPath string) {
+		db.Model(&model.Media{}).Where("id = ?", mediaID).Update("poster_url", localPath)
+	})
+
 	// ---- 核心业务模块（阶段 F）----
-	mediaSvc := service.NewMediaService(db, nil, nil)
-	mediaH := handler.NewMediaHandler(mediaSvc)
+	mediaSvc := service.NewMediaService(db, cfg.UploadsDir, nil, nil)
+	mediaH := handler.NewMediaHandler(mediaSvc, thumbQueue)
 	categorySvc := service.NewCategoryService(db)
 	categoryH := handler.NewCategoryHandler(categorySvc)
 	tagSvc := service.NewTagService(db)
@@ -263,9 +270,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	// ---- Admin 模块（阶段 I-1 + I-3 注入队列）----
 	adminSvc := service.NewAdminService(db)
 	activitySvc := service.NewActivityService(db)
-	thumbQueue := service.NewThumbnailQueue(cfg.ThumbnailConcurrency, nil)
-	posterDL := service.NewPosterDownloader(cfg.UploadsDir, cfg.PosterConcurrency)
-	adminH := handler.NewAdminHandler(adminSvc, activitySvc, proxySvc, thumbQueue, posterDL, newPosterStatsDB(db, cfg.UploadsDir), deps.RateLimitCache)
+	adminH := handler.NewAdminHandler(adminSvc, activitySvc, proxySvc, thumbQueue, posterDL, watchSvc, newPosterStatsDB(db, cfg.UploadsDir), deps.RateLimitCache)
 
 	// 注入真正的 poster resolver 到 media service（替换占位实现）
 	mediaSvc.SetPosterResolver(posterDL)

@@ -337,6 +337,40 @@ func (s *AdminService) BatchUpdateCategory(ids []string, categoryID *string) (dt
 
 // ---- helpers ----
 
+// MediaStub 批量操作查询结果的轻量结构。
+type MediaStub struct {
+	ID  string
+	URL string
+}
+
+// MediaWithoutPoster 查找没有封面的 ACTIVE 媒体（用于批量缩略图生成）。
+func (s *AdminService) MediaWithoutPoster(limit int) ([]MediaStub, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 500
+	}
+	var rows []MediaStub
+	err := s.db.Model(&model.Media{}).
+		Select("id, m3u8_url AS url").
+		Where("poster_url IS NULL AND status = ?", model.MediaStatusActive).
+		Limit(limit).
+		Scan(&rows).Error
+	return rows, err
+}
+
+// MediaWithExternalPoster 查找封面仍为外部 URL 的 ACTIVE 媒体（用于海报迁移）。
+func (s *AdminService) MediaWithExternalPoster(limit int) ([]MediaStub, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 500
+	}
+	var rows []MediaStub
+	err := s.db.Model(&model.Media{}).
+		Select("id, poster_url AS url").
+		Where("(poster_url LIKE 'http://%' OR poster_url LIKE 'https://%') AND status = ?", model.MediaStatusActive).
+		Limit(limit).
+		Scan(&rows).Error
+	return rows, err
+}
+
 func countGroup(db *gorm.DB, model any, col string, ids []string) map[string]int64 {
 	out := map[string]int64{}
 	if len(ids) == 0 {

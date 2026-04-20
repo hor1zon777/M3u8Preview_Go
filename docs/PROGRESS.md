@@ -172,7 +172,7 @@
 
 **风险与后续：**
 
-- 当前 `PosterResolver` / `ThumbnailEnqueuer` 仍是 no-op stub；阶段 I 会替换为真正的下载与 ffmpeg 队列
+- 当前 `PosterResolver` / `ThumbnailEnqueuer` 已替换为真正的下载与 ffmpeg 队列（阶段 K 完成）
 - execute 单次上限 1000 条，超限返回 400（对齐 TS H7）
 - xlsx magic bytes 校验拦截伪装 zip（对齐 importController.ts 的 `validateFileMagic`）
 
@@ -229,7 +229,7 @@
 - `internal/service/thumbnail.go` — `ThumbnailQueue(concurrency=5)`：bounded channel + 去重 enqueuedIDs + active/queued/processed/failed 计数
 - `internal/service/poster.go` — `PosterDownloader(concurrency=2)`：`util.TokenBucket(100 req/min)` + `util.SafeFetch` + 5MB 上限 + 扩展名白名单 + `fourhoi.com`/`surrit.com` 注入 `Referer: https://missav.ws`；作为 `MediaService.PosterResolver` 注入（真实下载取代 passthrough）
 - `internal/app/admin_adapters.go` — `posterStatsDB` 适配器，按 `poster_url` 是否 `http(s)://` 前缀统计 external / local / total
-- `handler/admin.go` 的 thumbnail/poster 端点全部接上真实队列统计（生成接口目前仅入队；实际 ffmpeg 生成逻辑在后续阶段按需接入）
+- `handler/admin.go` 的 thumbnail/poster 端点全部接上真实队列统计与批量扫库入队逻辑（阶段 K 完成实际 ffmpeg 生成与 DB 更新）
 
 **前端 API 覆盖：**
 
@@ -376,3 +376,123 @@
 | I. Admin/备份/缩略图 | ✅ | 2026-04-20 |
 | J. Docker/文档 | ✅ | 2026-04-20 |
 | J+. 前端一体化（web/ + nginx.conf 内置） | ✅ | 2026-04-20 |
+| K. 未落地功能全面实现 | ✅ | 2026-04-20 |
+| L. CI/CD（GitHub Actions 自动构建） | ✅ | 2026-04-20 |
+
+---
+
+## 阶段 K：未落地功能全面实现（已完成 — 2026-04-20）
+
+本阶段将此前标记为 501 / stub / no-op 的 8 个后端功能和 3 个前端缺失功能全部落地。
+
+### K-1 ffmpeg 工具层
+
+- **新建 `internal/util/ffmpeg.go`**
+  - `FFProbeDuration(ctx, m3u8URL)` — 调用 `ffprobe -v error -show_entries format=duration -of csv=p=0` 获取时长
+  - `FFmpegThumbnail(ctx, m3u8URL, seekSec, outPath)` — `ffmpeg -ss <seek> -i <url> -frames:v 1 -vf scale=480:-1 -c:v libwebp -q:v 75`，超 30KB 降质重编码（q:v 50）
+  - `RandomSeekSec(duration)` — 返回 10%~40% 之间的随机位置
+  - 全部使用 `exec.CommandContext` 确保超时可控
+
+### K-2 PosterDownloader Bug 修复
+
+- **修改 `internal/service/poster.go`**
+  - `PosterDownloader` 新增 `onDownloaded func(mediaID, localPath string)` 回调字段
+  - `NewPosterDownloader` 签名增加 `onDownloaded` 参数
+  - **修复核心 bug**：worker 第 183 行 `_, err := d.downloadOnce(job.URL)` → `localPath, err := d.downloadOnce(job.URL)` + 成功后调用 `d.onDownloaded(job.MediaID, localPath)`
+  - `app.go` 注入回调：`func(mediaID, localPath string) { db.Model(&model.Media{}).Where("id=?", mediaID).Update("poster_url", localPath) }`
+
+### K-3 Media Delete 文件清理
+
+- **修改 `internal/service/media.go`**
+  - `MediaService` 新增 `uploadsDir string` 字段，`NewMediaService` 签名增加 `uploadsDir`
+  - `Delete()` 删除 DB 记录后，如果 `poster_url` 以 `/uploads/` 开头，异步 goroutine 删除物理文件
+
+### K-4 Thumbnail 真实 ffmpeg 实现
+
+- **修改 `internal/service/thumbnail.go`**
+  - 新建 `NewFFmpegProcessor(uploadsDir, db)` 工厂函数：
+    1. `ffprobe` 获取时长
+    2. `RandomSeekSec` 随机 seek
+    3. `ffmpeg` 截帧保存 `uploads/thumbnails/<uuid>.webp`
+    4. 超 30KB 降质重编码
+    5. `UPDATE media SET poster_url = ? WHERE id = ? AND poster_url IS NULL`（仅无封面时写入）
+  - 错误不 panic，返回 error 让 queue 记 failed 计数
+
+### K-5 app.go 初始化重构
+
+- **修改 `internal/app/app.go`**
+  - `thumbQueue` + `posterDL` 提前到核心业务模块之前创建（`mediaH` 需要 `thumbQueue`）
+  - `NewThumbnailQueue` 传入 `NewFFmpegProcessor` 替代 nil
+  - `NewPosterDownloader` 传入 DB 更新回调
+  - `NewMediaService` 增加 `uploadsDir` 参数
+  - `NewMediaHandler` 增加 `thumbQueue` 参数
+  - `NewAdminHandler` 增加 `watchSvc` 参数
+
+### K-6 Admin 端点落地
+
+- **修改 `internal/service/admin.go`**
+  - `MediaWithoutPoster(limit)` — `WHERE poster_url IS NULL AND status='ACTIVE'`
+  - `MediaWithExternalPoster(limit)` — `WHERE poster_url LIKE 'http%' AND status='ACTIVE'`
+
+- **修改 `internal/handler/admin.go`**
+  - `AdminHandler` 新增 `watch *service.WatchHistoryService` 字段
+  - `userWatchHistory` — 调用 `watchSvc.List(userId, page, limit)`，返回分页数据（替代 501）
+  - `generateThumbnails` — 调用 `adminSvc.MediaWithoutPoster(500)` + 循环 `thumb.Enqueue`，返回 `202 {enqueued: N}`（替代空壳 202）
+  - `migratePosters` — 调用 `adminSvc.MediaWithExternalPoster(500)` + 循环 `poster.EnqueueMigrate`，返回 `202 {enqueued: N}`（替代空壳 202）
+  - `retryPosters` — 同 `migratePosters` 逻辑（替代空壳 202）
+
+- **修改 `internal/handler/media.go`**
+  - `MediaHandler` 新增 `thumb *service.ThumbnailQueue` 字段
+  - `regenerateThumbnail` — 获取 media by ID → `thumb.Enqueue(media.ID, media.M3u8URL)` → 返回 202（替代 501）
+
+### K-7 前端标签管理
+
+- **新建 `web/client/src/services/tagApi.ts`** — 参照 `categoryApi.ts`，调用 `/tags` 端点
+- **新建 `web/client/src/pages/AdminTagsPage.tsx`** — 完整 CRUD 页面（卡片网格 + 搜索 + 内联编辑/删除），紫色主题
+- **修改 `web/client/src/main.tsx`** — 添加 `/admin/tags` 路由
+- **修改 `web/client/src/components/layout/Header.tsx`** — admin 下拉菜单添加"标签管理"入口（Tag icon）
+
+### K-8 前端小功能补全
+
+- **修改 `web/client/src/pages/AdminDashboardPage.tsx`** — 系统设置区新增 `siteName` 文本输入（带"保存"按钮，变化时显示）
+- **修改 `web/client/src/pages/AdminMediaPage.tsx`**
+  - 新增 `filterStatus` 状态变量 + 状态筛选下拉（全部 / ACTIVE / INACTIVE / ERROR）
+  - 状态 badge 新增 ERROR 橙色样式
+
+### 交付验证
+
+- `go build ./...` — 通过
+- `go vet ./...` — 通过，无警告
+- `npm run build:shared && npm run build:client` — TypeScript 编译 + Vite 构建通过
+
+### 涉及文件清单
+
+| 操作 | 文件 |
+|---|---|
+| 新建 | `internal/util/ffmpeg.go` |
+| 新建 | `web/client/src/services/tagApi.ts` |
+| 新建 | `web/client/src/pages/AdminTagsPage.tsx` |
+| 修改 | `internal/service/poster.go` |
+| 修改 | `internal/service/media.go` |
+| 修改 | `internal/service/thumbnail.go` |
+| 修改 | `internal/service/admin.go` |
+| 修改 | `internal/handler/admin.go` |
+| 修改 | `internal/handler/media.go` |
+| 修改 | `internal/app/app.go` |
+| 修改 | `web/client/src/main.tsx` |
+| 修改 | `web/client/src/components/layout/Header.tsx` |
+| 修改 | `web/client/src/pages/AdminDashboardPage.tsx` |
+| 修改 | `web/client/src/pages/AdminMediaPage.tsx` |
+
+---
+
+## 阶段 L：CI/CD（已完成 — 2026-04-20）
+
+- **新建 `.github/workflows/docker-build.yml`** — GitHub Actions 自动构建 Docker 镜像
+  - 触发条件：push 到 `main`、推送 `v*` tag、PR 到 `main`
+  - 推送到 GHCR（`ghcr.io/hor1zon777/m3u8preview_go`）
+  - 使用 Buildx + GitHub Actions 缓存（`cache-from/to: type=gha`）
+  - `docker/metadata-action` 自动生成语义化 tag（branch / semver / sha）
+  - PR 场景仅构建验证不推送
+- **修改 `docker-compose.yml`** — 移除 `build` 段，直接使用 GHCR 镜像
+- **更新 `README.md`** — 方式 B 部署说明改为 GHCR 镜像拉取

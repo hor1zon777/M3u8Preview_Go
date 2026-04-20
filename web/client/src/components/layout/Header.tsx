@@ -3,7 +3,7 @@ import { useNavigate, NavLink, Link } from 'react-router-dom';
 import { useState, useRef, useEffect } from 'react';
 import {
   Clapperboard, Search, Film, ListVideo, Heart, Clock,
-  Settings, Users, MonitorPlay, Download, Home, LogOut, ChevronDown, Lock, User, FolderTree,
+  Settings, Users, MonitorPlay, Download, Home, LogOut, ChevronDown, Lock, User, FolderTree, Tag,
 } from 'lucide-react';
 
 export function Header() {
@@ -206,6 +206,7 @@ export function Header() {
                 <DropdownItem icon={Users} label="用户管理" onClick={() => handleDropdownNav('/admin/users')} />
                 <DropdownItem icon={MonitorPlay} label="媒体管理" onClick={() => handleDropdownNav('/admin/media')} />
                 <DropdownItem icon={FolderTree} label="分类管理" onClick={() => handleDropdownNav('/admin/categories')} />
+                <DropdownItem icon={Tag} label="标签管理" onClick={() => handleDropdownNav('/admin/tags')} />
                 <DropdownItem icon={Download} label="导入媒体" onClick={() => handleDropdownNav('/import')} />
               </div>
             )}

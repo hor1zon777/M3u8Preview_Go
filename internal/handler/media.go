@@ -15,12 +15,13 @@ import (
 
 // MediaHandler 汇总 media 端点。
 type MediaHandler struct {
-	svc *service.MediaService
+	svc   *service.MediaService
+	thumb *service.ThumbnailQueue
 }
 
 // NewMediaHandler 构造。
-func NewMediaHandler(svc *service.MediaService) *MediaHandler {
-	return &MediaHandler{svc: svc}
+func NewMediaHandler(svc *service.MediaService, thumb *service.ThumbnailQueue) *MediaHandler {
+	return &MediaHandler{svc: svc, thumb: thumb}
 }
 
 // RegisterPublic 挂载公开查询端点（匿名可访问）。
@@ -145,9 +146,20 @@ func (h *MediaHandler) getArtists(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.OK(items))
 }
 
-// regenerateThumbnail 阶段 I 会接真正的 ffmpeg；此处返回 501 以明示未实现。
+// regenerateThumbnail 为指定媒体重新生成缩略图。
 func (h *MediaHandler) regenerateThumbnail(c *gin.Context) {
-	middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotImplemented, "thumbnail generation not implemented yet"))
+	if h.thumb == nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotImplemented, "thumbnail service not configured"))
+		return
+	}
+	id := c.Param("id")
+	media, err := h.svc.FindByID(id)
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	h.thumb.Enqueue(media.ID, media.M3u8URL)
+	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "thumbnail generation enqueued", "mediaId": media.ID}))
 }
 
 // parseCount 从 query 读 count，限制 1..50，解析失败走 defaultCount。

@@ -20,7 +20,7 @@ import { mediaApi } from '../services/mediaApi.js';
 import { adminApi } from '../services/adminApi.js';
 import { categoryApi } from '../services/categoryApi.js';
 import { MediaThumbnail } from '../components/media/MediaThumbnail.js';
-import type { Media, MediaCreateRequest, Category } from '@m3u8-preview/shared';
+import type { Media, MediaCreateRequest, MediaStatus, Category } from '@m3u8-preview/shared';
 
 export function AdminMediaPage() {
   const [page, setPage] = useState(1);
@@ -32,6 +32,7 @@ export function AdminMediaPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchCategoryValue, setBatchCategoryValue] = useState('');
   const [filterCategoryId, setFilterCategoryId] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
   const queryClient = useQueryClient();
   const fieldIdBase = useId();
   const titleFieldId = `${fieldIdBase}-title`;
@@ -55,7 +56,7 @@ export function AdminMediaPage() {
   useEffect(() => {
     setPage(1);
     setSelectedIds(new Set());
-  }, [filterCategoryId]);
+  }, [filterCategoryId, filterStatus]);
 
   const handlePageSizeChange = useCallback((newSize: number) => {
     setPageSize(newSize);
@@ -64,12 +65,13 @@ export function AdminMediaPage() {
   }, []);
 
   const { data, isLoading } = useQuery({
-    queryKey: ['admin', 'media', page, pageSize, search, filterCategoryId],
+    queryKey: ['admin', 'media', page, pageSize, search, filterCategoryId, filterStatus],
     queryFn: () => mediaApi.getAll({
       page,
       limit: pageSize,
       search: search || undefined,
       categoryId: filterCategoryId || undefined,
+      status: (filterStatus as MediaStatus) || undefined,
     }),
   });
 
@@ -288,6 +290,17 @@ export function AdminMediaPage() {
               {categories?.map((cat: Category) => (
                 <option key={cat.id} value={cat.id}>{cat.name}</option>
               ))}
+            </select>
+            <select
+              title="状态筛选"
+              value={filterStatus}
+              onChange={e => setFilterStatus(e.target.value)}
+              className="px-3 py-2.5 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green min-w-[120px]"
+            >
+              <option value="">全部状态</option>
+              <option value="ACTIVE">ACTIVE</option>
+              <option value="INACTIVE">INACTIVE</option>
+              <option value="ERROR">ERROR</option>
             </select>
           </div>
           <button
@@ -621,6 +634,8 @@ export function AdminMediaPage() {
                         className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border ${
                           media.status === 'ACTIVE'
                             ? 'bg-green-500/10 text-green-400 border-green-500/30'
+                            : media.status === 'ERROR'
+                            ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
                             : 'bg-red-500/10 text-red-400 border-red-500/30'
                         }`}
                       >

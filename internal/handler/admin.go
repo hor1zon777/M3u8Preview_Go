@@ -19,6 +19,7 @@ type AdminHandler struct {
 	proxy          *service.ProxyService
 	thumb          *service.ThumbnailQueue
 	poster         *service.PosterDownloader
+	watch          *service.WatchHistoryService
 	db             DashboardDB
 	rateLimitCache *middleware.RateLimitSettingCache
 }
@@ -40,8 +41,8 @@ type PosterStats struct {
 }
 
 // NewAdminHandler 构造。thumb / poster / db 可以为 nil（对应端点返回占位结果）。
-func NewAdminHandler(admin *service.AdminService, activity *service.ActivityService, proxy *service.ProxyService, thumb *service.ThumbnailQueue, poster *service.PosterDownloader, db DashboardDB, rateLimitCache *middleware.RateLimitSettingCache) *AdminHandler {
-	return &AdminHandler{admin: admin, activity: activity, proxy: proxy, thumb: thumb, poster: poster, db: db, rateLimitCache: rateLimitCache}
+func NewAdminHandler(admin *service.AdminService, activity *service.ActivityService, proxy *service.ProxyService, thumb *service.ThumbnailQueue, poster *service.PosterDownloader, watch *service.WatchHistoryService, db DashboardDB, rateLimitCache *middleware.RateLimitSettingCache) *AdminHandler {
+	return &AdminHandler{admin: admin, activity: activity, proxy: proxy, thumb: thumb, poster: poster, watch: watch, db: db, rateLimitCache: rateLimitCache}
 }
 
 // Register 在已经应用 authenticate + requireAdmin 的 group 上挂全部路由。
@@ -234,9 +235,15 @@ func (h *AdminHandler) userLoginRecords(c *gin.Context) {
 
 // userWatchHistory 复用 WatchHistoryService.List 的能力（按任意 userId 查）。
 func (h *AdminHandler) userWatchHistory(c *gin.Context) {
-	// 直接走 watchSvc 需要依赖注入；为避免循环依赖，这里直接走 activityService 的底层 DB。
-	// 这里为简洁保留 501：前端若需要可后续接入。
-	middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotImplemented, "user watch history not implemented"))
+	uid := c.Param("userId")
+	page := parseIntQuery(c, "page", 1)
+	limit := parseIntQuery(c, "limit", 20)
+	items, total, err := h.watch.List(uid, page, limit)
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.Paginated(items, total, page, limit))
 }
 
 func (h *AdminHandler) userActivitySummary(c *gin.Context) {
@@ -256,8 +263,15 @@ func (h *AdminHandler) generateThumbnails(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotImplemented, "thumbnail service not configured"))
 		return
 	}
-	// 实际入队逻辑由 admin service 提供；这里返回 accepted
-	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "thumbnail generation enqueued"}))
+	rows, err := h.admin.MediaWithoutPoster(500)
+	if err != nil {
+		_ = c.Error(middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err))
+		return
+	}
+	for _, r := range rows {
+		h.thumb.Enqueue(r.ID, r.URL)
+	}
+	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "thumbnail generation enqueued", "enqueued": len(rows)}))
 }
 
 func (h *AdminHandler) thumbnailStatus(c *gin.Context) {
@@ -279,7 +293,15 @@ func (h *AdminHandler) migratePosters(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotImplemented, "poster migration not configured"))
 		return
 	}
-	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "poster migration enqueued"}))
+	rows, err := h.admin.MediaWithExternalPoster(500)
+	if err != nil {
+		_ = c.Error(middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err))
+		return
+	}
+	for _, r := range rows {
+		h.poster.EnqueueMigrate(r.ID, r.URL)
+	}
+	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "poster migration enqueued", "enqueued": len(rows)}))
 }
 
 func (h *AdminHandler) posterStatus(c *gin.Context) {
@@ -309,5 +331,13 @@ func (h *AdminHandler) retryPosters(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotImplemented, "poster retry not configured"))
 		return
 	}
-	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "retry enqueued"}))
+	rows, err := h.admin.MediaWithExternalPoster(500)
+	if err != nil {
+		_ = c.Error(middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err))
+		return
+	}
+	for _, r := range rows {
+		h.poster.EnqueueMigrate(r.ID, r.URL)
+	}
+	c.JSON(http.StatusAccepted, dto.OK(gin.H{"message": "retry enqueued", "enqueued": len(rows)}))
 }
