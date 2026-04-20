@@ -3,6 +3,9 @@
 package app
 
 import (
+	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -91,7 +94,13 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	r.GET("/uploads/*filepath", func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("Cache-Control", "public, max-age=300, must-revalidate")
-		c.File(cfg.UploadsDir + c.Param("filepath"))
+		cleaned := filepath.Clean("/" + c.Param("filepath"))
+		fullPath := filepath.Join(cfg.UploadsDir, cleaned)
+		if !strings.HasPrefix(fullPath, filepath.Clean(cfg.UploadsDir)) {
+			c.Status(http.StatusForbidden)
+			return
+		}
+		c.File(fullPath)
 	})
 
 	r.GET("/api/health", handler.Health)
@@ -256,7 +265,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	activitySvc := service.NewActivityService(db)
 	thumbQueue := service.NewThumbnailQueue(cfg.ThumbnailConcurrency, nil)
 	posterDL := service.NewPosterDownloader(cfg.UploadsDir, cfg.PosterConcurrency)
-	adminH := handler.NewAdminHandler(adminSvc, activitySvc, proxySvc, thumbQueue, posterDL, newPosterStatsDB(db, cfg.UploadsDir))
+	adminH := handler.NewAdminHandler(adminSvc, activitySvc, proxySvc, thumbQueue, posterDL, newPosterStatsDB(db, cfg.UploadsDir), deps.RateLimitCache)
 
 	// 注入真正的 poster resolver 到 media service（替换占位实现）
 	mediaSvc.SetPosterResolver(posterDL)

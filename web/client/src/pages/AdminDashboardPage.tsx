@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { Film, Users, FolderOpen, Play, Settings, Download, Shield, Activity, X, Plus } from 'lucide-react';
@@ -27,12 +27,20 @@ export function AdminDashboardPage() {
       queryClient.invalidateQueries({ queryKey: ['admin', 'settings'] });
     },
     onError: () => {
-      setSettingError('设置更新失败，请重试');
-      setTimeout(() => setSettingError(''), 3000);
+      showSettingError('设置更新失败，请重试');
     },
   });
 
   const [settingError, setSettingError] = useState('');
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => {
+    return () => { if (errorTimerRef.current) clearTimeout(errorTimerRef.current); };
+  }, []);
+  const showSettingError = useCallback((msg: string) => {
+    setSettingError(msg);
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = setTimeout(() => setSettingError(''), 3000);
+  }, []);
   const [newExt, setNewExt] = useState('');
   const settingsLoaded = !!settings;
   const allowRegistration = settings?.find((s) => s.key === 'allowRegistration')?.value !== 'false';
@@ -51,8 +59,7 @@ export function AdminDashboardPage() {
     if (!ext) return;
     if (!ext.startsWith('.')) ext = `.${ext}`;
     if (!/^\.[a-zA-Z0-9]+$/.test(ext)) {
-      setSettingError('扩展名格式无效，需以 . 开头且仅含字母数字');
-      setTimeout(() => setSettingError(''), 3000);
+      showSettingError('扩展名格式无效，需以 . 开头且仅含字母数字');
       return;
     }
     if (extensionTags.includes(ext)) {
@@ -66,8 +73,7 @@ export function AdminDashboardPage() {
   const handleRemoveExt = useCallback((ext: string) => {
     const remaining = extensionTags.filter(t => t !== ext);
     if (remaining.length === 0) {
-      setSettingError('至少需要保留一个扩展名');
-      setTimeout(() => setSettingError(''), 3000);
+      showSettingError('至少需要保留一个扩展名');
       return;
     }
     saveExtensions(remaining);
@@ -89,10 +95,10 @@ export function AdminDashboardPage() {
   if (!stats) return null;
 
   const statCards = [
-    { label: '总媒体数', value: stats.totalMedia, icon: Film, color: 'text-blue-400' },
-    { label: '总用户数', value: stats.totalUsers, icon: Users, color: 'text-green-400' },
-    { label: '分类数', value: stats.totalCategories, icon: FolderOpen, color: 'text-purple-400' },
-    { label: '总播放量', value: stats.totalViews, icon: Play, color: 'text-orange-400' },
+    { label: '总媒体数', value: stats.totalMedia ?? 0, icon: Film, color: 'text-blue-400' },
+    { label: '总用户数', value: stats.totalUsers ?? 0, icon: Users, color: 'text-green-400' },
+    { label: '分类数', value: stats.totalCategories ?? 0, icon: FolderOpen, color: 'text-purple-400' },
+    { label: '总播放量', value: stats.totalViews ?? 0, icon: Play, color: 'text-orange-400' },
   ];
 
   return (

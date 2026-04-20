@@ -14,12 +14,13 @@ import (
 
 // AdminHandler 汇总 admin 端点。
 type AdminHandler struct {
-	admin    *service.AdminService
-	activity *service.ActivityService
-	proxy    *service.ProxyService
-	thumb    *service.ThumbnailQueue
-	poster   *service.PosterDownloader
-	db       DashboardDB
+	admin          *service.AdminService
+	activity       *service.ActivityService
+	proxy          *service.ProxyService
+	thumb          *service.ThumbnailQueue
+	poster         *service.PosterDownloader
+	db             DashboardDB
+	rateLimitCache *middleware.RateLimitSettingCache
 }
 
 // DashboardDB 供 media count / poster stats 使用的最小 DB 访问接口（避免耦合具体 GORM 类型）。
@@ -39,8 +40,8 @@ type PosterStats struct {
 }
 
 // NewAdminHandler 构造。thumb / poster / db 可以为 nil（对应端点返回占位结果）。
-func NewAdminHandler(admin *service.AdminService, activity *service.ActivityService, proxy *service.ProxyService, thumb *service.ThumbnailQueue, poster *service.PosterDownloader, db DashboardDB) *AdminHandler {
-	return &AdminHandler{admin: admin, activity: activity, proxy: proxy, thumb: thumb, poster: poster, db: db}
+func NewAdminHandler(admin *service.AdminService, activity *service.ActivityService, proxy *service.ProxyService, thumb *service.ThumbnailQueue, poster *service.PosterDownloader, db DashboardDB, rateLimitCache *middleware.RateLimitSettingCache) *AdminHandler {
+	return &AdminHandler{admin: admin, activity: activity, proxy: proxy, thumb: thumb, poster: poster, db: db, rateLimitCache: rateLimitCache}
 }
 
 // Register 在已经应用 authenticate + requireAdmin 的 group 上挂全部路由。
@@ -146,6 +147,9 @@ func (h *AdminHandler) updateSettings(c *gin.Context) {
 	// 代理扩展名缓存需要立即失效；enableRateLimit 切换同理
 	if req.Key == "proxyAllowedExtensions" && h.proxy != nil {
 		h.proxy.InvalidateExtensionsCache()
+	}
+	if req.Key == "enableRateLimit" && h.rateLimitCache != nil {
+		h.rateLimitCache.Invalidate()
 	}
 	c.JSON(http.StatusOK, dto.OK(entry))
 }

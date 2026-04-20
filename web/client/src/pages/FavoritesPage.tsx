@@ -11,7 +11,7 @@ export function FavoritesPage() {
     queryFn: () => favoriteApi.getAll(page, 24),
   });
 
-  const mediaItems = data?.items?.map((f: any) => f.media).filter(Boolean) || [];
+  const mediaItems = data?.items?.map((f) => f.media).filter(Boolean) || [];
 
   return (
     <div className="space-y-6">

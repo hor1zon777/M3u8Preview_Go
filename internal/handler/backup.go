@@ -35,17 +35,28 @@ func (h *BackupHandler) Register(rg *gin.RouterGroup) {
 	rg.GET("/import/stream/:id", h.importStream)
 }
 
-// exportDirect 同步打包 ZIP 到响应流。
+// exportDirect 同步打包 ZIP 到临时文件再返回，确保出错时不返回损坏数据。
 func (h *BackupHandler) exportDirect(c *gin.Context) {
 	includePosters := c.Query("includePosters") != "false"
 	timestamp := nowISO()
 	filename := "backup-" + timestamp + ".zip"
-	c.Header("Content-Type", "application/zip")
-	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
-	if err := h.svc.ExportToStream(c.Writer, includePosters); err != nil {
+
+	tmp, err := os.CreateTemp("", "m3u8-export-*.zip")
+	if err != nil {
+		_ = c.Error(middleware.WrapAppError(http.StatusInternalServerError, "创建临时文件失败", err))
+		return
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+
+	if err := h.svc.ExportToStream(tmp, includePosters); err != nil {
+		_ = tmp.Close()
 		_ = c.Error(err)
 		return
 	}
+	_ = tmp.Close()
+
+	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
+	c.File(tmp.Name())
 }
 
 // exportStream SSE：按阶段推送进度，完成时带 downloadId。
@@ -114,7 +125,13 @@ func (h *BackupHandler) importSync(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusInternalServerError, "创建临时文件失败", err))
 		return
 	}
-	_, _ = io.Copy(tmp, src)
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = src.Close()
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusInternalServerError, "写入临时文件失败", err))
+		return
+	}
 	_ = src.Close()
 	_ = tmp.Close()
 	defer func() { _ = os.Remove(tmp.Name()) }()

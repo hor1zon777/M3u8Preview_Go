@@ -32,6 +32,7 @@ type SSETicketStore struct {
 	ttl      time.Duration
 	maxItems int
 	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewSSETicketStore 构造存储并启动周期清理 goroutine。
@@ -49,7 +50,7 @@ func NewSSETicketStore() *SSETicketStore {
 
 // Stop 停止后台清理 goroutine（测试用）。
 func (s *SSETicketStore) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
 // Issue 生成一次性 ticket 并存入；返回 ticket 字符串。

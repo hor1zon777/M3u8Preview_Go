@@ -8,14 +8,6 @@ type APIResponse struct {
 	Data    interface{} `json:"data,omitempty"`
 	Error   string      `json:"error,omitempty"`
 	Message string      `json:"message,omitempty"`
-	Meta    *PageMeta   `json:"meta,omitempty"`
-}
-
-// PageMeta 对齐 TS PaginatedResponse.meta，只有分页端点使用。
-type PageMeta struct {
-	Total int64 `json:"total"`
-	Page  int   `json:"page"`
-	Limit int   `json:"limit"`
 }
 
 // OK 是语义化构造器，便于 handler 使用。
@@ -23,12 +15,30 @@ func OK(data interface{}) APIResponse {
 	return APIResponse{Success: true, Data: data}
 }
 
+// PaginatedData 对齐前端 PaginatedResponse<T>，将 items 与分页元信息打包到 data 字段。
+type PaginatedData struct {
+	Items      interface{} `json:"items"`
+	Total      int64       `json:"total"`
+	Page       int         `json:"page"`
+	Limit      int         `json:"limit"`
+	TotalPages int         `json:"totalPages"`
+}
+
 // Paginated 构造分页响应。
 func Paginated(data interface{}, total int64, page, limit int) APIResponse {
+	totalPages := 0
+	if limit > 0 {
+		totalPages = int((total + int64(limit) - 1) / int64(limit))
+	}
 	return APIResponse{
 		Success: true,
-		Data:    data,
-		Meta:    &PageMeta{Total: total, Page: page, Limit: limit},
+		Data: PaginatedData{
+			Items:      data,
+			Total:      total,
+			Page:       page,
+			Limit:      limit,
+			TotalPages: totalPages,
+		},
 	}
 }
 

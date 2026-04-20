@@ -44,6 +44,9 @@ func (h *ProxyHandler) RegisterM3U8(rg *gin.RouterGroup) {
 // Range 值白名单：只允许 bytes=<n>-<n?>
 var rangeRegexp = regexp.MustCompile(`^bytes=\d+-\d*$`)
 
+// uriAttributeRegexp 匹配 URI="..." 属性（m3u8 重写用）。
+var uriAttributeRegexp = regexp.MustCompile(`URI="([^"]+)"`)
+
 const (
 	connectTimeout = 15 * time.Second
 	totalTimeout   = 120 * time.Second
@@ -175,7 +178,7 @@ func (h *ProxyHandler) m3u8(c *gin.Context) {
 	}
 
 	if isM3U8 && service.IsM3u8ContentType(ct) {
-		body, rerr := io.ReadAll(resp.Body)
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 		if rerr != nil {
 			middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusBadGateway, "读取 m3u8 失败", rerr))
 			return
@@ -235,9 +238,8 @@ func (h *ProxyHandler) rewriteM3U8(content string, base *url.URL, userID string)
 
 // rewriteURIAttribute 只替换一行内 URI="..." 里的 URL，保留 tag 结构。
 func rewriteURIAttribute(line string, base *url.URL, userID string, signer *util.ProxySigner, proxyPrefix string) string {
-	re := regexp.MustCompile(`URI="([^"]+)"`)
-	return re.ReplaceAllStringFunc(line, func(match string) string {
-		sub := re.FindStringSubmatch(match)
+	return uriAttributeRegexp.ReplaceAllStringFunc(line, func(match string) string {
+		sub := uriAttributeRegexp.FindStringSubmatch(match)
 		if len(sub) < 2 {
 			return match
 		}

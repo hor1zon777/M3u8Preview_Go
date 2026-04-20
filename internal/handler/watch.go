@@ -91,6 +91,10 @@ func (h *WatchHistoryHandler) progressMap(c *gin.Context) {
 			cleaned = append(cleaned, trimmed)
 		}
 	}
+	if len(cleaned) > 200 {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "单次最多查询 200 条进度"))
+		return
+	}
 	result, err := h.svc.ProgressMap(uid, cleaned)
 	if err != nil {
 		_ = c.Error(err)

@@ -205,6 +205,11 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 					categoryID = &cid
 				}
 			}
+			sp := fmt.Sprintf("item_%d", i)
+			if err := tx.SavePoint(sp).Error; err != nil {
+				errs = append(errs, dto.ImportError{Row: rowIdx[i], Field: "general", Message: err.Error()})
+				continue
+			}
 			m := model.Media{
 				Title:       it.Title,
 				M3u8URL:     it.M3u8URL,
@@ -216,6 +221,7 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 				Status:      model.MediaStatusActive,
 			}
 			if err := tx.Create(&m).Error; err != nil {
+				_ = tx.RollbackTo(sp).Error
 				errs = append(errs, dto.ImportError{Row: rowIdx[i], Field: "general", Message: err.Error()})
 				continue
 			}
@@ -228,6 +234,7 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 				}
 				if len(links) > 0 {
 					if err := tx.Create(&links).Error; err != nil {
+						_ = tx.RollbackTo(sp).Error
 						errs = append(errs, dto.ImportError{Row: rowIdx[i], Field: "tags", Message: err.Error()})
 						continue
 					}

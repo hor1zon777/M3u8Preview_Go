@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Check } from 'lucide-react';
 import { playlistApi } from '../../services/playlistApi.js';
@@ -21,14 +21,18 @@ export function AddToPlaylistModal({ mediaId, isOpen, onClose }: Props) {
   });
 
   const [addedId, setAddedId] = useState<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  useEffect(() => {
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, []);
 
   const addMutation = useMutation({
     mutationFn: (playlistId: string) => playlistApi.addItem(playlistId, mediaId),
     onSuccess: (_data, playlistId) => {
       queryClient.invalidateQueries({ queryKey: ['playlists'] });
-      // H4: 添加成功后给反馈并自动关闭
       setAddedId(playlistId);
-      setTimeout(() => {
+      timerRef.current = setTimeout(() => {
         setAddedId(null);
         onClose();
       }, 800);

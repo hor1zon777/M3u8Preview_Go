@@ -430,7 +430,7 @@ export function BackupSection() {
                 <span className="text-white font-medium">{restoreResult.uploadsRestored}</span> 个文件
               </div>
               <div>
-                耗时 <span className="text-white font-medium">{restoreResult.duration}</span>s
+                耗时 <span className="text-white font-medium">{typeof restoreResult.duration === 'number' ? restoreResult.duration.toFixed(1) : restoreResult.duration}</span>s
               </div>
             </div>
           </div>

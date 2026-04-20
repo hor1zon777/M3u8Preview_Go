@@ -33,6 +33,8 @@ type WindowLimiter struct {
 	window time.Duration
 	mu     sync.Mutex
 	store  map[string]*bucket
+	stopCh chan struct{}
+	stopOnce sync.Once
 }
 
 // NewWindowLimiter 构造 max 请求 / window 秒的限流器。
@@ -41,9 +43,15 @@ func NewWindowLimiter(max int, window time.Duration) *WindowLimiter {
 		max:    max,
 		window: window,
 		store:  make(map[string]*bucket),
+		stopCh: make(chan struct{}),
 	}
 	go l.sweep()
 	return l
+}
+
+// Stop 停止后台清理 goroutine。
+func (l *WindowLimiter) Stop() {
+	l.stopOnce.Do(func() { close(l.stopCh) })
 }
 
 // Allow 检查 key 是否还有配额。
@@ -68,15 +76,20 @@ func (l *WindowLimiter) Allow(key string) bool {
 func (l *WindowLimiter) sweep() {
 	t := time.NewTicker(l.window)
 	defer t.Stop()
-	for range t.C {
-		now := time.Now().UnixNano()
-		l.mu.Lock()
-		for k, b := range l.store {
-			if b.expiresAt <= now {
-				delete(l.store, k)
+	for {
+		select {
+		case <-l.stopCh:
+			return
+		case <-t.C:
+			now := time.Now().UnixNano()
+			l.mu.Lock()
+			for k, b := range l.store {
+				if b.expiresAt <= now {
+					delete(l.store, k)
+				}
 			}
+			l.mu.Unlock()
 		}
-		l.mu.Unlock()
 	}
 }
 

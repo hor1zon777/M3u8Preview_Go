@@ -132,7 +132,7 @@ export function PlaylistsPage() {
         <div className="bg-emby-bg-card border border-emby-border-subtle rounded-lg p-4 space-y-3">
           {createMutation.error && (
             <div className="bg-red-500/10 border border-red-500/20 text-red-400 px-3 py-2 rounded-md text-sm">
-              {(createMutation.error as any)?.response?.data?.error || '创建失败，请重试'}
+              {(createMutation.error as Error & { response?: { data?: { error?: string } } })?.response?.data?.error || '创建失败，请重试'}
             </div>
           )}
           <input

@@ -16,7 +16,7 @@ export function LoginForm() {
   const location = useLocation();
 
   useEffect(() => {
-    authApi.getRegisterStatus().then((res) => setAllowRegistration(res.allowRegistration)).catch(() => {});
+    authApi.getRegisterStatus().then((res) => setAllowRegistration(res.allowRegistration)).catch(() => { setAllowRegistration(false); });
   }, []);
 
   // 登录后重定向到来源页，过滤登录/注册页防止循环

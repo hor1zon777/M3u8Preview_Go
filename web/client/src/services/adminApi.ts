@@ -1,5 +1,5 @@
 import api from './api.js';
-import type { ApiResponse, DashboardStats, PaginatedResponse, RestoreResult, BatchOperationResult, LoginRecord, UserActivitySummary, UserActivityAggregate, WatchHistory, ExportProgress, BackupProgress } from '@m3u8-preview/shared';
+import type { ApiResponse, DashboardStats, PaginatedResponse, RestoreResult, BatchOperationResult, LoginRecord, UserActivitySummary, UserActivityAggregate, WatchHistory, ExportProgress, BackupProgress, User, UserWithStats } from '@m3u8-preview/shared';
 
 async function getSseTicket(): Promise<string> {
   const { data } = await api.post<ApiResponse<{ ticket: string }>>('/auth/sse-ticket');
@@ -13,14 +13,14 @@ export const adminApi = {
   },
 
   async getUsers(page: number = 1, limit: number = 20, search?: string) {
-    const { data } = await api.get<ApiResponse<PaginatedResponse<any>>>('/admin/users', {
+    const { data } = await api.get<ApiResponse<PaginatedResponse<UserWithStats>>>('/admin/users', {
       params: { page, limit, search },
     });
     return data.data!;
   },
 
   async updateUser(id: string, payload: { role?: string; isActive?: boolean }) {
-    const { data } = await api.put<ApiResponse<any>>(`/admin/users/${id}`, payload);
+    const { data } = await api.put<ApiResponse<User>>(`/admin/users/${id}`, payload);
     return data.data!;
   },
 

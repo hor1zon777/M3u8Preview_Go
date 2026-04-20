@@ -27,9 +27,15 @@ func NewAdminService(db *gorm.DB) *AdminService { return &AdminService{db: db} }
 // Dashboard 6 并行查询构建主页统计。
 func (s *AdminService) Dashboard() (dto.AdminDashboardResponse, error) {
 	var (
-		resp  dto.AdminDashboardResponse
-		wg    sync.WaitGroup
-		mu    sync.Mutex
+		totalMedia      int64
+		totalUsers      int64
+		totalCategories int64
+		totalViews      int64
+		recentMedia     []model.Media
+		topMedia        []model.Media
+
+		wg       sync.WaitGroup
+		mu       sync.Mutex
 		firstErr error
 	)
 	saveErr := func(err error) {
@@ -46,50 +52,54 @@ func (s *AdminService) Dashboard() (dto.AdminDashboardResponse, error) {
 	wg.Add(6)
 	go func() {
 		defer wg.Done()
-		var c int64
-		saveErr(s.db.Model(&model.Media{}).Count(&c).Error)
-		resp.TotalMedia = c
+		saveErr(s.db.Model(&model.Media{}).Count(&totalMedia).Error)
 	}()
 	go func() {
 		defer wg.Done()
-		var c int64
-		saveErr(s.db.Model(&model.User{}).Count(&c).Error)
-		resp.TotalUsers = c
+		saveErr(s.db.Model(&model.User{}).Count(&totalUsers).Error)
 	}()
 	go func() {
 		defer wg.Done()
-		var c int64
-		saveErr(s.db.Model(&model.Category{}).Count(&c).Error)
-		resp.TotalCategories = c
+		saveErr(s.db.Model(&model.Category{}).Count(&totalCategories).Error)
 	}()
 	go func() {
 		defer wg.Done()
 		type agg struct{ Total int64 }
 		var a agg
-		err := s.db.Model(&model.Media{}).Select("COALESCE(SUM(views),0) AS total").Scan(&a).Error
-		saveErr(err)
-		resp.TotalViews = a.Total
+		saveErr(s.db.Model(&model.Media{}).Select("COALESCE(SUM(views),0) AS total").Scan(&a).Error)
+		mu.Lock()
+		totalViews = a.Total
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
 		var rows []model.Media
-		err := s.db.Preload("Category").Order("created_at DESC").Limit(5).Find(&rows).Error
-		saveErr(err)
-		resp.RecentMedia = serializeMediaList(rows)
+		saveErr(s.db.Preload("Category").Order("created_at DESC").Limit(5).Find(&rows).Error)
+		mu.Lock()
+		recentMedia = rows
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
 		var rows []model.Media
-		err := s.db.Preload("Category").Order("views DESC").Limit(5).Find(&rows).Error
-		saveErr(err)
-		resp.TopMedia = serializeMediaList(rows)
+		saveErr(s.db.Preload("Category").Order("views DESC").Limit(5).Find(&rows).Error)
+		mu.Lock()
+		topMedia = rows
+		mu.Unlock()
 	}()
 	wg.Wait()
 
 	if firstErr != nil {
-		return resp, middleware.WrapAppError(http.StatusInternalServerError, "dashboard 查询失败", firstErr)
+		return dto.AdminDashboardResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "dashboard 查询失败", firstErr)
 	}
-	return resp, nil
+	return dto.AdminDashboardResponse{
+		TotalMedia:      totalMedia,
+		TotalUsers:      totalUsers,
+		TotalCategories: totalCategories,
+		TotalViews:      totalViews,
+		RecentMedia:     serializeMediaList(recentMedia),
+		TopMedia:        serializeMediaList(topMedia),
+	}, nil
 }
 
 // ListUsers 分页用户列表 + 三项 count。
@@ -212,11 +222,22 @@ func (s *AdminService) GetSettings() ([]dto.AdminSettingEntry, error) {
 	return out, nil
 }
 
+// allowedSettingKeys 是系统设置允许的 key 白名单。
+var allowedSettingKeys = map[string]struct{}{
+	"siteName":                {},
+	"allowRegistration":       {},
+	"enableRateLimit":         {},
+	"proxyAllowedExtensions":  {},
+}
+
 // UpdateSetting upsert 单个 key，返回当前值。
 func (s *AdminService) UpdateSetting(key, value string) (dto.AdminSettingEntry, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return dto.AdminSettingEntry{}, middleware.NewAppError(http.StatusBadRequest, "key 不能为空")
+	}
+	if _, ok := allowedSettingKeys[key]; !ok {
+		return dto.AdminSettingEntry{}, middleware.NewAppError(http.StatusBadRequest, "不支持的设置项: "+key)
 	}
 	var existing model.SystemSetting
 	err := s.db.Where("key = ?", key).Take(&existing).Error

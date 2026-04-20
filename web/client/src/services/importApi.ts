@@ -1,5 +1,5 @@
 import api from './api.js';
-import type { ApiResponse, ImportPreviewResponse, ImportResult, ImportLog } from '@m3u8-preview/shared';
+import type { ApiResponse, ImportPreviewResponse, ImportResult, ImportLog, ImportItem } from '@m3u8-preview/shared';
 
 export const importApi = {
   async previewText(content: string) {
@@ -16,7 +16,7 @@ export const importApi = {
     return data.data!;
   },
 
-  async execute(items: any[], format: string, fileName?: string) {
+  async execute(items: ImportItem[], format: string, fileName?: string) {
     const { data } = await api.post<ApiResponse<ImportResult>>('/import/execute', { items, format, fileName });
     return data.data!;
   },

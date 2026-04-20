@@ -114,21 +114,21 @@ func (s *ActivityService) Aggregate() (dto.UserActivityAggregateResponse, error)
 	weekStart := todayStart.Add(-7 * 24 * time.Hour)
 
 	var (
-		resp         dto.UserActivityAggregateResponse
-		recentLogin  []model.LoginRecord
-		recentWatch  []model.WatchHistory
-		topMediaGroup []struct {
-			MediaID string
-			C       int64
-		}
-		topUserGroup []struct {
-			UserID string
-			C      int64
-		}
-		wg  sync.WaitGroup
-		mu  sync.Mutex
+		totalLogins      int64
+		uniqueUsers      int64
+		todayLogins      int64
+		yesterdayLogins  int64
+		last7DaysLogins  int64
+		totalWatchRecs   int64
+		totalCompleted   int64
+		totalWatchTime   float64
+		recentLogin      []model.LoginRecord
+		recentWatch      []model.WatchHistory
+
+		wg       sync.WaitGroup
+		mu       sync.Mutex
 		errFirst error
-		saveErr = func(e error) {
+		saveErr  = func(e error) {
 			if e == nil {
 				return
 			}
@@ -141,56 +141,91 @@ func (s *ActivityService) Aggregate() (dto.UserActivityAggregateResponse, error)
 	)
 
 	wg.Add(10)
-	go func() { defer wg.Done(); saveErr(s.db.Model(&model.LoginRecord{}).Count(&resp.LoginStats.TotalLogins).Error) }()
+	go func() {
+		defer wg.Done()
+		saveErr(s.db.Model(&model.LoginRecord{}).Count(&totalLogins).Error)
+	}()
 	go func() {
 		defer wg.Done()
 		type row struct{ C int64 }
 		var r row
 		saveErr(s.db.Raw("SELECT COUNT(DISTINCT user_id) AS c FROM login_records").Scan(&r).Error)
-		resp.LoginStats.UniqueUsers = r.C
+		mu.Lock()
+		uniqueUsers = r.C
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
-		saveErr(s.db.Model(&model.LoginRecord{}).Where("created_at >= ?", todayStart).Count(&resp.LoginStats.TodayLogins).Error)
+		saveErr(s.db.Model(&model.LoginRecord{}).Where("created_at >= ?", todayStart).Count(&todayLogins).Error)
 	}()
 	go func() {
 		defer wg.Done()
 		saveErr(s.db.Model(&model.LoginRecord{}).
 			Where("created_at >= ? AND created_at < ?", yesterdayStart, todayStart).
-			Count(&resp.LoginStats.YesterdayLogins).Error)
+			Count(&yesterdayLogins).Error)
 	}()
 	go func() {
 		defer wg.Done()
 		saveErr(s.db.Model(&model.LoginRecord{}).Where("created_at >= ?", weekStart).
-			Count(&resp.LoginStats.Last7DaysLogins).Error)
+			Count(&last7DaysLogins).Error)
 	}()
 	go func() {
 		defer wg.Done()
-		saveErr(s.db.Model(&model.WatchHistory{}).Count(&resp.WatchStats.TotalWatchRecords).Error)
+		saveErr(s.db.Model(&model.WatchHistory{}).Count(&totalWatchRecs).Error)
 	}()
 	go func() {
 		defer wg.Done()
-		saveErr(s.db.Model(&model.WatchHistory{}).Where("completed = ?", true).Count(&resp.WatchStats.TotalCompleted).Error)
+		saveErr(s.db.Model(&model.WatchHistory{}).Where("completed = ?", true).Count(&totalCompleted).Error)
 	}()
 	go func() {
 		defer wg.Done()
 		type agg struct{ Total float64 }
 		var a agg
 		saveErr(s.db.Model(&model.WatchHistory{}).Select("COALESCE(SUM(progress),0) AS total").Scan(&a).Error)
-		resp.WatchStats.TotalWatchTime = a.Total
+		mu.Lock()
+		totalWatchTime = a.Total
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
-		saveErr(s.db.Order("created_at DESC").Limit(20).Find(&recentLogin).Error)
+		var rows []model.LoginRecord
+		saveErr(s.db.Order("created_at DESC").Limit(20).Find(&rows).Error)
+		mu.Lock()
+		recentLogin = rows
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
-		saveErr(s.db.Order("updated_at DESC").Limit(20).Find(&recentWatch).Error)
+		var rows []model.WatchHistory
+		saveErr(s.db.Order("updated_at DESC").Limit(20).Find(&rows).Error)
+		mu.Lock()
+		recentWatch = rows
+		mu.Unlock()
 	}()
 	wg.Wait()
 	if errFirst != nil {
-		return resp, middleware.WrapAppError(http.StatusInternalServerError, "活动聚合查询失败", errFirst)
+		return dto.UserActivityAggregateResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "活动聚合查询失败", errFirst)
 	}
+
+	var (
+		resp dto.UserActivityAggregateResponse
+		topMediaGroup []struct {
+			MediaID string
+			C       int64
+		}
+		topUserGroup []struct {
+			UserID string
+			C      int64
+		}
+	)
+	resp.LoginStats.TotalLogins = totalLogins
+	resp.LoginStats.UniqueUsers = uniqueUsers
+	resp.LoginStats.TodayLogins = todayLogins
+	resp.LoginStats.YesterdayLogins = yesterdayLogins
+	resp.LoginStats.Last7DaysLogins = last7DaysLogins
+	resp.WatchStats.TotalWatchRecords = totalWatchRecs
+	resp.WatchStats.TotalCompleted = totalCompleted
+	resp.WatchStats.TotalWatchTime = totalWatchTime
 
 	// topWatched / topActiveUsers 在 SQLite 下用 group by 语句直接查
 	if err := s.db.Model(&model.WatchHistory{}).
