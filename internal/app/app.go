@@ -223,7 +223,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	// ---- Upload / Import 模块（阶段 G）----
 	uploadSvc := service.NewUploadService(cfg.UploadsDir, cfg.Upload.MaxFileSize, cfg.Upload.AllowedMimeTypes)
 	uploadH := handler.NewUploadHandler(uploadSvc)
-	importSvc := service.NewImportService(db, nil, nil)
+	importSvc := service.NewImportService(db, thumbQueue, posterDL)
 	importH := handler.NewImportHandler(importSvc)
 
 	// /upload/poster —— 仅 admin

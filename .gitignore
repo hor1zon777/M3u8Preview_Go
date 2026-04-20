@@ -40,3 +40,6 @@ web/.env
 web/.env.local
 web/.env.*.local
 web/package-lock.json
+
+# claude配置
+.claude

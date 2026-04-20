@@ -23,8 +23,15 @@ type ThumbnailEnqueuer interface {
 }
 
 // PosterResolver 把外部 posterUrl 下载到本地并返回本地路径；阶段 I 提供实现。
+// 同步路径，适合单条 Create/Update；大批量导入请使用 PosterMigrator 异步入队。
 type PosterResolver interface {
 	Resolve(rawPosterURL *string) (*string, error)
+}
+
+// PosterMigrator 把外部 posterUrl 异步入队下载，下载完成后由 worker 回写 poster_url。
+// 用于批量导入，避免阻塞主请求；PosterDownloader 同时实现 PosterResolver 与 PosterMigrator。
+type PosterMigrator interface {
+	EnqueueMigrate(mediaID, rawURL string)
 }
 
 // NoopThumbnailEnqueuer 默认 no-op 实现。
@@ -38,6 +45,12 @@ type PassthroughPosterResolver struct{}
 
 // Resolve 原样返回输入。
 func (PassthroughPosterResolver) Resolve(in *string) (*string, error) { return in, nil }
+
+// NoopPosterMigrator 默认 no-op 实现。
+type NoopPosterMigrator struct{}
+
+// EnqueueMigrate is a no-op.
+func (NoopPosterMigrator) EnqueueMigrate(string, string) {}
 
 // MediaService 聚合 media 相关查询与写入。
 type MediaService struct {

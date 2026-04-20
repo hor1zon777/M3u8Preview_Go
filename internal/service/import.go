@@ -40,16 +40,18 @@ var xlsxMagicPrefixes = [][]byte{
 type ImportService struct {
 	db     *gorm.DB
 	thumb  ThumbnailEnqueuer
-	poster PosterResolver
+	poster PosterMigrator
 }
 
 // NewImportService 构造。
-func NewImportService(db *gorm.DB, thumb ThumbnailEnqueuer, poster PosterResolver) *ImportService {
+// poster 采用 PosterMigrator（异步入队）而非 PosterResolver（同步下载）：
+// 批量导入时外部 posterUrl 下载不再阻塞响应，worker 池在后台按速率限制顺次处理。
+func NewImportService(db *gorm.DB, thumb ThumbnailEnqueuer, poster PosterMigrator) *ImportService {
 	if thumb == nil {
 		thumb = NoopThumbnailEnqueuer{}
 	}
 	if poster == nil {
-		poster = PassthroughPosterResolver{}
+		poster = NoopPosterMigrator{}
 	}
 	return &ImportService{db: db, thumb: thumb, poster: poster}
 }
@@ -134,8 +136,15 @@ func (s *ImportService) Preview(items []dto.ImportItem) dto.ImportPreviewRespons
 	}
 }
 
-// Execute 将校验通过的条目写入 DB（事务），再在事务外触发缩略图生成。
-// 外部封面图下载在事务前完成以减小锁持有时间。
+// Execute 将校验通过的条目写入 DB（事务），再在事务外触发缩略图生成 / 海报异步迁移。
+// 性能优化：不再在事务前同步下载外部海报（原串行循环，单张超时 15s，1000 条最差可达 4+ 小时），
+// 改为事务内保留原 URL → 事务外按 URL 路径分流入两条后台队列：
+//
+//	posterUrl == nil/""     → ThumbnailEnqueuer（ffmpeg 截帧生成缩略图）
+//	posterUrl ~ http(s)://  → PosterMigrator（worker 池下载，完成后回写 poster_url）
+//	posterUrl 本地 /uploads/ → 不处理
+//
+// 这样导入响应时间与条目数量基本解耦，后台并发 + 限流由 PosterDownloader 统一控制。
 func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, fileName string) (dto.ImportResult, error) {
 	if len(items) > maxImportItems {
 		return dto.ImportResult{}, middleware.NewAppError(http.StatusBadRequest, fmt.Sprintf("Maximum %d items per import", maxImportItems))
@@ -152,17 +161,6 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 		}
 		valid = append(valid, it)
 		rowIdx = append(rowIdx, i+1)
-	}
-
-	// 事务前预下载外部封面（允许部分失败，失败则保留原 URL）
-	posterByIdx := make(map[int]*string, len(valid))
-	for i, it := range valid {
-		resolved, err := s.poster.Resolve(it.PosterURL)
-		if err == nil {
-			posterByIdx[i] = resolved
-		} else {
-			posterByIdx[i] = it.PosterURL
-		}
 	}
 
 	uniqueCategories := uniqueNonEmpty(func(yield func(string)) {
@@ -184,6 +182,10 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 
 	successCount := 0
 	createdForThumbs := make([]struct {
+		MediaID string
+		URL     string
+	}, 0)
+	createdForPosterMigrate := make([]struct {
 		MediaID string
 		URL     string
 	}, 0)
@@ -213,7 +215,7 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 			m := model.Media{
 				Title:       it.Title,
 				M3u8URL:     it.M3u8URL,
-				PosterURL:   posterByIdx[i],
+				PosterURL:   it.PosterURL,
 				Description: it.Description,
 				Year:        it.Year,
 				Artist:      it.Artist,
@@ -240,11 +242,17 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 					}
 				}
 			}
-			if m.PosterURL == nil {
+			switch {
+			case m.PosterURL == nil || *m.PosterURL == "":
 				createdForThumbs = append(createdForThumbs, struct {
 					MediaID string
 					URL     string
 				}{MediaID: m.ID, URL: m.M3u8URL})
+			case isExternalPosterURL(*m.PosterURL):
+				createdForPosterMigrate = append(createdForPosterMigrate, struct {
+					MediaID string
+					URL     string
+				}{MediaID: m.ID, URL: *m.PosterURL})
 			}
 			successCount++
 		}
@@ -254,11 +262,15 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 	if err != nil {
 		// 事务失败：全量视为失败
 		createdForThumbs = createdForThumbs[:0]
+		createdForPosterMigrate = createdForPosterMigrate[:0]
 		successCount = 0
 		errs = append(errs, dto.ImportError{Row: 0, Field: "transaction", Message: err.Error()})
 	} else {
 		for _, e := range createdForThumbs {
 			s.thumb.Enqueue(e.MediaID, e.URL)
+		}
+		for _, e := range createdForPosterMigrate {
+			s.poster.EnqueueMigrate(e.MediaID, e.URL)
 		}
 	}
 
@@ -469,6 +481,12 @@ func extFromName(name string) string {
 		return ""
 	}
 	return name[idx:]
+}
+
+// isExternalPosterURL 判断 posterUrl 是否是需要异步迁移的外部 http(s) 链接。
+// 本地 /uploads/ 或其它非 http(s) 值保持原样不入队。
+func isExternalPosterURL(u string) bool {
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
 }
 
 // TemplateCSV 返回 BOM + 模板文本；handler 负责 response header。
