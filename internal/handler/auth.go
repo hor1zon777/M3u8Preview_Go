@@ -151,15 +151,13 @@ const refreshCookieName = "refreshToken"
 
 func (h *AuthHandler) setRefreshCookie(c *gin.Context, token string) {
 	maxAge := int(h.cfg.JWT.RefreshExpiresIn.Seconds())
-	secure := h.cfg.NodeEnv == "production"
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(refreshCookieName, token, maxAge, "/", "", secure, true)
+	c.SetCookie(refreshCookieName, token, maxAge, "/", "", h.cfg.CookieSecure, true)
 }
 
 func (h *AuthHandler) clearRefreshCookie(c *gin.Context) {
-	secure := h.cfg.NodeEnv == "production"
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(refreshCookieName, "", -1, "/", "", secure, true)
+	c.SetCookie(refreshCookieName, "", -1, "/", "", h.cfg.CookieSecure, true)
 }
 
 func refreshCookieValue(c *gin.Context) string {

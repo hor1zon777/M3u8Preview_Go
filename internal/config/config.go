@@ -56,6 +56,7 @@ type Config struct {
 	Proxy        ProxyConfig
 	Bcrypt       BcryptConfig
 	TrustCDN     bool
+	CookieSecure bool
 	UploadsDir   string
 	DataDir      string
 	ThumbnailConcurrency int
@@ -121,6 +122,7 @@ func Load(projectRoot string) (*Config, error) {
 			SaltRounds: 12,
 		},
 		TrustCDN:             parseBoolDefault(os.Getenv("TRUST_CDN"), true),
+		CookieSecure:         parseCookieSecure(os.Getenv("COOKIE_SECURE"), getenv("CORS_ORIGIN", "http://localhost:5173")),
 		UploadsDir:           getenv("UPLOADS_DIR", filepath.Join(projectRoot, "uploads")),
 		DataDir:              getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
 		ThumbnailConcurrency: clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
@@ -239,4 +241,13 @@ func clamp(n, lo, hi int) int {
 		return hi
 	}
 	return n
+}
+
+// parseCookieSecure 决定 Cookie 的 Secure 标志。
+// 优先使用 COOKIE_SECURE 环境变量；未设置时根据 CORS_ORIGIN 是否为 HTTPS 自动推断。
+func parseCookieSecure(explicit, corsOrigin string) bool {
+	if explicit != "" {
+		return parseBoolDefault(explicit, false)
+	}
+	return strings.HasPrefix(strings.ToLower(corsOrigin), "https://")
 }
