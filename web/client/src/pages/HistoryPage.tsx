@@ -70,11 +70,8 @@ export function HistoryPage() {
               <Link to={`/media/${item.mediaId}`} className="w-48 flex-shrink-0">
                 <div className="aspect-video bg-emby-bg-input rounded-md overflow-hidden relative">
                   <MediaThumbnail
-                    mediaId={item.mediaId}
-                    m3u8Url={item.media?.m3u8Url || ''}
                     posterUrl={item.media?.posterUrl}
                     title={item.media?.title}
-                    watchedPercentage={item.percentage}
                   />
                   {/* Progress bar */}
                   <div className="absolute bottom-0 left-0 right-0 h-1 bg-emby-border">

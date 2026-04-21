@@ -598,8 +598,6 @@ export function AdminMediaPage() {
                           className="w-24 aspect-video bg-emby-bg-input rounded-lg flex-shrink-0 overflow-hidden"
                         >
                           <MediaThumbnail
-                            mediaId={media.id}
-                            m3u8Url={media.m3u8Url}
                             posterUrl={media.posterUrl}
                             title={media.title}
                             iconSize="w-4 h-4"

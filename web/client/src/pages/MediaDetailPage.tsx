@@ -8,7 +8,6 @@ import { FavoriteButton } from '../components/media/FavoriteButton.js';
 import { MediaCard } from '../components/media/MediaCard.js';
 import { AddToPlaylistModal } from '../components/playlist/AddToPlaylistModal.js';
 import { ScrollRow } from '../components/ui/ScrollRow.js';
-import { useVideoThumbnail } from '../hooks/useVideoThumbnail.js';
 import { useProgressMap } from '../hooks/useProgressMap.js';
 import { formatDate, formatDuration, buildRouteKey, saveCurrentRouteScrollPosition, setPendingScrollRestore } from '../lib/utils.js';
 import { useAuth } from '../hooks/useAuth.js';
@@ -62,13 +61,7 @@ export function MediaDetailPage() {
     enabled: !!id,
   });
 
-  // 使用缩略图 hook 获取封面
-  const thumbnail = useVideoThumbnail(
-    media?.id ?? '',
-    media?.m3u8Url ?? '',
-    media?.posterUrl,
-    watchProgress?.percentage,
-  );
+  const thumbnail = media?.posterUrl || null;
 
   // Increment views
   useEffect(() => {

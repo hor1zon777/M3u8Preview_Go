@@ -1,6 +1,5 @@
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { Film, Play, Star, Check } from 'lucide-react';
-import { useVideoThumbnail } from '../../hooks/useVideoThumbnail.js';
 import { buildRouteKey, saveCurrentRouteScrollPosition } from '../../lib/utils.js';
 import type { Media } from '@m3u8-preview/shared';
 
@@ -14,7 +13,7 @@ interface MediaCardProps {
 }
 
 export function MediaCard({ media, variant = 'portrait', showProgress = false, progress = 0, progressText, completed }: MediaCardProps) {
-  const thumbnail = useVideoThumbnail(media.id, media.m3u8Url, media.posterUrl);
+  const thumbnail = media.posterUrl || null;
   const navigate = useNavigate();
   const location = useLocation();
 

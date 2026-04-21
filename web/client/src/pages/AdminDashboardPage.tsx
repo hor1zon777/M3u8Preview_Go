@@ -375,8 +375,6 @@ export function AdminDashboardPage() {
               >
                 <div className="w-16 aspect-video bg-emby-bg-input rounded flex-shrink-0 overflow-hidden">
                   <MediaThumbnail
-                    mediaId={media.id}
-                    m3u8Url={media.m3u8Url}
                     posterUrl={media.posterUrl}
                     title={media.title}
                     iconSize="w-4 h-4"
@@ -404,8 +402,6 @@ export function AdminDashboardPage() {
                 <span className="text-emby-text-muted font-mono w-6 text-center">{index + 1}</span>
                 <div className="w-16 aspect-video bg-emby-bg-input rounded flex-shrink-0 overflow-hidden">
                   <MediaThumbnail
-                    mediaId={media.id}
-                    m3u8Url={media.m3u8Url}
                     posterUrl={media.posterUrl}
                     title={media.title}
                     iconSize="w-4 h-4"
