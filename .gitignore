@@ -14,6 +14,8 @@ build-errors.log
 /data/*.db-journal
 /data/*.db-wal
 /data/*.db-shm
+# 登录加密协议 ECDH 私钥（自动生成，绝不入库）
+/data/ecdh.pem
 /uploads/posters/*
 /uploads/thumbnails/*
 !/uploads/posters/.gitkeep

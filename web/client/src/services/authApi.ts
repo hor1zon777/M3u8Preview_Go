@@ -1,21 +1,18 @@
 import axios from 'axios';
 import api from './api.js';
 import type { ApiResponse, AuthResponse, User } from '@m3u8-preview/shared';
+import { encryptAuthPayload } from '../utils/crypto.js';
 
 export const authApi = {
   async register(username: string, password: string) {
-    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/register', {
-      username,
-      password,
-    });
+    const envelope = await encryptAuthPayload('register', { username, password });
+    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/register', envelope);
     return data.data!;
   },
 
   async login(username: string, password: string) {
-    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/login', {
-      username,
-      password,
-    });
+    const envelope = await encryptAuthPayload('login', { username, password });
+    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/login', envelope);
     return data.data!;
   },
 
@@ -56,10 +53,8 @@ export const authApi = {
   },
 
   async changePassword(oldPassword: string, newPassword: string) {
-    const { data } = await api.post<ApiResponse<null>>('/auth/change-password', {
-      oldPassword,
-      newPassword,
-    });
+    const envelope = await encryptAuthPayload('changePassword', { oldPassword, newPassword });
+    const { data } = await api.post<ApiResponse<null>>('/auth/change-password', envelope);
     return data;
   },
 };

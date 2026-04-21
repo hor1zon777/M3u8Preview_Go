@@ -51,3 +51,31 @@ type RegisterStatusResponse struct {
 type SSETicketResponse struct {
 	Ticket string `json:"ticket"`
 }
+
+// --- 加密登录协议 DTO（与前端 web/client/src/utils/crypto.ts 对齐）---
+
+// ChallengeResponse GET /auth/challenge
+// serverPub: 服务端长寿 ECDH P-256 公钥 raw(65B uncompressed)，base64url 无 padding。
+// challenge: 一次性 salt 标识（也是 HKDF salt 的 base64url 编码），前端原样回传。
+// ttl: challenge 过期秒数，前端决定是否刷新。
+type ChallengeResponse struct {
+	ServerPub string `json:"serverPub"`
+	Challenge string `json:"challenge"`
+	TTL       int    `json:"ttl"`
+}
+
+// EncryptedAuthRequest 是 login/register/change-password 的统一传输壳。
+// 内部明文格式由具体端点决定：
+//   - login:      {"username":"...","password":"..."}
+//   - register:   {"username":"...","password":"..."}
+//   - changePwd:  {"oldPassword":"...","newPassword":"..."}
+//
+// 所有二进制字段均 base64url 无 padding 编码。
+// AES-GCM 的 AAD 在 handler 层按端点名绑定（"login"/"register"/"change-password"），
+// 防止攻击者把 login 的密文原样当 change-password 提交。
+type EncryptedAuthRequest struct {
+	Challenge  string `json:"challenge" binding:"required"`
+	ClientPub  string `json:"clientPub" binding:"required"`
+	IV         string `json:"iv"        binding:"required"`
+	Ciphertext string `json:"ct"        binding:"required"`
+}

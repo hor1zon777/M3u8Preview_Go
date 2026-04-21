@@ -59,6 +59,9 @@ type Config struct {
 	CookieSecure bool
 	UploadsDir   string
 	DataDir      string
+	// ECDHPrivateKeyPath 登录加密协议用的长寿 ECDH P-256 私钥存放路径。
+	// 默认 <DataDir>/ecdh.pem；首次启动自动生成（0600）。
+	ECDHPrivateKeyPath string
 	ThumbnailConcurrency int
 	PosterConcurrency    int
 }
@@ -127,6 +130,13 @@ func Load(projectRoot string) (*Config, error) {
 		DataDir:              getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
 		ThumbnailConcurrency: clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
 		PosterConcurrency:    clamp(atoiDefault(os.Getenv("POSTER_MIGRATION_CONCURRENCY"), 2), 1, 10),
+	}
+
+	// ECDH 私钥路径：优先 env，否则落到 DataDir/ecdh.pem
+	if p := os.Getenv("ECDH_PRIVATE_KEY_PATH"); p != "" {
+		cfg.ECDHPrivateKeyPath = p
+	} else {
+		cfg.ECDHPrivateKeyPath = filepath.Join(cfg.DataDir, "ecdh.pem")
 	}
 
 	// 默认绑定地址：生产 127.0.0.1，开发 0.0.0.0

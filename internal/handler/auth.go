@@ -4,10 +4,14 @@
 package handler
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/go-playground/validator/v10"
 
 	"github.com/hor1zon777/m3u8-preview-go/internal/config"
@@ -19,19 +23,35 @@ import (
 
 // AuthHandler 汇总 auth 端点。
 type AuthHandler struct {
-	svc     *service.AuthService
-	ticket  *util.SSETicketStore
-	cfg     *config.Config
+	svc        *service.AuthService
+	ticket     *util.SSETicketStore
+	cfg        *config.Config
+	ecdh       *util.ECDHService
+	challenges *util.ChallengeStore
 }
 
 // NewAuthHandler 构造。
-func NewAuthHandler(svc *service.AuthService, ticket *util.SSETicketStore, cfg *config.Config) *AuthHandler {
-	return &AuthHandler{svc: svc, ticket: ticket, cfg: cfg}
+// ecdh / challenges 用于加密登录协议：前端先拉 challenge，再用 ECDH+HKDF+AES-GCM 提交密文。
+func NewAuthHandler(
+	svc *service.AuthService,
+	ticket *util.SSETicketStore,
+	cfg *config.Config,
+	ecdhSvc *util.ECDHService,
+	challenges *util.ChallengeStore,
+) *AuthHandler {
+	return &AuthHandler{
+		svc:        svc,
+		ticket:     ticket,
+		cfg:        cfg,
+		ecdh:       ecdhSvc,
+		challenges: challenges,
+	}
 }
 
 // Register 注入 Gin 路由。
 // authLimiter 已在上游 group.Use 注入；这里不再重复。
 func (h *AuthHandler) Register(rg *gin.RouterGroup) {
+	rg.GET("/challenge", h.challenge)
 	rg.POST("/register", h.register)
 	rg.POST("/login", h.login)
 	rg.POST("/refresh", h.refresh)
@@ -48,15 +68,36 @@ func (h *AuthHandler) RegisterAuthed(rg *gin.RouterGroup) {
 
 // --- handlers ---
 
+// challenge 签发一次性加密挑战，供前端用作 HKDF salt。
+// 公开端点（未认证），上游已挂 authLimiter（15m/50）限流。
+func (h *AuthHandler) challenge(c *gin.Context) {
+	id, _ := h.challenges.Issue()
+	c.JSON(http.StatusOK, dto.OK(dto.ChallengeResponse{
+		ServerPub: base64.RawURLEncoding.EncodeToString(h.ecdh.PublicKeyRaw()),
+		Challenge: id,
+		TTL:       h.challenges.TTLSeconds(),
+	}))
+}
+
 func (h *AuthHandler) register(c *gin.Context) {
-	var req dto.RegisterRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var enc dto.EncryptedAuthRequest
+	if err := c.ShouldBindJSON(&enc); err != nil {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
 		return
 	}
-	tp, err := h.svc.Register(req.Username, req.Password)
+	plaintext, err := h.decryptAuth(&enc, aadRegister)
 	if err != nil {
-		_ = c.Error(err)
+		middleware.AbortWithAppError(c, err)
+		return
+	}
+	var req dto.RegisterRequest
+	if err := unmarshalAndValidate(plaintext, &req); err != nil {
+		middleware.AbortWithAppError(c, err)
+		return
+	}
+	tp, err2 := h.svc.Register(req.Username, req.Password)
+	if err2 != nil {
+		_ = c.Error(err2)
 		return
 	}
 	h.setRefreshCookie(c, tp.RefreshToken)
@@ -64,16 +105,26 @@ func (h *AuthHandler) register(c *gin.Context) {
 }
 
 func (h *AuthHandler) login(c *gin.Context) {
-	var req dto.LoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var enc dto.EncryptedAuthRequest
+	if err := c.ShouldBindJSON(&enc); err != nil {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
+		return
+	}
+	plaintext, err := h.decryptAuth(&enc, aadLogin)
+	if err != nil {
+		middleware.AbortWithAppError(c, err)
+		return
+	}
+	var req dto.LoginRequest
+	if err := unmarshalAndValidate(plaintext, &req); err != nil {
+		middleware.AbortWithAppError(c, err)
 		return
 	}
 	ip := util.GetClientIP(c, h.cfg.TrustCDN)
 	ua := c.GetHeader("User-Agent")
-	tp, err := h.svc.Login(req.Username, req.Password, ip, ua)
-	if err != nil {
-		_ = c.Error(err)
+	tp, err2 := h.svc.Login(req.Username, req.Password, ip, ua)
+	if err2 != nil {
+		_ = c.Error(err2)
 		return
 	}
 	h.setRefreshCookie(c, tp.RefreshToken)
@@ -124,9 +175,19 @@ func (h *AuthHandler) me(c *gin.Context) {
 }
 
 func (h *AuthHandler) changePassword(c *gin.Context) {
-	var req dto.ChangePasswordRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var enc dto.EncryptedAuthRequest
+	if err := c.ShouldBindJSON(&enc); err != nil {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
+		return
+	}
+	plaintext, err := h.decryptAuth(&enc, aadChangePassword)
+	if err != nil {
+		middleware.AbortWithAppError(c, err)
+		return
+	}
+	var req dto.ChangePasswordRequest
+	if err := unmarshalAndValidate(plaintext, &req); err != nil {
+		middleware.AbortWithAppError(c, err)
 		return
 	}
 	uid := middleware.CurrentUserID(c)
@@ -177,4 +238,77 @@ func bindErrorToAppError(err error) *middleware.AppError {
 			fe.Field()+": "+fe.Tag())
 	}
 	return middleware.WrapAppError(http.StatusBadRequest, "请求体无效", err)
+}
+
+// --- 加密登录协议 helpers ---
+
+// AAD 端点绑定常量。加入 AES-GCM AAD 后，把 login 的密文改投给 register/change-password 会 GCM 校验失败。
+const (
+	aadLogin          = "auth:login:v1"
+	aadRegister       = "auth:register:v1"
+	aadChangePassword = "auth:change-password:v1"
+)
+
+// encryptedTSWindow 明文内 ts 字段允许的时钟漂移。超出窗口即便 challenge 尚未消费也视为重放尝试。
+const encryptedTSWindow = 60 * time.Second
+
+// encryptedPayloadEnvelope 是前端 JSON 明文的公共字段。各端点的业务字段用 RawMessage 透传。
+// 分两步 unmarshal：先读 ts，再 unmarshal 到具体 DTO。
+type encryptedPayloadEnvelope struct {
+	TS int64 `json:"ts"`
+}
+
+// decryptAuth 按协议解密 EncryptedAuthRequest，返回明文字节。
+// 失败统一返 400 "请求无效"，不回显内部原因（防止 oracle）。
+// 已记入 c.Error(原 err)，ErrorHandler 中间件会日志化。
+func (h *AuthHandler) decryptAuth(enc *dto.EncryptedAuthRequest, aad string) (plaintext []byte, appErr *middleware.AppError) {
+	clientPub, err := base64.RawURLEncoding.DecodeString(enc.ClientPub)
+	if err != nil {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+	iv, err := base64.RawURLEncoding.DecodeString(enc.IV)
+	if err != nil {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+	ct, err := base64.RawURLEncoding.DecodeString(enc.Ciphertext)
+	if err != nil {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+
+	// 消费 challenge（单次 + TTL 60s）。失败一律 400 "挑战已过期"。
+	salt, ok := h.challenges.Consume(enc.Challenge)
+	if !ok {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "挑战已过期或无效")
+	}
+
+	pt, err := h.ecdh.DecryptAuthPayload(clientPub, iv, ct, []byte(aad), salt)
+	if err != nil {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+
+	// 校验时间戳窗口作为双保险（challenge 已是一次性，这里主要挡客户端时钟飘移 + 便于日志分析）。
+	var env encryptedPayloadEnvelope
+	if err := json.Unmarshal(pt, &env); err != nil {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+	if env.TS == 0 {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+	drift := time.Since(time.UnixMilli(env.TS))
+	if drift < -encryptedTSWindow || drift > encryptedTSWindow {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求时间戳超出容许窗口")
+	}
+	return pt, nil
+}
+
+// unmarshalAndValidate 把明文 JSON 解入 dst 并跑 validator binding tag。
+// dst 应为 *RegisterRequest / *LoginRequest / *ChangePasswordRequest 之一。
+func unmarshalAndValidate(plaintext []byte, dst any) *middleware.AppError {
+	if err := json.Unmarshal(plaintext, dst); err != nil {
+		return middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+	if err := binding.Validator.ValidateStruct(dst); err != nil {
+		return bindErrorToAppError(err)
+	}
+	return nil
 }

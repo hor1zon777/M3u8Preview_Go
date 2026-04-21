@@ -3,6 +3,7 @@
 package app
 
 import (
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,8 @@ type Deps struct {
 	JWT    *util.JWTService
 	Ticket *util.SSETicketStore
 	Proxy  *util.ProxySigner
+	ECDH   *util.ECDHService
+	Chal   *util.ChallengeStore
 
 	// 限流
 	RateLimitCache *middleware.RateLimitSettingCache
@@ -43,13 +46,20 @@ type Deps struct {
 }
 
 // NewDeps 构造跨请求 singleton。
+// ECDH 密钥加载失败会 log.Fatal —— 这是启动必备资源，缺失时直接阻断启动比静默降级更安全。
 func NewDeps(cfg *config.Config, db *gorm.DB) *Deps {
+	ecdhSvc, err := util.LoadOrGenerateECDH(cfg.ECDHPrivateKeyPath)
+	if err != nil {
+		log.Fatalf("[app] load ecdh private key: %v", err)
+	}
 	return &Deps{
 		Cfg:            cfg,
 		DB:             db,
 		JWT:            util.NewJWTService(&cfg.JWT),
 		Ticket:         util.NewSSETicketStore(),
 		Proxy:          util.NewProxySigner(cfg.Proxy.Secret, cfg.Proxy.SignatureTTL),
+		ECDH:           ecdhSvc,
+		Chal:           util.NewChallengeStore(),
 		RateLimitCache: middleware.NewRateLimitSettingCache(db),
 		AuthLimiter:    middleware.NewWindowLimiter(50, 15*time.Minute),
 		GlobalLimiter:  middleware.NewWindowLimiter(200, 15*time.Minute),
@@ -117,7 +127,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 
 	// ---- Auth 模块 ----
 	authSvc := service.NewAuthService(db, deps.JWT, cfg)
-	authH := handler.NewAuthHandler(authSvc, deps.Ticket, cfg)
+	authH := handler.NewAuthHandler(authSvc, deps.Ticket, cfg, deps.ECDH, deps.Chal)
 	authDeps := &middleware.AuthDeps{JWT: deps.JWT, Ticket: deps.Ticket}
 
 	// 公开 auth 路由：register/login/refresh/logout/register-status
