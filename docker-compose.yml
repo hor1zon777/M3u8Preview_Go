@@ -17,8 +17,8 @@ services:
       - POSTER_MIGRATION_CONCURRENCY=${POSTER_MIGRATION_CONCURRENCY:-2}
       - TRUST_CDN=${TRUST_CDN:-true}
     volumes:
-      - db-data:/data
-      - uploads:/app/uploads
+      - ./data:/data
+      - ./uploads:/app/uploads
       # 前端构建产物：entrypoint 会把 /app/web/dist-image 每次启动同步到该 volume，
       # nginx 服务再只读挂到 /usr/share/nginx/html。
       - client-dist:/app/web/dist
@@ -40,9 +40,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  db-data:
-    driver: local
-  uploads:
-    driver: local
   client-dist:
     driver: local
