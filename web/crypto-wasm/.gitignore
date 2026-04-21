@@ -1,0 +1,4 @@
+# wasm-pack 构建产物
+target/
+*.wasm
+!src/*.rs

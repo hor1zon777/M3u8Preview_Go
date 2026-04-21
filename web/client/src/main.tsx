@@ -31,6 +31,12 @@ import { AdminUserDetailPage } from './pages/AdminUserDetailPage.js';
 import { AdminActivityPage } from './pages/AdminActivityPage.js';
 import './index.css';
 import { clearPendingScrollRestore, getPendingScrollRestore, getSavedRouteScrollPosition, buildRouteKey } from './lib/utils.js';
+import { startAntiDebug } from './utils/antidebug.js';
+
+// 软反调试仅在生产构建启用；dev 下 DevTools 是调试必备，启用会误伤自己。
+if (import.meta.env.PROD) {
+  startAntiDebug();
+}
 
 const queryClient = new QueryClient({
   defaultOptions: {

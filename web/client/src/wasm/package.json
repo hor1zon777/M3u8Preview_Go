@@ -1,0 +1,16 @@
+{
+  "name": "crypto-wasm",
+  "type": "module",
+  "description": "M3u8Preview 登录加密核心（ECDH P-256 + HKDF-SHA256 + AES-256-GCM）编译为 WASM",
+  "version": "0.1.0",
+  "files": [
+    "crypto_wasm_bg.wasm",
+    "crypto_wasm.js",
+    "crypto_wasm.d.ts"
+  ],
+  "main": "crypto_wasm.js",
+  "types": "crypto_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

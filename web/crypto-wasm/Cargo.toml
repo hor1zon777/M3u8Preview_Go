@@ -1,0 +1,42 @@
+[package]
+name = "crypto-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "M3u8Preview 登录加密核心（ECDH P-256 + HKDF-SHA256 + AES-256-GCM）编译为 WASM"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# WASM 绑定
+wasm-bindgen = "0.2"
+
+# WASM 随机源：必须开 js feature 才能用浏览器 CSPRNG
+getrandom = { version = "0.2", features = ["js"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# 加密原语（RustCrypto 生态）
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic", "pem"] }
+hkdf = "0.12"
+aes-gcm = "0.10"
+sha2 = "0.10"
+
+# 编码
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# 日志/错误
+thiserror = "1"
+
+[profile.release]
+# 体积优化：WASM 首屏加载速度比运行时速度重要
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# wasm-pack 自带 wasm-opt 版本过旧（不支持 bulk memory，LLVM 新目标生成的 memory.copy 会报错）。
+# 已通过 Rust release profile（lto + opt-z + strip）做体积优化，wasm-opt 收益有限，直接禁用。
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
