@@ -190,3 +190,13 @@ func deriveAESKey(sharedSecret, salt []byte) ([]byte, error) {
 	}
 	return out, nil
 }
+
+// BlendSalt 混合 challenge salt 与设备指纹：SHA256(challengeSalt || fingerprintBytes)。
+// 与 Rust WASM 的 blend_salt 函数一一对齐。
+// 前端指纹是 hex string，调用方负责 hex.DecodeString 后传入 fpBytes。
+func BlendSalt(challengeSalt, fpBytes []byte) []byte {
+	h := sha256.New()
+	h.Write(challengeSalt)
+	h.Write(fpBytes)
+	return h.Sum(nil)
+}

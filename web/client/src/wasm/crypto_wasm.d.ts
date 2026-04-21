@@ -1,9 +1,6 @@
 /* tslint:disable */
 /* eslint-disable */
 
-/**
- * 加密结果，结构字段 base64url 无 padding，与后端 handler 对齐。
- */
 export class EncryptResult {
     private constructor();
     free(): void;
@@ -15,21 +12,21 @@ export class EncryptResult {
 
 /**
  * 执行 ECDH + HKDF + AES-GCM 加密，返回 (clientPub, iv, ct)。
- * 参数均为明文/base64url 字符串，JS 层保持与文档约定一致的编码。
  *
- * * aad             AES-GCM AAD，端点绑定常量，如 "auth:login:v1"。
- * * server_pub_b64  服务端公钥 65B uncompressed 的 base64url。
- * * challenge_b64   服务端下发的 challenge（既是 ID 也是 HKDF salt）的 base64url。
- * * plaintext_json  明文 JSON，如 '{"username":"a","password":"b","ts":1234567890}'。
+ * * aad              AES-GCM AAD，端点绑定常量，如 "auth:login:v1"
+ * * server_pub_b64   服务端公钥 65B uncompressed 的 base64url
+ * * challenge_b64    challenge salt 的 base64url
+ * * fingerprint_hex  设备指纹 SHA-256 hex（64 字符），混入 HKDF salt
+ * * plaintext_json   明文 JSON
  */
-export function encrypt_auth_payload(aad: string, server_pub_b64: string, challenge_b64: string, plaintext_json: string): EncryptResult;
+export function encrypt_auth_payload(aad: string, server_pub_b64: string, challenge_b64: string, fingerprint_hex: string, plaintext_json: string): EncryptResult;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_encryptresult_free: (a: number, b: number) => void;
-    readonly encrypt_auth_payload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+    readonly encrypt_auth_payload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly encryptresult_clientPub: (a: number, b: number) => void;
     readonly encryptresult_ct: (a: number, b: number) => void;
     readonly encryptresult_iv: (a: number, b: number) => void;

@@ -19,6 +19,7 @@
 
 import axios from 'axios';
 import initWasm, { encrypt_auth_payload, type EncryptResult } from '../wasm/crypto_wasm.js';
+import { getDeviceFingerprint } from './fingerprint.js';
 
 const CHALLENGE_URL = '/api/v1/auth/challenge';
 
@@ -54,10 +55,11 @@ function ensureWasm(): Promise<void> {
   return wasmReady;
 }
 
-async function fetchChallenge(): Promise<ChallengeResponse> {
-  // 用原始 axios 跳过 api 拦截器：本接口未认证，也不应触发 refresh 逻辑。
-  const { data } = await axios.get<{ success: boolean; data?: ChallengeResponse; error?: string }>(
+async function fetchChallenge(fingerprint: string): Promise<ChallengeResponse> {
+  // POST 改 GET：T2.5 起 challenge 绑定设备指纹，body 传 fingerprint。
+  const { data } = await axios.post<{ success: boolean; data?: ChallengeResponse; error?: string }>(
     CHALLENGE_URL,
+    { fingerprint },
     { timeout: 10000 },
   );
   if (!data.success || !data.data) {
@@ -77,7 +79,8 @@ export async function encryptAuthPayload(
 ): Promise<EncryptedEnvelope> {
   await ensureWasm();
 
-  const challengeResp = await fetchChallenge();
+  const fingerprint = await getDeviceFingerprint();
+  const challengeResp = await fetchChallenge(fingerprint);
   const plaintextJson = JSON.stringify({ ...payload, ts: Date.now() });
 
   let result: EncryptResult | null = null;
@@ -86,6 +89,7 @@ export async function encryptAuthPayload(
       AuthAAD[aadKey],
       challengeResp.serverPub,
       challengeResp.challenge,
+      fingerprint,
       plaintextJson,
     );
     return {

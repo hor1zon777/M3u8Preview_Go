@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"maps"
@@ -42,12 +43,14 @@ func buildTestHandler(t *testing.T) *AuthHandler {
 	}
 }
 
-// encryptAsClient 复刻前端 utils/crypto.ts 的加密步骤。
+// encryptAsClient 复刻前端 utils/crypto.ts 的加密步骤（含 T2.5 设备指纹混合 salt）。
 func encryptAsClient(t *testing.T, h *AuthHandler, aad string, payload map[string]any) (*dto.EncryptedAuthRequest, string) {
 	t.Helper()
 
-	// 1. 从 store issue 一个 challenge（模拟前端 GET /auth/challenge）
-	challengeID, salt := h.challenges.Issue()
+	const testFP = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+	// 1. 从 store issue 一个 challenge + 绑定指纹
+	challengeID, salt := h.challenges.Issue(testFP)
 
 	// 2. 客户端一次性 ECDH 密钥对
 	clientPriv, err := ecdh.P256().GenerateKey(rand.Reader)
@@ -55,7 +58,7 @@ func encryptAsClient(t *testing.T, h *AuthHandler, aad string, payload map[strin
 		t.Fatalf("gen client priv: %v", err)
 	}
 
-	// 3. ECDH 协商 + HKDF 派生 AES key
+	// 3. ECDH 协商 + HKDF 派生 AES key（salt = BlendSalt(challenge, fp)）
 	serverPubKey, err := ecdh.P256().NewPublicKey(h.ecdh.PublicKeyRaw())
 	if err != nil {
 		t.Fatalf("parse server pub: %v", err)
@@ -64,7 +67,9 @@ func encryptAsClient(t *testing.T, h *AuthHandler, aad string, payload map[strin
 	if err != nil {
 		t.Fatalf("ecdh: %v", err)
 	}
-	r := hkdf.New(sha256.New, shared, salt, []byte("m3u8preview-auth-v1"))
+	fpBytes, _ := hex.DecodeString(testFP)
+	blendedSalt := util.BlendSalt(salt, fpBytes)
+	r := hkdf.New(sha256.New, shared, blendedSalt, []byte("m3u8preview-auth-v1"))
 	aesKey := make([]byte, 32)
 	if _, err := io.ReadFull(r, aesKey); err != nil {
 		t.Fatalf("hkdf: %v", err)
@@ -156,12 +161,14 @@ func TestAuthHandler_DecryptAuth_InvalidBase64_Rejects(t *testing.T) {
 
 func TestAuthHandler_DecryptAuth_StaleTimestamp_Rejects(t *testing.T) {
 	h := buildTestHandler(t)
-	// 用 2 分钟前的 ts 加密
-	challengeID, salt := h.challenges.Issue()
+	const testFP = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	challengeID, salt := h.challenges.Issue(testFP)
 	clientPriv, _ := ecdh.P256().GenerateKey(rand.Reader)
 	serverPubKey, _ := ecdh.P256().NewPublicKey(h.ecdh.PublicKeyRaw())
 	shared, _ := clientPriv.ECDH(serverPubKey)
-	r := hkdf.New(sha256.New, shared, salt, []byte("m3u8preview-auth-v1"))
+	fpBytes, _ := hex.DecodeString(testFP)
+	blendedSalt := util.BlendSalt(salt, fpBytes)
+	r := hkdf.New(sha256.New, shared, blendedSalt, []byte("m3u8preview-auth-v1"))
 	aesKey := make([]byte, 32)
 	_, _ = io.ReadFull(r, aesKey)
 

@@ -5,6 +5,7 @@ package handler
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -51,7 +52,7 @@ func NewAuthHandler(
 // Register 注入 Gin 路由。
 // authLimiter 已在上游 group.Use 注入；这里不再重复。
 func (h *AuthHandler) Register(rg *gin.RouterGroup) {
-	rg.GET("/challenge", h.challenge)
+	rg.POST("/challenge", h.challenge)
 	rg.POST("/register", h.register)
 	rg.POST("/login", h.login)
 	rg.POST("/refresh", h.refresh)
@@ -68,10 +69,14 @@ func (h *AuthHandler) RegisterAuthed(rg *gin.RouterGroup) {
 
 // --- handlers ---
 
-// challenge 签发一次性加密挑战，供前端用作 HKDF salt。
-// 公开端点（未认证），上游已挂 authLimiter（15m/50）限流。
+// challenge 签发一次性加密挑战，绑定设备指纹。
 func (h *AuthHandler) challenge(c *gin.Context) {
-	id, _ := h.challenges.Issue()
+	var req dto.ChallengeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, bindErrorToAppError(err))
+		return
+	}
+	id, _ := h.challenges.Issue(req.Fingerprint)
 	c.JSON(http.StatusOK, dto.OK(dto.ChallengeResponse{
 		ServerPub: base64.RawURLEncoding.EncodeToString(h.ecdh.PublicKeyRaw()),
 		Challenge: id,
@@ -275,13 +280,20 @@ func (h *AuthHandler) decryptAuth(enc *dto.EncryptedAuthRequest, aad string) (pl
 		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
 	}
 
-	// 消费 challenge（单次 + TTL 60s）。失败一律 400 "挑战已过期"。
-	salt, ok := h.challenges.Consume(enc.Challenge)
+	// 消费 challenge（单次 + TTL 60s）+ 取出绑定的设备指纹。
+	salt, fp, ok := h.challenges.Consume(enc.Challenge)
 	if !ok {
 		return nil, middleware.NewAppError(http.StatusBadRequest, "挑战已过期或无效")
 	}
 
-	pt, err := h.ecdh.DecryptAuthPayload(clientPub, iv, ct, []byte(aad), salt)
+	// 混合 salt：SHA256(challengeSalt || fingerprint)，与 Rust WASM blend_salt 对齐。
+	fpBytes, err := hex.DecodeString(fp)
+	if err != nil {
+		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
+	}
+	blendedSalt := util.BlendSalt(salt, fpBytes)
+
+	pt, err := h.ecdh.DecryptAuthPayload(clientPub, iv, ct, []byte(aad), blendedSalt)
 	if err != nil {
 		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
 	}

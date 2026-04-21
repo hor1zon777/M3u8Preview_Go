@@ -1,8 +1,5 @@
 /* @ts-self-types="./crypto_wasm.d.ts" */
 
-/**
- * 加密结果，结构字段 base64url 无 padding，与后端 handler 对齐。
- */
 export class EncryptResult {
     static __wrap(ptr) {
         ptr = ptr >>> 0;
@@ -83,19 +80,20 @@ if (Symbol.dispose) EncryptResult.prototype[Symbol.dispose] = EncryptResult.prot
 
 /**
  * 执行 ECDH + HKDF + AES-GCM 加密，返回 (clientPub, iv, ct)。
- * 参数均为明文/base64url 字符串，JS 层保持与文档约定一致的编码。
  *
- * * aad             AES-GCM AAD，端点绑定常量，如 "auth:login:v1"。
- * * server_pub_b64  服务端公钥 65B uncompressed 的 base64url。
- * * challenge_b64   服务端下发的 challenge（既是 ID 也是 HKDF salt）的 base64url。
- * * plaintext_json  明文 JSON，如 '{"username":"a","password":"b","ts":1234567890}'。
+ * * aad              AES-GCM AAD，端点绑定常量，如 "auth:login:v1"
+ * * server_pub_b64   服务端公钥 65B uncompressed 的 base64url
+ * * challenge_b64    challenge salt 的 base64url
+ * * fingerprint_hex  设备指纹 SHA-256 hex（64 字符），混入 HKDF salt
+ * * plaintext_json   明文 JSON
  * @param {string} aad
  * @param {string} server_pub_b64
  * @param {string} challenge_b64
+ * @param {string} fingerprint_hex
  * @param {string} plaintext_json
  * @returns {EncryptResult}
  */
-export function encrypt_auth_payload(aad, server_pub_b64, challenge_b64, plaintext_json) {
+export function encrypt_auth_payload(aad, server_pub_b64, challenge_b64, fingerprint_hex, plaintext_json) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         const ptr0 = passStringToWasm0(aad, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
@@ -104,9 +102,11 @@ export function encrypt_auth_payload(aad, server_pub_b64, challenge_b64, plainte
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passStringToWasm0(challenge_b64, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
         const len2 = WASM_VECTOR_LEN;
-        const ptr3 = passStringToWasm0(plaintext_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const ptr3 = passStringToWasm0(fingerprint_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
         const len3 = WASM_VECTOR_LEN;
-        wasm.encrypt_auth_payload(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        const ptr4 = passStringToWasm0(plaintext_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len4 = WASM_VECTOR_LEN;
+        wasm.encrypt_auth_payload(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);

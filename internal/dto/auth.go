@@ -64,6 +64,12 @@ type ChallengeResponse struct {
 	TTL       int    `json:"ttl"`
 }
 
+// ChallengeRequest POST /auth/challenge
+// fingerprint: 设备指纹 SHA-256 hex（64 字符），与 challenge 绑定后混入 HKDF salt。
+type ChallengeRequest struct {
+	Fingerprint string `json:"fingerprint" binding:"required,len=64"`
+}
+
 // EncryptedAuthRequest 是 login/register/change-password 的统一传输壳。
 // 内部明文格式由具体端点决定：
 //   - login:      {"username":"...","password":"..."}

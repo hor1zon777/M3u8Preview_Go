@@ -5,11 +5,13 @@ import (
 	"time"
 )
 
+const testFP = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
 func TestChallenge_IssueConsume(t *testing.T) {
 	s := NewChallengeStore()
 	defer s.Stop()
 
-	id, salt := s.Issue()
+	id, salt := s.Issue(testFP)
 	if id == "" {
 		t.Fatal("empty id")
 	}
@@ -17,15 +19,17 @@ func TestChallenge_IssueConsume(t *testing.T) {
 		t.Fatalf("salt length=%d, want 32", len(salt))
 	}
 
-	got, ok := s.Consume(id)
+	got, fp, ok := s.Consume(id)
 	if !ok {
 		t.Fatal("first consume should succeed")
 	}
 	if string(got) != string(salt) {
 		t.Fatal("consumed salt != issued salt")
 	}
-	// 一次性：第二次消费应该失败
-	if _, ok := s.Consume(id); ok {
+	if fp != testFP {
+		t.Fatalf("fingerprint mismatch: %s", fp)
+	}
+	if _, _, ok := s.Consume(id); ok {
 		t.Fatal("second consume should fail (one-time use)")
 	}
 }
@@ -36,12 +40,13 @@ func TestChallenge_Expired(t *testing.T) {
 
 	s.mu.Lock()
 	s.entries["expired"] = challengeEntry{
-		salt:      []byte("x"),
-		expiresAt: time.Now().Add(-time.Second).UnixNano(),
+		salt:        []byte("x"),
+		fingerprint: testFP,
+		expiresAt:   time.Now().Add(-time.Second).UnixNano(),
 	}
 	s.mu.Unlock()
 
-	if _, ok := s.Consume("expired"); ok {
+	if _, _, ok := s.Consume("expired"); ok {
 		t.Fatal("expired challenge should not be consumable")
 	}
 }
@@ -49,7 +54,7 @@ func TestChallenge_Expired(t *testing.T) {
 func TestChallenge_Unknown(t *testing.T) {
 	s := NewChallengeStore()
 	defer s.Stop()
-	if _, ok := s.Consume("does-not-exist"); ok {
+	if _, _, ok := s.Consume("does-not-exist"); ok {
 		t.Fatal("unknown challenge should fail")
 	}
 }
@@ -57,12 +62,10 @@ func TestChallenge_Unknown(t *testing.T) {
 func TestChallenge_MaxItemsEviction(t *testing.T) {
 	s := NewChallengeStore()
 	defer s.Stop()
-	s.maxItems = 4 // 压到小值便于测试
+	s.maxItems = 4
 
-	ids := make([]string, 0, 10)
 	for range 10 {
-		id, _ := s.Issue()
-		ids = append(ids, id)
+		s.Issue(testFP)
 	}
 	s.mu.Lock()
 	size := len(s.entries)
@@ -77,7 +80,7 @@ func TestChallenge_UniqueIDs(t *testing.T) {
 	defer s.Stop()
 	seen := make(map[string]bool)
 	for i := range 1000 {
-		id, _ := s.Issue()
+		id, _ := s.Issue(testFP)
 		if seen[id] {
 			t.Fatalf("duplicate id at iter %d: %s", i, id)
 		}

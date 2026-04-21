@@ -14,10 +14,11 @@ import (
 	"time"
 )
 
-// challengeEntry 存储 salt 字节与过期时间。
+// challengeEntry 存储 salt 字节、指纹与过期时间。
 type challengeEntry struct {
-	salt      []byte
-	expiresAt int64 // unix nano
+	salt        []byte
+	fingerprint string // 设备指纹 SHA-256 hex
+	expiresAt   int64  // unix nano
 }
 
 // ChallengeStore 是进程内 challenge 存储。单实例复用。
@@ -52,9 +53,9 @@ func (s *ChallengeStore) TTLSeconds() int {
 	return int(s.ttl.Seconds())
 }
 
-// Issue 生成 32B 随机 challenge，存入并返回（id, base64url 编码）。
-// id 同时也是 map key 与前端提交时回传的标识；id = base64url(salt)（无需额外随机 id）。
-func (s *ChallengeStore) Issue() (id string, salt []byte) {
+// Issue 生成 32B 随机 challenge，绑定设备指纹，存入并返回（id, salt）。
+// fingerprint 是前端采集的 SHA-256 hex（64 字符），不在这层校验格式。
+func (s *ChallengeStore) Issue(fingerprint string) (id string, salt []byte) {
 	buf := make([]byte, 32)
 	_, _ = rand.Read(buf)
 	id = base64.RawURLEncoding.EncodeToString(buf)
@@ -62,32 +63,32 @@ func (s *ChallengeStore) Issue() (id string, salt []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.entries) >= s.maxItems {
-		for k := range s.entries { // map 无序遍历，取一条删除近似 FIFO
+		for k := range s.entries {
 			delete(s.entries, k)
 			break
 		}
 	}
 	s.entries[id] = challengeEntry{
-		salt:      buf,
-		expiresAt: time.Now().Add(s.ttl).UnixNano(),
+		salt:        buf,
+		fingerprint: fingerprint,
+		expiresAt:   time.Now().Add(s.ttl).UnixNano(),
 	}
 	return id, buf
 }
 
-// Consume 一次性消费 challenge。成功返回 salt 字节和 true；不存在 / 过期返回 false。
-// id 是 Issue 返回的 base64url 字符串。
-func (s *ChallengeStore) Consume(id string) ([]byte, bool) {
+// Consume 一次性消费 challenge。成功返回 (salt, fingerprint, true)；不存在 / 过期返回 false。
+func (s *ChallengeStore) Consume(id string) (salt []byte, fingerprint string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.entries[id]
-	if !ok {
-		return nil, false
+	e, exists := s.entries[id]
+	if !exists {
+		return nil, "", false
 	}
 	delete(s.entries, id)
 	if time.Now().UnixNano() > e.expiresAt {
-		return nil, false
+		return nil, "", false
 	}
-	return e.salt, true
+	return e.salt, e.fingerprint, true
 }
 
 func (s *ChallengeStore) loopCleanup() {
