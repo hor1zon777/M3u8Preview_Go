@@ -45,6 +45,7 @@ export function AdminDashboardPage() {
   const settingsLoaded = !!settings;
   const allowRegistration = settings?.find((s) => s.key === 'allowRegistration')?.value !== 'false';
   const enableRateLimit = settings?.find((s) => s.key === 'enableRateLimit')?.value !== 'false';
+  const downloadExternalPosters = settings?.find((s) => s.key === 'downloadExternalPosters')?.value === 'true';
   const siteName = settings?.find((s) => s.key === 'siteName')?.value || '';
   const [siteNameDraft, setSiteNameDraft] = useState('');
   const siteNameSynced = useRef(false);
@@ -257,6 +258,35 @@ export function AdminDashboardPage() {
               <span
                 className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
                   enableRateLimit ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-white text-sm">外部封面下载到本地</p>
+              <p className="text-emby-text-muted text-xs mt-0.5">
+                开启后新建/编辑媒体时会把外部 http(s) 封面同步下载到 uploads/posters/；关闭则保留原 URL
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={downloadExternalPosters}
+              disabled={updateSettingMutation.isPending || !settingsLoaded}
+              onClick={() =>
+                updateSettingMutation.mutate({
+                  key: 'downloadExternalPosters',
+                  value: downloadExternalPosters ? 'false' : 'true',
+                })
+              }
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
+                downloadExternalPosters ? 'bg-emby-green' : 'bg-emby-bg-input'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  downloadExternalPosters ? 'translate-x-6' : 'translate-x-1'
                 }`}
               />
             </button>

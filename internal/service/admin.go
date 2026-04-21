@@ -244,6 +244,7 @@ var allowedSettingKeys = map[string]struct{}{
 	"allowRegistration":       {},
 	"enableRateLimit":         {},
 	"proxyAllowedExtensions":  {},
+	"downloadExternalPosters": {},
 }
 
 // UpdateSetting upsert 单个 key，返回当前值。

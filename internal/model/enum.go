@@ -37,4 +37,7 @@ const (
 	SettingAllowRegistration      = "allowRegistration"
 	SettingEnableRateLimit        = "enableRateLimit"
 	SettingProxyAllowedExtensions = "proxyAllowedExtensions"
+	// 新建/更新媒体时，若 posterUrl 为外部 http(s)，是否同步下载到本地。
+	// 默认 false：保留原 URL，避免首次入库同步阻塞。
+	SettingDownloadExternalPosters = "downloadExternalPosters"
 )

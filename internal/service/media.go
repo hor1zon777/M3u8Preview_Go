@@ -134,6 +134,16 @@ func (s *MediaService) SetThumbnailEnqueuer(t ThumbnailEnqueuer) {
 	s.thumb = t
 }
 
+// shouldDownloadExternalPoster 查 system_settings.downloadExternalPosters，
+// 缺失或查询失败均视为 false（保留外部 URL，不阻塞请求）。
+func (s *MediaService) shouldDownloadExternalPoster() bool {
+	var setting model.SystemSetting
+	if err := s.db.Where("key = ?", model.SettingDownloadExternalPosters).Take(&setting).Error; err != nil {
+		return false
+	}
+	return setting.Value == "true"
+}
+
 // FindAll 分页列表，支持 search / categoryId / tagId / artist / status / sortBy/Order。
 func (s *MediaService) FindAll(q dto.MediaQuery) (dto.MediaListResponse, error) {
 	page, limit := util.SafePagination(q.Page, q.Limit, 100)
@@ -214,9 +224,14 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 	if err := validateLocalPosterURL(req.PosterURL); err != nil {
 		return nil, err
 	}
-	resolvedPoster, err := s.poster.Resolve(req.PosterURL)
-	if err != nil {
-		return nil, middleware.WrapAppError(http.StatusBadGateway, "下载封面失败", err)
+	// 是否把外部 poster URL 同步下载到本地，由系统设置 downloadExternalPosters 控制。
+	resolvedPoster := req.PosterURL
+	if s.shouldDownloadExternalPoster() {
+		rp, err := s.poster.Resolve(req.PosterURL)
+		if err != nil {
+			return nil, middleware.WrapAppError(http.StatusBadGateway, "下载封面失败", err)
+		}
+		resolvedPoster = rp
 	}
 
 	m := model.Media{
@@ -235,7 +250,7 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 		m.Status = *req.Status
 	}
 
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err := s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&m).Error; err != nil {
 			return err
 		}
@@ -274,11 +289,14 @@ func (s *MediaService) Update(id string, req dto.MediaUpdateRequest) (*dto.Media
 		if err := validateLocalPosterURL(req.PosterURL); err != nil {
 			return nil, err
 		}
-		resolved, err := s.poster.Resolve(req.PosterURL)
-		if err != nil {
-			return nil, middleware.WrapAppError(http.StatusBadGateway, "下载封面失败", err)
+		// 同 Create：由系统设置 downloadExternalPosters 决定是否同步下载到本地。
+		if s.shouldDownloadExternalPoster() {
+			resolved, err := s.poster.Resolve(req.PosterURL)
+			if err != nil {
+				return nil, middleware.WrapAppError(http.StatusBadGateway, "下载封面失败", err)
+			}
+			req.PosterURL = resolved
 		}
-		req.PosterURL = resolved
 	}
 
 	updates := map[string]any{}

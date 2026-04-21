@@ -141,7 +141,10 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	})
 
 	// ---- 核心业务模块（阶段 F）----
-	mediaSvc := service.NewMediaService(db, cfg.UploadsDir, nil, nil)
+	// thumbQueue / posterDL 已在上方构造，这里注入给 MediaService：
+	//   - PosterResolver：admin 创建/更新时若 poster_url 为外部 http(s)，同步下载到本地
+	//   - ThumbnailEnqueuer：新建媒体且未显式指定封面时异步生成缩略图
+	mediaSvc := service.NewMediaService(db, cfg.UploadsDir, thumbQueue, posterDL)
 	mediaH := handler.NewMediaHandler(mediaSvc, thumbQueue)
 	categorySvc := service.NewCategoryService(db)
 	categoryH := handler.NewCategoryHandler(categorySvc)
