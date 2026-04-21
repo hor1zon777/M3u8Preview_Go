@@ -63,11 +63,16 @@ func (s *UploadService) SavePoster(header *multipart.FileHeader) (string, error)
 		return "", middleware.NewAppError(http.StatusBadRequest, "Invalid file extension")
 	}
 
+	// Content-Type 强制必填：空值之前会跳过 MIME 白名单与 image/* 前缀校验，只剩扩展名做闸。
+	// 攻击者可把 HTML/SVG+JS 改名为 .png 上传，此处直接拒绝。
 	mime := strings.ToLower(header.Header.Get("Content-Type"))
-	if mime != "" && len(s.allowedMimeTypes) > 0 && !s.allowedMimeTypes[mime] {
+	if mime == "" {
+		return "", middleware.NewAppError(http.StatusBadRequest, "缺少 Content-Type")
+	}
+	if len(s.allowedMimeTypes) > 0 && !s.allowedMimeTypes[mime] {
 		return "", middleware.NewAppError(http.StatusBadRequest, fmt.Sprintf("File type %s is not allowed", mime))
 	}
-	if mime != "" && !strings.HasPrefix(mime, "image/") {
+	if !strings.HasPrefix(mime, "image/") {
 		return "", middleware.NewAppError(http.StatusBadRequest, "Only image files are allowed")
 	}
 

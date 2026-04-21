@@ -18,6 +18,11 @@ import (
 // Open 建立 GORM 连接并设置 SQLite 关键 PRAGMA。
 // foreign_keys=ON 对齐 Prisma 默认行为（SQLite 原生不强制外键，必须显式打开）；
 // WAL 模式提升并发读性能，对备份恢复场景更友好。
+//
+// 注意：PRAGMA 在 SQLite 中是"连接级"配置。
+// glebarez/sqlite 以 DSN 查询参数 `_pragma=foreign_keys(1)` 形式传递的 PRAGMA 会在每次建连时执行，
+// 因此即便 SetConnMaxLifetime 触发连接重建，新连接也会自动带上外键 / busy_timeout / WAL 设置。
+// 旧版只用 db.Exec("PRAGMA ...") 对当前连接生效，连接回收后这些约束静默失效。
 func Open(cfg *config.Config) (*gorm.DB, error) {
 	dbPath := cfg.SQLitePath()
 	// 确保数据库文件目录存在
@@ -41,7 +46,10 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		NowFunc: func() time.Time { return time.Now().UTC() },
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), gormCfg)
+	// DSN 里挂 PRAGMA：glebarez/sqlite 驱动在每次建连时会执行这些 PRAGMA，
+	// 因此连接池重建连接后外键 / busy_timeout / WAL 等仍然生效，不再受 ConnMaxLifetime 影响。
+	dsn := dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err := gorm.Open(sqlite.Open(dsn), gormCfg)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -55,22 +63,10 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(1)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
-	// 开启外键（SQLite 默认关）
+	// 首连接上再执行一次 PRAGMA 校验，确保 DSN 被驱动正确解析（防御性）。
 	if err := db.Exec("PRAGMA foreign_keys = ON").Error; err != nil {
 		return nil, fmt.Errorf("enable foreign_keys: %w", err)
 	}
-	// WAL + NORMAL 组合：读写并发更好，崩溃安全性与 FULL 接近
-	if err := db.Exec("PRAGMA journal_mode = WAL").Error; err != nil {
-		return nil, fmt.Errorf("set journal_mode: %w", err)
-	}
-	if err := db.Exec("PRAGMA synchronous = NORMAL").Error; err != nil {
-		return nil, fmt.Errorf("set synchronous: %w", err)
-	}
-	// 忙等待 5s 再报错，减少并发写冲突
-	if err := db.Exec("PRAGMA busy_timeout = 5000").Error; err != nil {
-		return nil, fmt.Errorf("set busy_timeout: %w", err)
-	}
-
 	return db, nil
 }
 

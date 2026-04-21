@@ -5,6 +5,7 @@ package handler
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"os"
 
@@ -14,6 +15,10 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
 	"github.com/hor1zon777/m3u8-preview-go/internal/service"
 )
+
+// maxBackupUploadBytes 限制上传备份 ZIP 的大小，防止磁盘填满 DoS。
+// 对齐典型 admin 备份规模（数百 MB 级别）。如需更大可设 ENV，这里先硬编码 2 GiB。
+const maxBackupUploadBytes int64 = 2 << 30
 
 // BackupHandler 汇总 backup 端点。
 type BackupHandler struct {
@@ -25,13 +30,19 @@ func NewBackupHandler(svc *service.BackupService) *BackupHandler {
 	return &BackupHandler{svc: svc}
 }
 
-// Register 在已经应用 authenticate + requireAdmin 的 group 上挂全部路由。
+// Register 在已经应用 authenticate + requireAdmin 的 group 上挂非 SSE 路由。
+// SSE 路由由 RegisterSSE 注册，须走 AuthenticateSSE 中间件以识别 ?ticket=。
 func (h *BackupHandler) Register(rg *gin.RouterGroup) {
 	rg.GET("/export", h.exportDirect)
-	rg.GET("/export/stream", h.exportStream)
 	rg.GET("/download/:id", h.download)
 	rg.POST("/import", h.importSync)
 	rg.POST("/import/upload", h.importUpload)
+}
+
+// RegisterSSE 注册需要 ?ticket= 认证的 EventSource 路由。
+// 调用方应对此 group 使用 middleware.AuthenticateSSE + RequireRole("ADMIN")。
+func (h *BackupHandler) RegisterSSE(rg *gin.RouterGroup) {
+	rg.GET("/export/stream", h.exportStream)
 	rg.GET("/import/stream/:id", h.importStream)
 }
 
@@ -60,21 +71,46 @@ func (h *BackupHandler) exportDirect(c *gin.Context) {
 }
 
 // exportStream SSE：按阶段推送进度，完成时带 downloadId。
+// 客户端断开时 (c.Request.Context().Done()) 立即中止，避免白跑完整 DB 扫描 + ZIP 打包。
 func (h *BackupHandler) exportStream(c *gin.Context) {
 	includePosters := c.Query("includePosters") != "false"
 	setupSSEHeaders(c)
+	ctx := c.Request.Context()
 
+	cancelled := false
 	send := func(v any) {
+		if cancelled {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			cancelled = true
+			return
+		default:
+		}
 		raw, _ := json.Marshal(v)
-		_, _ = c.Writer.Write([]byte("data: "))
-		_, _ = c.Writer.Write(raw)
-		_, _ = c.Writer.Write([]byte("\n\n"))
+		if _, err := c.Writer.Write([]byte("data: ")); err != nil {
+			cancelled = true
+			return
+		}
+		if _, err := c.Writer.Write(raw); err != nil {
+			cancelled = true
+			return
+		}
+		if _, err := c.Writer.Write([]byte("\n\n")); err != nil {
+			cancelled = true
+			return
+		}
 		c.Writer.Flush()
 	}
 
 	_, _, err := h.svc.ExportToFile(includePosters, func(p service.ExportProgress) {
 		send(p)
 	})
+	if cancelled {
+		log.Printf("[backup] exportStream client disconnected, abort")
+		return
+	}
 	if err != nil {
 		send(service.ExportProgress{Phase: "error", Message: err.Error()})
 		return
@@ -89,6 +125,9 @@ func (h *BackupHandler) download(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusNotFound, "下载链接已过期或不存在"))
 		return
 	}
+	// 无论后续 open/copy 是否成功，都必须清理 DB 中的 pendingDownload + 磁盘文件，
+	// 否则 Open 失败的路径会导致临时 ZIP 永久残留。
+	defer h.svc.DeleteDownload(id)
 	f, err := os.Open(item.FilePath)
 	if err != nil {
 		middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusInternalServerError, "打开临时文件失败", err))
@@ -103,15 +142,21 @@ func (h *BackupHandler) download(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="`+item.Filename+`"`)
 	if _, err := io.Copy(c.Writer, f); err != nil {
 		// 客户端断开；仍尝试清理
+		_ = err
 	}
-	h.svc.DeleteDownload(id)
 }
 
 // importSync 一步式：multipart 上传 → 立即恢复 → 返回结果（阻塞到完成）。
+// 前置 size 校验 + LimitReader 双重防护，防止 100GB 恶意上传。
 func (h *BackupHandler) importSync(c *gin.Context) {
 	fh, err := c.FormFile("file")
 	if err != nil {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请上传 ZIP 备份文件"))
+		return
+	}
+	if fh.Size > maxBackupUploadBytes {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusRequestEntityTooLarge,
+			"备份文件超过最大允许大小"))
 		return
 	}
 	src, err := fh.Open()
@@ -125,14 +170,22 @@ func (h *BackupHandler) importSync(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusInternalServerError, "创建临时文件失败", err))
 		return
 	}
-	if _, err := io.Copy(tmp, src); err != nil {
-		_ = src.Close()
+	// LimitReader 拦截篡改 Content-Length 的攻击；+1 用于识别超限情况
+	n, err := io.Copy(tmp, io.LimitReader(src, maxBackupUploadBytes+1))
+	_ = src.Close()
+	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusInternalServerError, "写入临时文件失败", err))
 		return
 	}
-	_ = src.Close()
+	if n > maxBackupUploadBytes {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusRequestEntityTooLarge,
+			"备份文件超过最大允许大小"))
+		return
+	}
 	_ = tmp.Close()
 	defer func() { _ = os.Remove(tmp.Name()) }()
 
@@ -151,6 +204,11 @@ func (h *BackupHandler) importUpload(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请上传 ZIP 备份文件"))
 		return
 	}
+	if fh.Size > maxBackupUploadBytes {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusRequestEntityTooLarge,
+			"备份文件超过最大允许大小"))
+		return
+	}
 	src, err := fh.Open()
 	if err != nil {
 		middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusBadRequest, "打开上传文件失败", err))
@@ -158,7 +216,7 @@ func (h *BackupHandler) importUpload(c *gin.Context) {
 	}
 	defer func() { _ = src.Close() }()
 
-	id, err := h.svc.SaveUploadedBackup(src)
+	id, err := h.svc.SaveUploadedBackup(io.LimitReader(src, maxBackupUploadBytes+1))
 	if err != nil {
 		_ = c.Error(err)
 		return
@@ -167,6 +225,7 @@ func (h *BackupHandler) importUpload(c *gin.Context) {
 }
 
 // importStream 用 restoreId 触发恢复并发送 SSE 进度。
+// 客户端断开时立即中止，避免白跑完整恢复流程。
 func (h *BackupHandler) importStream(c *gin.Context) {
 	id := c.Param("id")
 	path, ok := h.svc.ConsumeRestore(id)
@@ -176,19 +235,41 @@ func (h *BackupHandler) importStream(c *gin.Context) {
 	}
 	defer func() { _ = os.Remove(path) }()
 	setupSSEHeaders(c)
+	ctx := c.Request.Context()
 
+	cancelled := false
 	send := func(v any) {
+		if cancelled {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			cancelled = true
+			return
+		default:
+		}
 		raw, _ := json.Marshal(v)
-		_, _ = c.Writer.Write([]byte("data: "))
-		_, _ = c.Writer.Write(raw)
-		_, _ = c.Writer.Write([]byte("\n\n"))
+		if _, err := c.Writer.Write([]byte("data: ")); err != nil {
+			cancelled = true
+			return
+		}
+		if _, err := c.Writer.Write(raw); err != nil {
+			cancelled = true
+			return
+		}
+		if _, err := c.Writer.Write([]byte("\n\n")); err != nil {
+			cancelled = true
+			return
+		}
 		c.Writer.Flush()
 	}
 
 	if _, err := h.svc.ImportFromFile(path, func(p service.BackupProgress) {
 		send(p)
 	}); err != nil {
-		send(service.BackupProgress{Phase: "error", Message: err.Error()})
+		if !cancelled {
+			send(service.BackupProgress{Phase: "error", Message: err.Error()})
+		}
 		return
 	}
 }

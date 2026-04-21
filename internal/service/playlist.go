@@ -67,7 +67,9 @@ func (s *PlaylistService) GetByID(id, viewerID string) (*dto.PlaylistResponse, e
 		return nil, middleware.NewAppError(http.StatusForbidden, "无权访问")
 	}
 	var count int64
-	s.db.Model(&model.PlaylistItem{}).Where("playlist_id = ?", p.ID).Count(&count)
+	if err := s.db.Model(&model.PlaylistItem{}).Where("playlist_id = ?", p.ID).Count(&count).Error; err != nil {
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "统计失败", err)
+	}
 	r := serializePlaylist(&p, count)
 	return &r, nil
 }
@@ -76,7 +78,10 @@ func (s *PlaylistService) GetByID(id, viewerID string) (*dto.PlaylistResponse, e
 func (s *PlaylistService) GetItems(playlistID, viewerID string) ([]dto.PlaylistItemResponse, error) {
 	var p model.Playlist
 	if err := s.db.Take(&p, "id = ?", playlistID).Error; err != nil {
-		return nil, middleware.NewAppError(http.StatusNotFound, "Playlist not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, middleware.NewAppError(http.StatusNotFound, "Playlist not found")
+		}
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 	if !p.IsPublic && p.UserID != viewerID {
 		return nil, middleware.NewAppError(http.StatusForbidden, "无权访问")
@@ -147,7 +152,9 @@ func (s *PlaylistService) Update(id, operatorID string, req dto.PlaylistUpdateRe
 		}
 	}
 	var count int64
-	s.db.Model(&model.PlaylistItem{}).Where("playlist_id = ?", id).Count(&count)
+	if err := s.db.Model(&model.PlaylistItem{}).Where("playlist_id = ?", id).Count(&count).Error; err != nil {
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "统计失败", err)
+	}
 	var fresh model.Playlist
 	if err := s.db.Take(&fresh, "id = ?", id).Error; err != nil {
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
@@ -176,32 +183,43 @@ func (s *PlaylistService) Delete(id, operatorID string) error {
 
 // AddItem 把 media 加到 playlist 末尾。
 // 权限：playlist.user_id == operatorID（只能给自己的 playlist 加）。
+// 使用事务保证 MAX(position)+1 与 INSERT 原子，避免并发 AddItem 拿到相同 position。
 func (s *PlaylistService) AddItem(playlistID, operatorID, mediaID string) (*dto.PlaylistItemResponse, error) {
 	var p model.Playlist
 	if err := s.db.Take(&p, "id = ?", playlistID).Error; err != nil {
-		return nil, middleware.NewAppError(http.StatusNotFound, "Playlist not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, middleware.NewAppError(http.StatusNotFound, "Playlist not found")
+		}
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 	if p.UserID != operatorID {
 		return nil, middleware.NewAppError(http.StatusForbidden, "无权修改")
 	}
 	var m model.Media
 	if err := s.db.Take(&m, "id = ?", mediaID).Error; err != nil {
-		return nil, middleware.NewAppError(http.StatusNotFound, "Media not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, middleware.NewAppError(http.StatusNotFound, "Media not found")
+		}
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 
-	// 计算 next position
-	var maxPos int
-	s.db.Model(&model.PlaylistItem{}).
-		Where("playlist_id = ?", playlistID).
-		Select("COALESCE(MAX(position), 0)").
-		Scan(&maxPos)
-
-	item := model.PlaylistItem{
-		PlaylistID: playlistID,
-		MediaID:    mediaID,
-		Position:   maxPos + 1,
-	}
-	if err := s.db.Create(&item).Error; err != nil {
+	var item model.PlaylistItem
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var maxPos int
+		if err := tx.Model(&model.PlaylistItem{}).
+			Where("playlist_id = ?", playlistID).
+			Select("COALESCE(MAX(position), 0)").
+			Scan(&maxPos).Error; err != nil {
+			return err
+		}
+		item = model.PlaylistItem{
+			PlaylistID: playlistID,
+			MediaID:    mediaID,
+			Position:   maxPos + 1,
+		}
+		return tx.Create(&item).Error
+	})
+	if err != nil {
 		return nil, mapUniqueErr(err, "该媒体已在播放列表中")
 	}
 	mResp := serializeMedia(&m)

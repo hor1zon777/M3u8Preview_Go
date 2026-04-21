@@ -79,9 +79,15 @@ func (s *ActivityService) UserSummary(userID string) (dto.UserActivitySummaryRes
 		lastLogin      model.LoginRecord
 		hasLastLogin   = true
 	)
-	s.db.Model(&model.LoginRecord{}).Where("user_id = ?", userID).Count(&loginCount)
-	s.db.Model(&model.WatchHistory{}).Where("user_id = ?", userID).Count(&watchCount)
-	s.db.Model(&model.WatchHistory{}).Where("user_id = ? AND completed = ?", userID, true).Count(&completedCount)
+	if err := s.db.Model(&model.LoginRecord{}).Where("user_id = ?", userID).Count(&loginCount).Error; err != nil {
+		return dto.UserActivitySummaryResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "统计登录失败", err)
+	}
+	if err := s.db.Model(&model.WatchHistory{}).Where("user_id = ?", userID).Count(&watchCount).Error; err != nil {
+		return dto.UserActivitySummaryResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "统计观看失败", err)
+	}
+	if err := s.db.Model(&model.WatchHistory{}).Where("user_id = ? AND completed = ?", userID, true).Count(&completedCount).Error; err != nil {
+		return dto.UserActivitySummaryResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "统计完播失败", err)
+	}
 	if err := s.db.Where("user_id = ?", userID).Order("created_at DESC").Take(&lastLogin).Error; err != nil {
 		hasLastLogin = false
 	}
@@ -107,9 +113,10 @@ func (s *ActivityService) UserSummary(userID string) (dto.UserActivitySummaryRes
 
 // Aggregate 全局活动聚合（对齐 loginRecordService.getActivityAggregate）。
 // 并行执行 10 个聚合查询，再对 topN 结果做二次查询。
+// 时间边界统一用 UTC 与 DB 存储保持一致，避免不同部署时区下"今天"的语义漂移。
 func (s *ActivityService) Aggregate() (dto.UserActivityAggregateResponse, error) {
-	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	now := time.Now().UTC()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	yesterdayStart := todayStart.Add(-24 * time.Hour)
 	weekStart := todayStart.Add(-7 * 24 * time.Hour)
 

@@ -99,7 +99,11 @@ func (h *AuthHandler) refresh(c *gin.Context) {
 
 func (h *AuthHandler) logout(c *gin.Context) {
 	raw := refreshCookieValue(c)
-	h.svc.Logout(raw)
+	// 不论 DB 是否删除成功都清 cookie（从客户端角度已登出）；但服务端错误需记录。
+	if err := h.svc.Logout(raw); err != nil {
+		// 记录但不阻塞 cookie 清理；用 _ = c.Error(err) 让 error middleware 感知到
+		_ = c.Error(err)
+	}
 	h.clearRefreshCookie(c)
 	c.JSON(http.StatusOK, dto.OK(gin.H{"message": "logged out"}))
 }

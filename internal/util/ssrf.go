@@ -136,20 +136,36 @@ func allZero(b []byte) bool {
 }
 
 // ValidateResolvedIP 对 host 进行 DNS 解析，任一地址处于私有段即拒绝。
-// 纯 v4 / 纯 v6 域名其中一边 ENOTFOUND 是正常的，不视为错误。
+// 注意：与旧版不同，DNS 查询失败现在视为 SSRF 风险（fail-closed），而不是放行。
+// 调用方应把此返回的错误直接冒泡给客户端，避免"DNS 抖动 → 校验层失效 → 实际连接打到内网"的绕过。
 func ValidateResolvedIP(ctx context.Context, host string) error {
-	// net.DefaultResolver.LookupIPAddr 同时返回 v4 + v6
+	_, err := lookupSafeIP(ctx, host)
+	return err
+}
+
+// lookupSafeIP 解析 host 并返回第一个非私有 IP。
+// - DNS 查询失败：返回 SSRFError（fail-closed）
+// - 任一返回地址为私有段：返回 SSRFError
+// - 无任何可用地址：返回 SSRFError
+// 此函数既用于预校验，也作为 SafeFetch 里 DialContext 的 IP 来源，确保"校验 IP = 连接 IP"。
+func lookupSafeIP(ctx context.Context, host string) (net.IP, error) {
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		// DNS 查不到让上层 http 层去报错；这里不当 SSRF 处理
-		return nil
+		return nil, newSSRF(http.StatusBadGateway, "DNS 解析失败")
 	}
+	var firstSafe net.IP
 	for _, a := range addrs {
 		if isPrivateIP(a.IP) {
-			return newSSRF(http.StatusForbidden, "不允许访问内网地址")
+			return nil, newSSRF(http.StatusForbidden, "不允许访问内网地址")
+		}
+		if firstSafe == nil {
+			firstSafe = a.IP
 		}
 	}
-	return nil
+	if firstSafe == nil {
+		return nil, newSSRF(http.StatusBadGateway, "DNS 无可用地址")
+	}
+	return firstSafe, nil
 }
 
 // AssertSafeURL 校验协议 + hostname + DNS。
@@ -161,10 +177,18 @@ func AssertSafeURL(ctx context.Context, raw string) (*url.URL, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, newSSRF(http.StatusBadRequest, "仅支持 HTTP/HTTPS 协议")
 	}
-	if IsPrivateHostname(u.Hostname()) {
+	host := u.Hostname()
+	// IP 字面量不必走 DNS
+	if ip := net.ParseIP(host); ip != nil {
+		if isPrivateIP(ip) {
+			return nil, newSSRF(http.StatusForbidden, "不允许访问内网地址")
+		}
+		return u, nil
+	}
+	if IsPrivateHostname(host) {
 		return nil, newSSRF(http.StatusForbidden, "不允许访问内网地址")
 	}
-	if err := ValidateResolvedIP(ctx, u.Hostname()); err != nil {
+	if err := ValidateResolvedIP(ctx, host); err != nil {
 		return nil, err
 	}
 	return u, nil
@@ -177,11 +201,41 @@ type SafeFetchOptions struct {
 	Method       string
 	Body         io.Reader
 	Timeout      time.Duration
-	Client       *http.Client // 用于测试注入
+	Client       *http.Client // 用于测试注入；生产不传
 }
 
-// SafeFetch 手动处理重定向，每一跳都做 AssertSafeURL，防止上游 302 到内网。
-// 返回最终 Response（调用方负责 Close Body）。
+// buildPinnedClient 构造一个把 DialContext 固定到 pinnedIP 的 HTTP client。
+// 核心作用：消除 DNS Rebinding —— 校验时解析的 IP 与实际拨号 IP 保持一致。
+// SNI/Host 头仍然使用原 hostname（由 net/http 根据 req.URL.Host 自动设置），不影响 TLS 验证。
+func buildPinnedClient(pinnedIP net.IP, timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP.String(), port))
+		},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     true, // 防止跨 URL 复用导致 IP 绑定错乱
+	}
+	return &http.Client{
+		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: timeout,
+	}
+}
+
+// SafeFetch 手动处理重定向；关键抗 DNS Rebinding：
+// 1. 每一跳都用 lookupSafeIP 解析当前 host 得到 pinnedIP
+// 2. 为该跳构造一次性 Transport.DialContext → 所有连接都走 pinnedIP
+// 这样"校验阶段的 DNS 结果"与"实际连接的 IP"绑定在同一个解析里，
+// 无论底层 http 是否再次查询 DNS 都会被 DialContext 替换为已校验 IP。
 func SafeFetch(ctx context.Context, raw string, opts SafeFetchOptions) (*http.Response, error) {
 	if opts.MaxRedirects <= 0 {
 		opts.MaxRedirects = 3
@@ -192,16 +246,6 @@ func SafeFetch(ctx context.Context, raw string, opts SafeFetchOptions) (*http.Re
 	if opts.Timeout <= 0 {
 		opts.Timeout = 30 * time.Second
 	}
-	client := opts.Client
-	if client == nil {
-		client = &http.Client{
-			// 禁止自动跟随；本函数自己处理
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			Timeout: opts.Timeout,
-		}
-	}
 
 	currentURL, err := AssertSafeURL(ctx, raw)
 	if err != nil {
@@ -209,6 +253,23 @@ func SafeFetch(ctx context.Context, raw string, opts SafeFetchOptions) (*http.Re
 	}
 
 	for hop := 0; hop <= opts.MaxRedirects; hop++ {
+		host := currentURL.Hostname()
+		var pinnedIP net.IP
+		if ip := net.ParseIP(host); ip != nil {
+			// IP 字面量：AssertSafeURL/AssertSafeURL-on-redirect 已校验，不会是私有 IP
+			pinnedIP = ip
+		} else {
+			pinnedIP, err = lookupSafeIP(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		client := opts.Client
+		if client == nil {
+			client = buildPinnedClient(pinnedIP, opts.Timeout)
+		}
+
 		req, rerr := http.NewRequestWithContext(ctx, opts.Method, currentURL.String(), opts.Body)
 		if rerr != nil {
 			return nil, rerr
@@ -226,10 +287,8 @@ func SafeFetch(ctx context.Context, raw string, opts SafeFetchOptions) (*http.Re
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			loc := resp.Header.Get("Location")
 			if loc == "" {
-				// 异常 3xx 无 Location，原样返回
 				return resp, nil
 			}
-			// 关闭中间响应的 body，避免连接泄漏
 			_ = resp.Body.Close()
 			if hop >= opts.MaxRedirects {
 				return nil, newSSRF(http.StatusBadGateway, "重定向次数过多")
@@ -243,7 +302,6 @@ func SafeFetch(ctx context.Context, raw string, opts SafeFetchOptions) (*http.Re
 				return nil, verr
 			}
 			currentURL = safe
-			// body 流只能读一次：重定向场景不太可能带 body（GET），这里简单置 nil
 			opts.Body = nil
 			continue
 		}

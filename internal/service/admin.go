@@ -151,17 +151,14 @@ func (s *AdminService) ListUsers(page, limit int, search string) ([]dto.AdminUse
 }
 
 // UpdateUser 修改角色 / 激活状态，含业务约束。
+// 降级最后一个 admin 的检测 + UPDATE 放在同一事务中，避免并发降级双双通过检查导致 0 admin。
 func (s *AdminService) UpdateUser(id, currentUID string, req dto.AdminUpdateUserRequest) (*dto.AdminUserListItem, error) {
 	var u model.User
 	if err := s.db.Take(&u, "id = ?", id).Error; err != nil {
-		return nil, middleware.NewAppError(http.StatusNotFound, "User not found")
-	}
-	if req.Role != nil && u.Role == "ADMIN" && *req.Role == "USER" {
-		var count int64
-		s.db.Model(&model.User{}).Where("role = ?", "ADMIN").Count(&count)
-		if count <= 1 {
-			return nil, middleware.NewAppError(http.StatusBadRequest, "Cannot demote the last admin user")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, middleware.NewAppError(http.StatusNotFound, "User not found")
 		}
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 	if req.IsActive != nil && id == currentUID && !*req.IsActive {
 		return nil, middleware.NewAppError(http.StatusBadRequest, "Cannot deactivate yourself")
@@ -173,8 +170,27 @@ func (s *AdminService) UpdateUser(id, currentUID string, req dto.AdminUpdateUser
 	if req.IsActive != nil {
 		updates["is_active"] = *req.IsActive
 	}
+	demotingAdmin := req.Role != nil && u.Role == "ADMIN" && *req.Role == "USER"
 	if len(updates) > 0 {
-		if err := s.db.Model(&model.User{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		err := s.db.Transaction(func(tx *gorm.DB) error {
+			if demotingAdmin {
+				var count int64
+				if err := tx.Model(&model.User{}).
+					Where("role = ? AND is_active = ?", "ADMIN", true).
+					Count(&count).Error; err != nil {
+					return middleware.WrapAppError(http.StatusInternalServerError, "统计管理员失败", err)
+				}
+				if count <= 1 {
+					return middleware.NewAppError(http.StatusBadRequest, "Cannot demote the last admin user")
+				}
+			}
+			return tx.Model(&model.User{}).Where("id = ?", id).Updates(updates).Error
+		})
+		if err != nil {
+			// 已包装的 AppError 直接返回
+			if appErr, ok := err.(*middleware.AppError); ok {
+				return nil, appErr
+			}
 			return nil, middleware.WrapAppError(http.StatusInternalServerError, "更新失败", err)
 		}
 	}
@@ -314,7 +330,9 @@ func (s *AdminService) BatchUpdateStatus(ids []string, status string) (dto.Batch
 func (s *AdminService) BatchUpdateCategory(ids []string, categoryID *string) (dto.BatchOperationResponse, error) {
 	if categoryID != nil && *categoryID != "" {
 		var count int64
-		s.db.Model(&model.Category{}).Where("id = ?", *categoryID).Count(&count)
+		if err := s.db.Model(&model.Category{}).Where("id = ?", *categoryID).Count(&count).Error; err != nil {
+			return dto.BatchOperationResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "校验分类失败", err)
+		}
 		if count == 0 {
 			return dto.BatchOperationResponse{}, middleware.NewAppError(http.StatusNotFound, "分类不存在")
 		}

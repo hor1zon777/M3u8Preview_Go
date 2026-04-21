@@ -3,6 +3,7 @@
 package app
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 
@@ -33,15 +34,24 @@ func (p *posterStatsDB) CountExternalPosters() (int64, int64, int64) {
 // - total/external/local 来源于 media 表对 poster_url 的前缀判断
 // - missing 为 total 减去 external 与 local，等价于 poster_url IS NULL OR '' OR 其它
 // - totalSizeBytes 扫描 uploadsDir/posters 汇总本地封面字节数（目录不存在或不可读时返回 0）
+//
+// DB 查询错误通过 log 打印，不向上冒泡（保持向后兼容的返回签名），
+// 否则前端看到 0 会误以为"无封面问题"，实际是查询失败。
 func (p *posterStatsDB) PosterStats() handler.PosterStats {
 	var external, local, total int64
-	p.db.Model(&model.Media{}).Count(&total)
-	p.db.Model(&model.Media{}).
+	if err := p.db.Model(&model.Media{}).Count(&total).Error; err != nil {
+		log.Printf("[posterStats] count total failed: %v", err)
+	}
+	if err := p.db.Model(&model.Media{}).
 		Where("poster_url LIKE 'http://%' OR poster_url LIKE 'https://%'").
-		Count(&external)
-	p.db.Model(&model.Media{}).
+		Count(&external).Error; err != nil {
+		log.Printf("[posterStats] count external failed: %v", err)
+	}
+	if err := p.db.Model(&model.Media{}).
 		Where("poster_url IS NOT NULL AND poster_url <> '' AND poster_url NOT LIKE 'http%'").
-		Count(&local)
+		Count(&local).Error; err != nil {
+		log.Printf("[posterStats] count local failed: %v", err)
+	}
 	missing := total - external - local
 	if missing < 0 {
 		missing = 0

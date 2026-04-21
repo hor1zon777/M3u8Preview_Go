@@ -18,8 +18,21 @@ const (
 	thumbMaxBytes  = 30 * 1024
 )
 
+// assertM3U8URLSafe 防止 ffmpeg argument injection：
+// 即使 URL 被调用方忘记做 scheme 校验，这里也拒绝 "-" 开头等可能被解释为选项的字符串。
+func assertM3U8URLSafe(m3u8URL string) error {
+	if !strings.HasPrefix(m3u8URL, "http://") && !strings.HasPrefix(m3u8URL, "https://") {
+		return fmt.Errorf("m3u8 URL 必须以 http:// 或 https:// 开头")
+	}
+	return nil
+}
+
 // FFProbeDuration 通过 ffprobe 获取 m3u8 流的时长（秒）。
+// 使用 "-i <url>" 明确以 "input" 选项接收 URL，配合 scheme 校验杜绝 ffmpeg argument injection。
 func FFProbeDuration(ctx context.Context, m3u8URL string) (float64, error) {
+	if err := assertM3U8URLSafe(m3u8URL); err != nil {
+		return 0, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, ffprobeTimeout)
 	defer cancel()
 
@@ -27,7 +40,7 @@ func FFProbeDuration(ctx context.Context, m3u8URL string) (float64, error) {
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "csv=p=0",
-		m3u8URL,
+		"-i", m3u8URL,
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -52,6 +65,9 @@ func FFProbeDuration(ctx context.Context, m3u8URL string) (float64, error) {
 // seekSec 为截取位置（秒），outPath 为输出文件路径（应以 .webp 结尾）。
 // 如果生成的文件超过 30KB，会以较低质量重编码一次。
 func FFmpegThumbnail(ctx context.Context, m3u8URL string, seekSec float64, outPath string) error {
+	if err := assertM3U8URLSafe(m3u8URL); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, ffmpegTimeout)
 	defer cancel()
 

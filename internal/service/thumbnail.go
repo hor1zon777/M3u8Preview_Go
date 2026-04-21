@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -28,12 +27,19 @@ type ThumbnailTask struct {
 	URL     string
 }
 
+// ThumbnailProcessor 接受 ctx 以便优雅关停时能中断 ffmpeg 子进程。
+type ThumbnailProcessor func(ctx context.Context, task ThumbnailTask) error
+
 // ThumbnailQueue 固定 concurrency 的简单任务队列。
 type ThumbnailQueue struct {
 	jobs        chan ThumbnailTask
 	stop        chan struct{}
 	once        sync.Once
-	processor   func(ThumbnailTask) error
+	wg          sync.WaitGroup
+	stopped     atomic.Bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	processor   ThumbnailProcessor
 	queued      atomic.Int64
 	active      atomic.Int64
 	processed   atomic.Int64
@@ -42,18 +48,22 @@ type ThumbnailQueue struct {
 }
 
 // NewThumbnailQueue 构造。concurrency<=0 视为 1。
-func NewThumbnailQueue(concurrency int, processor func(ThumbnailTask) error) *ThumbnailQueue {
+func NewThumbnailQueue(concurrency int, processor ThumbnailProcessor) *ThumbnailQueue {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 	if processor == nil {
-		processor = func(ThumbnailTask) error { return nil }
+		processor = func(context.Context, ThumbnailTask) error { return nil }
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	q := &ThumbnailQueue{
 		jobs:      make(chan ThumbnailTask, 1024),
 		stop:      make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
 		processor: processor,
 	}
+	q.wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		go q.worker()
 	}
@@ -61,7 +71,11 @@ func NewThumbnailQueue(concurrency int, processor func(ThumbnailTask) error) *Th
 }
 
 // Enqueue 追加任务；同 mediaID 重复入队会被去重。
+// 队列已 Stop 后直接丢弃，避免计数器与 enqueuedIDs 泄漏。
 func (q *ThumbnailQueue) Enqueue(mediaID, url string) {
+	if q.stopped.Load() {
+		return
+	}
 	if _, loaded := q.enqueuedIDs.LoadOrStore(mediaID, struct{}{}); loaded {
 		return
 	}
@@ -81,12 +95,18 @@ func (q *ThumbnailQueue) Status() (active, queued, processed, failed int64) {
 	return q.active.Load(), q.queued.Load(), q.processed.Load(), q.failed.Load()
 }
 
-// Stop 关闭队列；阻塞等待所有 worker 退出。
+// Stop 关闭队列；取消进行中的 ffmpeg ctx 后阻塞等待所有 worker 退出。
 func (q *ThumbnailQueue) Stop() {
-	q.once.Do(func() { close(q.stop) })
+	q.once.Do(func() {
+		q.stopped.Store(true)
+		close(q.stop)
+		q.cancel()
+	})
+	q.wg.Wait()
 }
 
 func (q *ThumbnailQueue) worker() {
+	defer q.wg.Done()
 	for {
 		select {
 		case <-q.stop:
@@ -97,7 +117,7 @@ func (q *ThumbnailQueue) worker() {
 			}
 			q.active.Add(1)
 			q.queued.Add(-1)
-			err := q.processor(job)
+			err := q.processor(q.ctx, job)
 			q.active.Add(-1)
 			if err != nil {
 				q.failed.Add(1)
@@ -105,19 +125,16 @@ func (q *ThumbnailQueue) worker() {
 				q.processed.Add(1)
 			}
 			q.enqueuedIDs.Delete(job.MediaID)
-		case <-time.After(24 * time.Hour):
-			// 防 worker 永久泄漏；实际 stop 会提前退出
 		}
 	}
 }
 
 // NewFFmpegProcessor 返回一个真正的 ffmpeg 缩略图生成 processor。
 // 仅在 media.poster_url 为 NULL 时写入，避免覆盖用户上传的封面。
-func NewFFmpegProcessor(uploadsDir string, db *gorm.DB) func(ThumbnailTask) error {
+// RowsAffected=0 视为"期间用户已上传封面"，此时主动清理生成的 webp，防止孤儿文件。
+func NewFFmpegProcessor(uploadsDir string, db *gorm.DB) ThumbnailProcessor {
 	thumbDir := filepath.Join(uploadsDir, "thumbnails")
-	return func(task ThumbnailTask) error {
-		ctx := context.Background()
-
+	return func(ctx context.Context, task ThumbnailTask) error {
 		duration, err := util.FFProbeDuration(ctx, task.URL)
 		if err != nil {
 			return fmt.Errorf("ffprobe media %s: %w", task.MediaID, err)
@@ -146,6 +163,15 @@ func NewFFmpegProcessor(uploadsDir string, db *gorm.DB) func(ThumbnailTask) erro
 		if result.Error != nil {
 			_ = os.Remove(outPath)
 			return fmt.Errorf("update db media %s: %w", task.MediaID, result.Error)
+		}
+		if result.RowsAffected == 0 {
+			// 期间用户手动上传了封面，或媒体被删除；本次生成的 webp 成为孤儿，必须清理。
+			if rmErr := os.Remove(outPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("[thumbnail] orphan cleanup failed media=%s path=%s: %v", task.MediaID, outPath, rmErr)
+			} else {
+				log.Printf("[thumbnail] skip media=%s: poster already set, cleaned %s", task.MediaID, filename)
+			}
+			return nil
 		}
 
 		log.Printf("[thumbnail] generated %s for media %s (seek=%.1fs)", filename, task.MediaID, seekSec)

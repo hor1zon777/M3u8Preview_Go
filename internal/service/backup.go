@@ -91,8 +91,11 @@ func NewBackupService(db *gorm.DB, uploadsDir string) *BackupService {
 }
 
 // RegisterInvalidator 注册一个在 import 完成时调用的缓存失效函数。
+// 使用 s.mu 保护 invalidators 切片，防止并发注册与读取之间的数据竞争。
 func (s *BackupService) RegisterInvalidator(fn func()) {
+	s.mu.Lock()
 	s.invalidators = append(s.invalidators, fn)
+	s.mu.Unlock()
 }
 
 // ---- export ----
@@ -127,7 +130,8 @@ func (s *BackupService) ExportToFile(includePosters bool, onProgress func(Export
 	}
 	emit(ExportProgress{Phase: "db", Message: "查询完成", Current: 11, Total: 11, Percentage: 30})
 
-	timestamp := time.Now().Format("2006-01-02T15-04-05")
+	// 统一用 UTC 时间戳，避免文件名与 exportedAt (UTC) 时区不一致
+	timestamp := time.Now().UTC().Format("2006-01-02T15-04-05Z")
 	filename := "backup-" + timestamp + ".zip"
 	tmpFile, err := os.CreateTemp("", "m3u8-backup-*.zip")
 	if err != nil {
@@ -419,8 +423,8 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 		return RestoreResult{}, middleware.WrapAppError(http.StatusInternalServerError, "恢复事务失败", err)
 	}
 
-	// 恢复 uploads
-	restored := s.restoreUploads(zr, func(done, total int) {
+	// 恢复 uploads：失败必须向上冒泡，避免"DB 已写入但文件缺失"的孤儿态
+	restored, upErr := s.restoreUploads(zr, func(done, total int) {
 		emit(BackupProgress{Phase: "files",
 			Message:    fmt.Sprintf("正在恢复文件 (%d/%d)", done, total),
 			Current:    done,
@@ -428,8 +432,15 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			Percentage: 75 + int(float64(done)/float64(maxInt(total, 1))*20),
 		})
 	})
+	if upErr != nil {
+		return RestoreResult{}, middleware.WrapAppError(http.StatusInternalServerError, "恢复文件失败", upErr)
+	}
 
-	for _, fn := range s.invalidators {
+	// 拷贝 invalidators 切片后释放锁再调用回调，避免持锁执行业务方法导致死锁
+	s.mu.Lock()
+	fns := append([]func(){}, s.invalidators...)
+	s.mu.Unlock()
+	for _, fn := range fns {
 		fn()
 	}
 
@@ -568,8 +579,15 @@ func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters bool) err
 	})
 }
 
-// restoreUploads 将 ZIP 里的 uploads/* 还原到磁盘。返回还原文件数。
-func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, total int)) int {
+// restoreUploads 将 ZIP 里的 uploads/* 还原到磁盘。
+// 采用"两阶段原子切换"设计防止数据永久丢失：
+//  1. 先把所有文件解压到临时目录 <uploadsDir>.new-<ts>
+//  2. 解压期间任一写失败 → 删除临时目录，原 uploadsDir 完好保留，返回 error
+//  3. 全部成功后：rename(old → .old-<ts>) + rename(new → uploadsDir) 原子切换
+//  4. 异步清理 .old-<ts>
+//
+// 返回 (成功文件数, error)。原先忽略 io.Copy 错误 + 先删后写的做法已废弃。
+func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, total int)) (int, error) {
 	entries := make([]*zip.File, 0)
 	for _, f := range zr.File {
 		if !strings.HasPrefix(f.Name, "uploads/") || f.FileInfo().IsDir() {
@@ -579,18 +597,28 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 	}
 	total := len(entries)
 	if total == 0 {
-		return 0
+		return 0, nil
 	}
 
-	// 清空 uploads 下的直接子项（保留目录本身）
-	if st, err := os.Stat(s.uploadsDir); err == nil && st.IsDir() {
-		items, _ := os.ReadDir(s.uploadsDir)
-		for _, it := range items {
-			_ = os.RemoveAll(filepath.Join(s.uploadsDir, it.Name()))
-		}
-	} else {
-		_ = os.MkdirAll(s.uploadsDir, 0o755)
+	absRoot, err := filepath.Abs(s.uploadsDir)
+	if err != nil {
+		return 0, fmt.Errorf("resolve uploads dir: %w", err)
 	}
+	ts := time.Now().UTC().Format("20060102-150405")
+	newDir := absRoot + ".new-" + ts
+	oldDir := absRoot + ".old-" + ts
+
+	// 清理可能残留的同名临时目录
+	_ = os.RemoveAll(newDir)
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		return 0, fmt.Errorf("create staging dir: %w", err)
+	}
+	staged := false
+	defer func() {
+		if !staged {
+			_ = os.RemoveAll(newDir)
+		}
+	}()
 
 	done := 0
 	for _, f := range entries {
@@ -598,26 +626,38 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 		if rel == "" {
 			continue
 		}
-		// 路径穿越防护
-		if filepath.IsAbs(rel) || strings.Contains(rel, "..") || strings.Contains(rel, `\`) {
+		// 路径穿越防护：拒绝绝对路径、..、反斜杠、NUL
+		if filepath.IsAbs(rel) || strings.ContainsAny(rel, "\x00") {
 			continue
 		}
-		dst := filepath.Join(s.uploadsDir, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		// 二次校验：拼接后必须仍在 newDir 内
+		dst := filepath.Clean(filepath.Join(newDir, filepath.FromSlash(rel)))
+		inside, relErr := filepath.Rel(newDir, dst)
+		if relErr != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(os.PathSeparator)) {
 			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return 0, fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 		}
 		rc, err := f.Open()
 		if err != nil {
-			continue
+			return 0, fmt.Errorf("open zip entry %s: %w", f.Name, err)
 		}
 		out, err := os.Create(dst)
 		if err != nil {
 			_ = rc.Close()
-			continue
+			return 0, fmt.Errorf("create %s: %w", dst, err)
 		}
-		_, _ = io.Copy(out, rc)
+		if _, copyErr := io.Copy(out, rc); copyErr != nil {
+			_ = out.Close()
+			_ = rc.Close()
+			return 0, fmt.Errorf("copy %s: %w", dst, copyErr)
+		}
+		if err := out.Close(); err != nil {
+			_ = rc.Close()
+			return 0, fmt.Errorf("close %s: %w", dst, err)
+		}
 		_ = rc.Close()
-		_ = out.Close()
 		done++
 		if done%20 == 0 || done == total {
 			if progress != nil {
@@ -628,7 +668,28 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 	if progress != nil {
 		progress(done, total)
 	}
-	return done
+
+	// 原子切换：先把旧目录搬走，再把新目录顶上；任何一步失败都尝试回滚
+	if st, statErr := os.Stat(absRoot); statErr == nil && st.IsDir() {
+		if err := os.Rename(absRoot, oldDir); err != nil {
+			return 0, fmt.Errorf("swap old uploads dir: %w", err)
+		}
+		if err := os.Rename(newDir, absRoot); err != nil {
+			// 回滚：把 old 搬回原位
+			_ = os.Rename(oldDir, absRoot)
+			return 0, fmt.Errorf("swap new uploads dir: %w", err)
+		}
+		staged = true
+		// 异步删除旧目录，失败只记录到日志
+		go func(p string) { _ = os.RemoveAll(p) }(oldDir)
+	} else {
+		// 原目录不存在：直接把新目录改名为正式目录
+		if err := os.Rename(newDir, absRoot); err != nil {
+			return 0, fmt.Errorf("promote new uploads dir: %w", err)
+		}
+		staged = true
+	}
+	return done, nil
 }
 
 // ---- 白名单字段清洗 ----

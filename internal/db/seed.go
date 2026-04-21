@@ -57,20 +57,22 @@ func seedUsers(db *gorm.DB, cfg *config.Config) error {
 		demoPass = "Demo1234"
 	}
 
-	if err := upsertUser(db, "admin", adminPass, model.RoleAdmin); err != nil {
+	if err := ensureUser(db, "admin", adminPass, model.RoleAdmin); err != nil {
 		return err
 	}
 	log.Println("[seed] admin user ensured")
 
-	if err := upsertUser(db, "demo", demoPass, model.RoleUser); err != nil {
+	if err := ensureUser(db, "demo", demoPass, model.RoleUser); err != nil {
 		return err
 	}
 	log.Println("[seed] demo user ensured")
 	return nil
 }
 
-// upsertUser 存在则不动密码（保留用户改过的密码），不存在则创建。
-func upsertUser(db *gorm.DB, username, password, role string) error {
+// ensureUser 不存在则按给定 role 创建；存在则保持原数据不动。
+// 原名 `upsertUser` 具误导性——它实际只做 insert-if-missing，不会更新已存在行的 role/is_active/password。
+// 如运维需要"修正 admin role 或重新启用禁用账号"，应另写 `fixAdminUser` 之类的函数。
+func ensureUser(db *gorm.DB, username, password, role string) error {
 	var existing model.User
 	err := db.Where("username = ?", username).First(&existing).Error
 	if err == nil {

@@ -79,18 +79,30 @@ func (s *AuthService) Register(username, password string) (*TokenPair, error) {
 	return s.issueTokens(&user, newFamilyID())
 }
 
+// dummyBcryptHash 用于拉平"用户不存在"与"密码错误"的时延差，缓解用户名枚举。
+// 这是 cost=12 的 bcrypt hash，口令值与正式密码无关，只用于消耗 CPU 时间。
+const dummyBcryptHash = "$2a$12$abcdefghijklmnopqrstuuH0Jh0Tn95i6h3nbr8Pxc8T8c4nDqjvK" // 任意一个合法 hash
+
 // Login 校验密码后签发 token，并写一条 LoginRecord。
 // LoginRecord 不阻塞主流程；失败只记日志。
+// 用户名不存在与密码错误返回相同错误码和消息，并跑一次假 bcrypt 拉平时延；
+// 账户禁用也一并映射为 401 以避免泄露账户存在性（仅审计日志记录真实原因）。
 func (s *AuthService) Login(username, password, ip, userAgent string) (*TokenPair, error) {
 	var user model.User
-	if err := s.db.Where("username = ?", username).Take(&user).Error; err != nil {
+	err := s.db.Where("username = ?", username).Take(&user).Error
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 跑一次假 bcrypt 与真实路径时延对齐，无视结果
+			_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 			return nil, middleware.NewAppError(http.StatusUnauthorized, "用户名或密码错误")
 		}
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询用户失败", err)
 	}
 	if !user.IsActive {
-		return nil, middleware.NewAppError(http.StatusForbidden, "账户已被禁用")
+		// 禁用账户也走 bcrypt 并返回 401，避免枚举禁用账号
+		_ = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password))
+		log.Printf("[auth] login denied for disabled account userId=%s", user.ID)
+		return nil, middleware.NewAppError(http.StatusUnauthorized, "用户名或密码错误")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return nil, middleware.NewAppError(http.StatusUnauthorized, "用户名或密码错误")
@@ -106,7 +118,9 @@ func (s *AuthService) Login(username, password, ip, userAgent string) (*TokenPai
 	return tp, nil
 }
 
-// Refresh 校验并轮换 refresh token。复用检测命中时删除该用户的全部 token 并要求重新登录。
+// Refresh 校验并轮换 refresh token。
+// 使用事务 + RowsAffected 检查保证原子，防止并发 refresh 同一 token 都成功（两条合法链路）。
+// 复用检测命中时仅撤销同 family 的 token（若查得到 family），避免因客户端双提交踢掉所有设备。
 func (s *AuthService) Refresh(rawRefresh string) (*TokenPair, error) {
 	claims, err := s.jwt.Verify(rawRefresh, util.JWTPurposeRefresh)
 	if err != nil {
@@ -118,9 +132,12 @@ func (s *AuthService) Refresh(rawRefresh string) (*TokenPair, error) {
 	var stored model.RefreshToken
 	err = s.db.Where("token = ?", hashed).Take(&stored).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		// 复用检测：旧 token 不在 DB 中 → 撤销该用户全部 token
+		// 复用检测：token 不在 DB 中说明已被使用过或伪造。
+		// 无 family 信息时退化为按 user 撤销（保留原行为，但记录日志便于审计）。
 		log.Printf("[auth] refresh token reuse detected, userId=%s", claims.UserID)
-		s.db.Where("user_id = ?", claims.UserID).Delete(&model.RefreshToken{})
+		if err := s.db.Where("user_id = ?", claims.UserID).Delete(&model.RefreshToken{}).Error; err != nil {
+			log.Printf("[auth] revoke all tokens failed userId=%s: %v", claims.UserID, err)
+		}
 		return nil, middleware.NewAppError(http.StatusUnauthorized, "Refresh token reuse detected, all sessions revoked")
 	}
 	if err != nil {
@@ -140,19 +157,40 @@ func (s *AuthService) Refresh(rawRefresh string) (*TokenPair, error) {
 		return nil, middleware.NewAppError(http.StatusUnauthorized, "User not found or inactive")
 	}
 
-	// 轮换：删旧发新，保留 familyId
-	if err := s.db.Delete(&stored).Error; err != nil {
+	// 原子删除：通过事务中的 RowsAffected 确保同一 token 只被成功消费一次。
+	// 并发 refresh 的另一条会拿到 RowsAffected=0，落入 reuse 检测路径。
+	var rowsDeleted int64
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("token = ?", hashed).Delete(&model.RefreshToken{})
+		rowsDeleted = res.RowsAffected
+		return res.Error
+	})
+	if err != nil {
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "轮换失败", err)
+	}
+	if rowsDeleted == 0 {
+		// 竞态：另一条请求已消费这张 token。按 reuse 检测处理，但只撤销同 family。
+		log.Printf("[auth] refresh token lost race, userId=%s family=%s", claims.UserID, stored.FamilyID)
+		if err := s.db.Where("user_id = ? AND family_id = ?", claims.UserID, stored.FamilyID).Delete(&model.RefreshToken{}).Error; err != nil {
+			log.Printf("[auth] revoke family tokens failed: %v", err)
+		}
+		return nil, middleware.NewAppError(http.StatusUnauthorized, "Refresh token already used")
 	}
 	return s.issueTokens(&user, stored.FamilyID)
 }
 
-// Logout 撤销传入的 refresh token。即使查不到也静默成功（幂等）。
-func (s *AuthService) Logout(rawRefresh string) {
+// Logout 撤销传入的 refresh token。
+// DB 错误上报给调用方，避免因 DB 抖动导致"客户端看 200 OK 但服务端未撤销"的会话残留。
+func (s *AuthService) Logout(rawRefresh string) error {
 	if rawRefresh == "" {
-		return
+		return nil
 	}
-	s.db.Where("token = ?", util.HashSHA256Hex(rawRefresh)).Delete(&model.RefreshToken{})
+	res := s.db.Where("token = ?", util.HashSHA256Hex(rawRefresh)).Delete(&model.RefreshToken{})
+	if res.Error != nil {
+		log.Printf("[auth] logout delete failed: %v", res.Error)
+		return middleware.WrapAppError(http.StatusInternalServerError, "登出失败", res.Error)
+	}
+	return nil
 }
 
 // GetProfile 返回脱敏用户信息。

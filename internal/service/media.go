@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gorm.io/gorm"
@@ -16,6 +17,52 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/model"
 	"github.com/hor1zon777/m3u8-preview-go/internal/util"
 )
+
+// localUploadPattern 限制本地 poster_url 只能指向 /uploads/{posters|thumbnails|categories}/<安全文件名>。
+// 防止 ../ 路径穿越、绝对路径、反斜杠注入（Windows）等攻击向量。
+var localUploadPattern = regexp.MustCompile(`^/uploads/(posters|thumbnails|categories)/[A-Za-z0-9._\-]+$`)
+
+// validateLocalPosterURL 对非 http(s) 的 posterUrl 做白名单校验。
+// 返回 nil 表示通过（包含 http(s) 或 nil/空）；返回 AppError 表示拒绝写入。
+func validateLocalPosterURL(raw *string) error {
+	if raw == nil {
+		return nil
+	}
+	s := *raw
+	if s == "" {
+		return nil
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return nil
+	}
+	if !localUploadPattern.MatchString(s) {
+		return middleware.NewAppError(http.StatusBadRequest, "posterUrl 格式非法")
+	}
+	return nil
+}
+
+// resolveLocalUploadPath 把相对 URL（/uploads/xxx）解析为 uploadsDir 下的绝对路径，
+// 并通过 filepath.Rel 二次校验确认未越出 uploadsDir。
+// 返回 ok=false 表示路径越界，调用方必须拒绝删除/访问。
+func resolveLocalUploadPath(uploadsDir, relURL string) (string, bool) {
+	if !strings.HasPrefix(relURL, "/uploads/") {
+		return "", false
+	}
+	rel := strings.TrimPrefix(relURL, "/uploads/")
+	if rel == "" || strings.ContainsAny(rel, "\x00") {
+		return "", false
+	}
+	absRoot, err := filepath.Abs(uploadsDir)
+	if err != nil {
+		return "", false
+	}
+	absPath := filepath.Clean(filepath.Join(absRoot, filepath.FromSlash(rel)))
+	inside, err := filepath.Rel(absRoot, absPath)
+	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return absPath, true
+}
 
 // ThumbnailEnqueuer 供 media service 触发缩略图生成；阶段 I 提供真实实现。
 type ThumbnailEnqueuer interface {
@@ -164,6 +211,9 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 	if !strings.Contains(req.M3u8URL, ".m3u8") {
 		return nil, middleware.NewAppError(http.StatusBadRequest, "m3u8Url 必须包含 .m3u8 路径")
 	}
+	if err := validateLocalPosterURL(req.PosterURL); err != nil {
+		return nil, err
+	}
 	resolvedPoster, err := s.poster.Resolve(req.PosterURL)
 	if err != nil {
 		return nil, middleware.WrapAppError(http.StatusBadGateway, "下载封面失败", err)
@@ -214,10 +264,16 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 func (s *MediaService) Update(id string, req dto.MediaUpdateRequest) (*dto.MediaResponse, error) {
 	var existing model.Media
 	if err := s.db.Take(&existing, "id = ?", id).Error; err != nil {
-		return nil, middleware.NewAppError(http.StatusNotFound, "Media not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, middleware.NewAppError(http.StatusNotFound, "Media not found")
+		}
+		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 
 	if req.PosterURL != nil {
+		if err := validateLocalPosterURL(req.PosterURL); err != nil {
+			return nil, err
+		}
 		resolved, err := s.poster.Resolve(req.PosterURL)
 		if err != nil {
 			return nil, middleware.WrapAppError(http.StatusBadGateway, "下载封面失败", err)
@@ -292,16 +348,20 @@ func (s *MediaService) Update(id string, req dto.MediaUpdateRequest) (*dto.Media
 func (s *MediaService) Delete(id string) error {
 	var existing model.Media
 	if err := s.db.Take(&existing, "id = ?", id).Error; err != nil {
-		return middleware.NewAppError(http.StatusNotFound, "Media not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return middleware.NewAppError(http.StatusNotFound, "Media not found")
+		}
+		return middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 	if err := s.db.Delete(&existing).Error; err != nil {
 		return middleware.WrapAppError(http.StatusInternalServerError, "删除失败", err)
 	}
+	// 删除本地封面文件：仅当 URL 是合法本地 uploads 路径，且 filepath.Rel 校验未越出 uploadsDir 时才执行。
 	if existing.PosterURL != nil && strings.HasPrefix(*existing.PosterURL, "/uploads/") {
-		go func(relPath, uploadsDir string) {
-			abs := filepath.Join(uploadsDir, strings.TrimPrefix(relPath, "/uploads/"))
-			_ = os.Remove(abs)
-		}(*existing.PosterURL, s.uploadsDir)
+		abs, ok := resolveLocalUploadPath(s.uploadsDir, *existing.PosterURL)
+		if ok {
+			go func(p string) { _ = os.Remove(p) }(abs)
+		}
 	}
 	return nil
 }
@@ -327,7 +387,7 @@ func (s *MediaService) GetRecent(count int) ([]dto.MediaResponse, error) {
 	return serializeMediaList(rows), nil
 }
 
-// GetRandom 随机 ACTIVE 媒体。
+// GetRandom 随机 ACTIVE 媒体。第二次 IN 查询后按 ids 原顺序重排，避免返回固定索引顺序。
 func (s *MediaService) GetRandom(count int) ([]dto.MediaResponse, error) {
 	count = clampInt(count, 1, 50)
 	var ids []string
@@ -343,7 +403,17 @@ func (s *MediaService) GetRandom(count int) ([]dto.MediaResponse, error) {
 	if err := s.db.Preload("Category").Where("id IN ?", ids).Find(&rows).Error; err != nil {
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
-	return serializeMediaList(rows), nil
+	byID := make(map[string]model.Media, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	ordered := make([]model.Media, 0, len(ids))
+	for _, id := range ids {
+		if r, ok := byID[id]; ok {
+			ordered = append(ordered, r)
+		}
+	}
+	return serializeMediaList(ordered), nil
 }
 
 // GetArtists 按 artist 聚合计数。

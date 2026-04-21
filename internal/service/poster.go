@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,6 +41,10 @@ type PosterDownloader struct {
 	jobs      chan posterJob
 	stop      chan struct{}
 	once      sync.Once
+	wg        sync.WaitGroup
+	stopped   atomic.Bool
+	ctx       context.Context
+	cancel    context.CancelFunc
 	active    atomic.Int64
 	queued    atomic.Int64
 	processed atomic.Int64
@@ -58,26 +63,36 @@ func NewPosterDownloader(uploadsDir string, concurrency int, onDownloaded func(m
 	if concurrency < 1 {
 		concurrency = 1
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &PosterDownloader{
 		postersDir:   filepath.Join(uploadsDir, "posters"),
 		bucket:       util.NewTokenBucket(100, 100.0/60.0),
 		onDownloaded: onDownloaded,
 		jobs:         make(chan posterJob, 1024),
 		stop:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
+	d.wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		go d.worker()
 	}
 	return d
 }
 
-// Stop 关闭队列。
+// Stop 关闭队列；cancel 根 ctx 后阻塞等待所有 worker 退出。
 func (d *PosterDownloader) Stop() {
-	d.once.Do(func() { close(d.stop) })
+	d.once.Do(func() {
+		d.stopped.Store(true)
+		close(d.stop)
+		d.cancel()
+	})
+	d.wg.Wait()
 }
 
 // Resolve 作为 MediaService.PosterResolver：输入 nil/本地路径直接返回；外部 URL 则下载到本地。
 // 返回值是新的本地 URL（/uploads/posters/xxx.ext）或原值（下载失败）。
+// 此路径为同步调用，目前用于 Create/Update —— 后续可改为接收 ctx 使客户端取消可传播。
 func (d *PosterDownloader) Resolve(raw *string) (*string, error) {
 	if raw == nil || *raw == "" {
 		return raw, nil
@@ -85,15 +100,21 @@ func (d *PosterDownloader) Resolve(raw *string) (*string, error) {
 	if !strings.HasPrefix(*raw, "http://") && !strings.HasPrefix(*raw, "https://") {
 		return raw, nil
 	}
-	local, err := d.downloadOnce(*raw)
+	// 同步 Resolve 绑定到下载器的根 ctx（Stop 时可中断）+ 固定超时
+	ctx, cancel := context.WithTimeout(d.ctx, posterTimeoutMS)
+	defer cancel()
+	local, err := d.downloadOnce(ctx, *raw)
 	if err != nil {
 		return raw, err
 	}
 	return &local, nil
 }
 
-// EnqueueMigrate 异步迁移一张外部封面。
+// EnqueueMigrate 异步迁移一张外部封面。队列已 Stop 后直接丢弃。
 func (d *PosterDownloader) EnqueueMigrate(mediaID, rawURL string) {
+	if d.stopped.Load() {
+		return
+	}
 	d.queued.Add(1)
 	select {
 	case d.jobs <- posterJob{MediaID: mediaID, URL: rawURL}:
@@ -109,13 +130,11 @@ func (d *PosterDownloader) Status() (active, queued, processed, failed int64) {
 }
 
 // downloadOnce 执行一次下载，返回本地路径（如 /uploads/posters/xxx.jpg）。
-func (d *PosterDownloader) downloadOnce(raw string) (string, error) {
-	if err := d.bucket.Wait(context.Background()); err != nil {
+// ctx 传入后令 bucket.Wait / HTTP 请求都能在 Stop 或客户端取消时立即返回。
+func (d *PosterDownloader) downloadOnce(ctx context.Context, raw string) (string, error) {
+	if err := d.bucket.Wait(ctx); err != nil {
 		return "", err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), posterTimeoutMS)
-	defer cancel()
 
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -157,22 +176,45 @@ func (d *PosterDownloader) downloadOnce(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = out.Close() }()
+	// 关闭+清理封装：Windows 下 os.Remove 无法删除仍被当前进程打开的文件，
+	// 必须在 Remove 前显式 Close。
+	closed := false
+	closeOnce := func() {
+		if !closed {
+			_ = out.Close()
+			closed = true
+		}
+	}
+	defer closeOnce()
+	cleanup := func() {
+		closeOnce()
+		if rmErr := os.Remove(dst); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[poster] failed to remove partial file %s: %v", dst, rmErr)
+		}
+	}
 
 	// 限流到 5MB
 	if _, err := io.Copy(out, io.LimitReader(resp.Body, posterMaxBytes+1)); err != nil {
+		cleanup()
+		return "", err
+	}
+	st, statErr := out.Stat()
+	if statErr == nil && st.Size() > posterMaxBytes {
+		cleanup()
+		return "", &fileTooLargeError{Size: st.Size(), Max: posterMaxBytes}
+	}
+	// 关闭文件句柄确保落盘
+	if err := out.Close(); err != nil {
+		closed = true
 		_ = os.Remove(dst)
 		return "", err
 	}
-	st, err := out.Stat()
-	if err == nil && st.Size() > posterMaxBytes {
-		_ = os.Remove(dst)
-		return "", &fileTooLargeError{Size: st.Size(), Max: posterMaxBytes}
-	}
+	closed = true
 	return "/uploads/posters/" + filename, nil
 }
 
 func (d *PosterDownloader) worker() {
+	defer d.wg.Done()
 	for {
 		select {
 		case <-d.stop:
@@ -183,7 +225,10 @@ func (d *PosterDownloader) worker() {
 			}
 			d.active.Add(1)
 			d.queued.Add(-1)
-			localPath, err := d.downloadOnce(job.URL)
+			// 单次下载带自己的超时，与根 ctx 联动；Stop 时立即取消进行中的下载。
+			downloadCtx, cancel := context.WithTimeout(d.ctx, posterTimeoutMS)
+			localPath, err := d.downloadOnce(downloadCtx, job.URL)
+			cancel()
 			d.active.Add(-1)
 			if err != nil {
 				d.failed.Add(1)

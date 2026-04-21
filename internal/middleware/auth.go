@@ -25,11 +25,34 @@ type AuthDeps struct {
 	Ticket *util.SSETicketStore
 }
 
-// Authenticate 构造强制认证中间件。
-// 优先级：?ticket=xxx（仅 SSE）→ Authorization: Bearer <token>
+// Authenticate 构造强制认证中间件（仅接受 Bearer token）。
+// 注意：出于最小权限原则，?ticket=xxx 不在此中间件识别。
+// 理由：ticket 通过 URL 传递，极易泄漏到 Referer / 代理日志 / 截图，
+//       若所有写接口都认 ticket，泄漏的 ticket 就等同于 admin token。
+// SSE 专用路由请改用 AuthenticateSSE。
 func Authenticate(d *AuthDeps) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// SSE ticket 分支
+		token, ok := bearerToken(c)
+		if !ok {
+			AbortWithAppError(c, NewAppError(http.StatusUnauthorized, "Authentication required"))
+			return
+		}
+		claims, err := d.JWT.Verify(token, util.JWTPurposeAccess)
+		if err != nil || claims == nil || claims.UserID == "" {
+			AbortWithAppError(c, NewAppError(http.StatusUnauthorized, "Invalid or expired token"))
+			return
+		}
+		c.Set(ContextKeyUserID, claims.UserID)
+		c.Set(ContextKeyRole, claims.Role)
+		c.Next()
+	}
+}
+
+// AuthenticateSSE 供 EventSource 路由专用。
+// 优先级：?ticket=xxx（一次性）→ Authorization: Bearer <token>（便于非 SSE 测试）。
+// ticket 仅在本中间件识别，避免被误用到写接口上。
+func AuthenticateSSE(d *AuthDeps) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		if ticket := c.Query("ticket"); ticket != "" {
 			claim, ok := d.Ticket.Consume(ticket)
 			if !ok {
@@ -41,7 +64,6 @@ func Authenticate(d *AuthDeps) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-
 		token, ok := bearerToken(c)
 		if !ok {
 			AbortWithAppError(c, NewAppError(http.StatusUnauthorized, "Authentication required"))

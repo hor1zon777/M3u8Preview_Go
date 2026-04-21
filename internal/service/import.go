@@ -242,6 +242,12 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 					}
 				}
 			}
+			// 成功路径必须 RELEASE SAVEPOINT，否则 SQLite 会累积 1000 个 savepoint，
+			// 让整个事务长时间独占写锁，其他写请求全部排队。
+			if err := tx.Exec("RELEASE SAVEPOINT " + sp).Error; err != nil {
+				// release 失败只记录；已写入的行不回滚
+				errs = append(errs, dto.ImportError{Row: rowIdx[i], Field: "savepoint", Message: err.Error()})
+			}
 			switch {
 			case m.PosterURL == nil || *m.PosterURL == "":
 				createdForThumbs = append(createdForThumbs, struct {
@@ -362,7 +368,12 @@ func upsertCategories(tx *gorm.DB, names []string) (map[string]string, error) {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, err
 		}
-		slug := buildSlug(name)
+		// slug 唯一索引冲突检测：若已存在相同 slug（不同 name），追加后缀找可用值。
+		// 否则 Create 会因 UNIQUE 约束失败并导致整批 import 回滚。
+		slug, err := uniqueSlug(tx, buildSlug(name))
+		if err != nil {
+			return nil, err
+		}
 		nc := model.Category{Name: name, Slug: slug}
 		if err := tx.Create(&nc).Error; err != nil {
 			return nil, err
@@ -370,6 +381,26 @@ func upsertCategories(tx *gorm.DB, names []string) (map[string]string, error) {
 		out[name] = nc.ID
 	}
 	return out, nil
+}
+
+// uniqueSlug 确保 slug 在 categories 表中唯一，冲突时追加数字后缀（slug-1, slug-2 ...）。
+func uniqueSlug(tx *gorm.DB, base string) (string, error) {
+	if base == "" {
+		return "", fmt.Errorf("empty slug")
+	}
+	slug := base
+	for i := 1; i < 100; i++ {
+		var existing model.Category
+		err := tx.Where("slug = ?", slug).Take(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return slug, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		slug = fmt.Sprintf("%s-%d", base, i)
+	}
+	return "", fmt.Errorf("slug %q 及其 99 个变体均已占用", base)
 }
 
 func upsertTags(tx *gorm.DB, names []string) (map[string]string, error) {
@@ -409,12 +440,10 @@ func buildSlug(name string) string {
 		s = strings.ReplaceAll(s, "--", "-")
 	}
 	if s == "" {
-		var hash int32
+		// 全非 ASCII 名的兜底：用 uint32 哈希避免 INT32_MIN 取负失效（产生 "-80000000" slug）
+		var hash uint32
 		for _, r := range name {
-			hash = (hash << 5) - hash + int32(r)
-		}
-		if hash < 0 {
-			hash = -hash
+			hash = (hash << 5) - hash + uint32(r)
 		}
 		s = fmt.Sprintf("cat-%x", hash)
 	}
