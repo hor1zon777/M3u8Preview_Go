@@ -358,7 +358,7 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			return nil
 		}
 
-		users := sanitizeUsers(data.Tables.Users)
+		users := backupToUsers(sanitizeUsers(data.Tables.Users))
 		if err := writeTable(0, "users", &users, len(users)); err != nil {
 			return err
 		}
@@ -461,8 +461,45 @@ type backupPayload struct {
 	Tables  *tableSet  `json:"tables"`
 }
 
+// backupUser 是 User 在 backup JSON 中的序列化形态。
+// model.User.PasswordHash 标了 json:"-" 防止 API 泄露，但 backup 必须保留 hash 否则恢复后无法登录。
+type backupUser struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"passwordHash"`
+	Role         string    `json:"role"`
+	Avatar       *string   `json:"avatar,omitempty"`
+	IsActive     bool      `json:"isActive"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+func usersToBackup(in []model.User) []backupUser {
+	out := make([]backupUser, 0, len(in))
+	for _, u := range in {
+		out = append(out, backupUser{
+			ID: u.ID, Username: u.Username, PasswordHash: u.PasswordHash,
+			Role: u.Role, Avatar: u.Avatar, IsActive: u.IsActive,
+			CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
+		})
+	}
+	return out
+}
+
+func backupToUsers(in []backupUser) []model.User {
+	out := make([]model.User, 0, len(in))
+	for _, b := range in {
+		out = append(out, model.User{
+			ID: b.ID, Username: b.Username, PasswordHash: b.PasswordHash,
+			Role: b.Role, Avatar: b.Avatar, IsActive: b.IsActive,
+			CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		})
+	}
+	return out
+}
+
 type tableSet struct {
-	Users          []model.User          `json:"users"`
+	Users          []backupUser          `json:"users"`
 	Categories     []model.Category      `json:"categories"`
 	Tags           []model.Tag           `json:"tags"`
 	Media          []model.Media         `json:"media"`
@@ -494,7 +531,14 @@ func (s *BackupService) buildBackupJSON() (map[string]any, error) {
 		mu.Unlock()
 	}
 	wg.Add(11)
-	go func() { defer wg.Done(); saveErr(s.db.Find(&data.Users).Error) }()
+	go func() {
+		defer wg.Done()
+		var users []model.User
+		saveErr(s.db.Find(&users).Error)
+		mu.Lock()
+		data.Users = usersToBackup(users)
+		mu.Unlock()
+	}()
 	go func() { defer wg.Done(); saveErr(s.db.Find(&data.Categories).Error) }()
 	go func() { defer wg.Done(); saveErr(s.db.Find(&data.Tags).Error) }()
 	go func() { defer wg.Done(); saveErr(s.db.Find(&data.Media).Error) }()
@@ -696,8 +740,8 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 // 由于 JSON 反序列化已经用 model.X 作为 target，unknown 字段会被忽略；
 // 这里仅做最小值清洗（例如 User.IsActive 默认 true、Media.M3u8URL 协议校验）。
 
-func sanitizeUsers(in []model.User) []model.User {
-	out := make([]model.User, 0, len(in))
+func sanitizeUsers(in []backupUser) []backupUser {
+	out := make([]backupUser, 0, len(in))
 	for _, u := range in {
 		if u.Username == "" {
 			continue
