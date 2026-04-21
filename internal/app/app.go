@@ -93,7 +93,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	})))
 
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{cfg.CORS.Origin},
+		AllowOrigins:     cfg.CORS.Origins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "Cookie", "Accept", "X-Requested-With"},
 		ExposeHeaders:    []string{"Content-Length", "Content-Range"},

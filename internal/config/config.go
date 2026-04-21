@@ -28,7 +28,10 @@ type JWTConfig struct {
 }
 
 type CORSConfig struct {
-	Origin string
+	// Origins 允许的前端来源列表。
+	// 支持逗号分隔多个（常见场景：localhost + 127.0.0.1 + 生产域名），
+	// 空白会被 trim。单值和多值配置都工作。
+	Origins []string
 }
 
 type UploadConfig struct {
@@ -111,7 +114,7 @@ func Load(projectRoot string) (*Config, error) {
 			RefreshSecretPrev: os.Getenv("JWT_REFRESH_SECRET_PREV"),
 		},
 		CORS: CORSConfig{
-			Origin: getenv("CORS_ORIGIN", "http://localhost:5173"),
+			Origins: parseOrigins(getenv("CORS_ORIGIN", "http://localhost:5173")),
 		},
 		Upload: UploadConfig{
 			MaxFileSize:      10 * 1024 * 1024,
@@ -168,11 +171,16 @@ func (c *Config) validate() error {
 	if len(c.Proxy.Secret) < 32 || weakDefaults[c.Proxy.Secret] {
 		return fmt.Errorf("FATAL: PROXY_SECRET must be >= 32 chars and not a known default")
 	}
-	if c.CORS.Origin == "" || c.CORS.Origin == "*" {
+	if len(c.CORS.Origins) == 0 {
 		return fmt.Errorf("FATAL: CORS_ORIGIN must be explicitly configured in production and cannot be *")
 	}
-	if _, err := url.Parse(c.CORS.Origin); err != nil {
-		return fmt.Errorf("FATAL: CORS_ORIGIN must be a valid URL: %w", err)
+	for _, origin := range c.CORS.Origins {
+		if origin == "" || origin == "*" {
+			return fmt.Errorf("FATAL: CORS_ORIGIN must be explicitly configured in production and cannot be *")
+		}
+		if _, err := url.Parse(origin); err != nil {
+			return fmt.Errorf("FATAL: CORS_ORIGIN %q must be a valid URL: %w", origin, err)
+		}
 	}
 	return nil
 }
@@ -255,9 +263,34 @@ func clamp(n, lo, hi int) int {
 
 // parseCookieSecure 决定 Cookie 的 Secure 标志。
 // 优先使用 COOKIE_SECURE 环境变量；未设置时根据 CORS_ORIGIN 是否为 HTTPS 自动推断。
+// 多个 origin 时：只要有任何一个是 https://，就按 Secure 处理（保守选择——
+// https 前端在 Secure cookie 下能工作，http 前端在 Secure cookie 下拿不到 cookie
+// 会体现为"刷新掉登录"，比 http 前端拿到被窃取的 cookie 更安全）。
 func parseCookieSecure(explicit, corsOrigin string) bool {
 	if explicit != "" {
 		return parseBoolDefault(explicit, false)
 	}
-	return strings.HasPrefix(strings.ToLower(corsOrigin), "https://")
+	for _, origin := range parseOrigins(corsOrigin) {
+		if strings.HasPrefix(strings.ToLower(origin), "https://") {
+			return true
+		}
+	}
+	return false
+}
+
+// parseOrigins 按逗号拆分 CORS_ORIGIN，trim 空格，去掉空元素。
+// 这样一来 .env 写 "http://localhost:5173,http://127.0.0.1:5173" 能得到两条。
+// 不在这里做 URL 合法性校验——校验放在 Config.validate()，保持本函数纯粹。
+func parseOrigins(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
