@@ -293,6 +293,11 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	backupGroup.Use(middleware.Authenticate(authDeps), requireAdmin)
 	backupH.Register(backupGroup)
 
+	// SSE 路由单独挂载：使用 AuthenticateSSE 识别 ?ticket=
+	backupSSE := v1.Group("/admin/backup")
+	backupSSE.Use(middleware.AuthenticateSSE(authDeps), requireAdmin)
+	backupH.RegisterSSE(backupSSE)
+
 	r.NoRoute(func(c *gin.Context) {
 		c.JSON(404, gin.H{"success": false, "error": "Route not found"})
 	})
