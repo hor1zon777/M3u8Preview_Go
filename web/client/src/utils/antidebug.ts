@@ -4,11 +4,17 @@
 //
 // 启用前提：只在生产构建（import.meta.env.PROD）启用。开发模式不检测，避免误伤调试。
 //
-// 检测手段：
+// 检测手段（3 个互补）：
 //   1. DevTools 尺寸差：window.outerWidth/Height - innerWidth/Height 在 DevTools 停靠时显著增大
-//   2. debugger 语句执行耗时：DevTools 打开时 debugger 会断住，执行时长 > ~100ms
-//   3. console.log 的 %c getter 陷阱：DevTools 打开时会读取对象 toString，触发陷阱
-//   4. 定时器漂移：单步调试时 setInterval 回调间隔显著变大（>2x 期望值）
+//   2. console.log 的 getter 陷阱：DevTools 打开时会读取对象 toString，触发陷阱
+//   3. 定时器漂移：单步调试时 setInterval 回调间隔显著变大（>2x 期望值）
+//
+// 历史注记：曾经有第 4 个检测点——debugger 语句执行耗时。但 Vite/esbuild 生产
+// minify 默认会 drop debugger 语句（即便 simplify:false 也拦不住），切 terser
+// 会拖慢构建 10x，权衡后取舍。若只开独立窗口的 DevTools 可绕开 outerWidth 检测，
+// 此时主要靠 console getter 陷阱和定时器漂移兜底。
+//
+// 严格 CSP 兼容：不使用 new Function / eval / unsafe-eval。
 //
 // 失败副作用：仅设置模块级 dirty 标志，不 reload / 不清 token / 不破坏 UI。
 
@@ -34,21 +40,18 @@ export function startAntiDebug(): void {
   if (started) return;
   started = true;
   if (typeof window === 'undefined') return;
-  // 生产判断由调用方决定（main.tsx），这里不做环境检测避免"dev 也被检测"被遗漏
 
-  // 1. 初次立即跑一次
+  // 初次立即跑一次
   checkSize();
-  checkDebuggerTrap();
   installConsoleTrap();
 
-  // 2. 周期性复检
+  // 周期性复检尺寸差
   setInterval(() => {
     if (dirty) return; // 已命中则停止消耗 CPU
     checkSize();
-    checkDebuggerTrap();
   }, 2500);
 
-  // 3. 定时器漂移检测
+  // 定时器漂移检测
   scheduleDriftCheck();
 }
 
@@ -58,16 +61,6 @@ function checkSize(): void {
   const diffW = window.outerWidth - window.innerWidth;
   const diffH = window.outerHeight - window.innerHeight;
   if (diffW > 160 || diffH > 160) {
-    dirty = true;
-  }
-}
-
-function checkDebuggerTrap(): void {
-  // 通过 new Function 绕开 linter 与静态扫描。
-  // 无 DevTools 时 debugger 是 no-op；打开时会暂停，恢复后耗时显著。
-  const fn = new Function('var t=performance.now();debugger;return performance.now()-t;') as () => number;
-  const cost = fn();
-  if (cost > 100) {
     dirty = true;
   }
 }
