@@ -6,7 +6,7 @@ import JavaScriptObfuscator from 'javascript-obfuscator';
 /**
  * securityObfuscator —— 对登录加密协议相关源文件做强混淆。
  *
- * 覆盖范围：src/utils/crypto.ts + src/utils/antidebug.ts + src/services/authApi.ts。
+ * 覆盖范围：src/utils/crypto.ts + src/services/authApi.ts。
  * 只在 mode=production 启用，避免拖慢 dev 和破坏 source map 调试体验。
  *
  * 采用 Medium 预设 + 关闭 debugProtection（避免生产用户误进 DevTools 时页面卡死）。
@@ -15,7 +15,6 @@ import JavaScriptObfuscator from 'javascript-obfuscator';
 function securityObfuscator(): Plugin {
   const patterns = [
     /[\\/]src[\\/]utils[\\/]crypto\.ts$/,
-    /[\\/]src[\\/]utils[\\/]antidebug\.ts$/,
     /[\\/]src[\\/]services[\\/]authApi\.ts$/,
   ];
   return {

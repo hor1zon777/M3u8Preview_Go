@@ -1,5 +1,5 @@
 // utils/crypto.ts
-// 登录载荷加密工具（T2 档）：WASM 加密核心 + 反调试检查。
+// 登录载荷加密工具：WASM 加密核心（Rust 编译，位于 src/wasm/）。
 //
 // 协议（与后端 internal/util/ecdh.go 一一对齐）：
 //   1. GET /auth/challenge → {serverPub, challenge, ttl}（base64url 无 padding）
@@ -9,14 +9,16 @@
 //      - AES-GCM 加密 {payload, ts}，IV=12B 随机，AAD=端点常量
 //   3. POST {challenge, clientPub, iv, ct}（全 base64url）
 //
-// T2 相比 T1 的增强：
-//   - 加密核心从 JS WebCrypto 改为 WASM（逆向需 wasm-decompile/Ghidra）
+// 相比 T1（纯 JS WebCrypto）：
+//   - 加密核心从 JS 迁移到 WASM（逆向需 wasm-decompile/Ghidra）
 //   - HKDF info 等关键常量在 WASM 内 XOR 混淆，运行时解码
-//   - 加密前查 isDebugging()，命中就抛错中断请求（软反调试）
+//
+// 历史注记：曾实现过"检测 DevTools → 拒绝加密请求"的软反调试，但用户正当
+// 使用 F12 调试时会被登录流程误杀，ROI 为负，已移除。需要反调试时应上报给
+// 后端做风控，而不是阻断当前请求。
 
 import axios from 'axios';
 import initWasm, { encrypt_auth_payload, type EncryptResult } from '../wasm/crypto_wasm.js';
-import { isDebugging } from './antidebug.js';
 
 const CHALLENGE_URL = '/api/v1/auth/challenge';
 
@@ -73,12 +75,6 @@ export async function encryptAuthPayload(
   aadKey: AuthAADKey,
   payload: Record<string, unknown>,
 ): Promise<EncryptedEnvelope> {
-  // 软反调试：检测到 DevTools/单步调试就中断当前登录请求。
-  // 设计上不主动破坏用户体验——用户关闭 DevTools 重试即可。
-  if (isDebugging()) {
-    throw new Error('检测到调试环境，已中断本次请求');
-  }
-
   await ensureWasm();
 
   const challengeResp = await fetchChallenge();
@@ -103,3 +99,4 @@ export async function encryptAuthPayload(
     result?.free?.();
   }
 }
+
