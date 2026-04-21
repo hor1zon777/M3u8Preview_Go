@@ -399,9 +399,9 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			return err
 		}
 
-		// systemSettings 用 upsert，跳过 enableRateLimit
+		// systemSettings 用 upsert
 		for _, row := range data.Tables.SystemSettings {
-			if row.Key == "" || row.Key == "enableRateLimit" {
+			if row.Key == "" {
 				continue
 			}
 			if err := tx.Save(&model.SystemSetting{Key: row.Key, Value: row.Value}).Error; err != nil {
@@ -409,11 +409,6 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			}
 			totalRecords++
 		}
-		// 强制 enableRateLimit=true（默认安全）
-		if err := tx.Save(&model.SystemSetting{Key: "enableRateLimit", Value: "true"}).Error; err != nil {
-			return err
-		}
-		totalRecords++
 		tablesRestored++
 		emit(BackupProgress{Phase: "write", Message: "已写入 systemSettings",
 			Current: 11, Total: 11, Percentage: 75})
@@ -553,16 +548,6 @@ func (s *BackupService) buildBackupJSON() (map[string]any, error) {
 	if firstErr != nil {
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "导出查询失败", firstErr)
 	}
-
-	// 去掉 enableRateLimit，避免恢复到另一套环境时造成开关混乱
-	filtered := make([]model.SystemSetting, 0, len(data.SystemSettings))
-	for _, s := range data.SystemSettings {
-		if s.Key == "enableRateLimit" {
-			continue
-		}
-		filtered = append(filtered, s)
-	}
-	data.SystemSettings = filtered
 
 	return map[string]any{
 		"version":    backupVersion,
