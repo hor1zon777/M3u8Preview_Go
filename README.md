@@ -191,7 +191,7 @@ m3u8-preview-go/
 | m3u8 重写 | 按行扫描；非注释整行替换，`#... URI="..."` 只替 URI |
 | SSRF | IPv4 + IPv6 覆盖相同私有段；`.local/.internal/.localhost` 拒绝；`SafeFetch` 每跳重验 IP |
 | SSE | `data: <json>\n\n` + `X-Accel-Buffering: no`；握手用一次性 ticket |
-| Cookie | `refreshToken`，`SameSite=Lax`，生产 `Secure` |
+| Cookie | `refreshToken`，`SameSite=Lax`，`Secure` 根据 `CORS_ORIGIN` 协议自动推断（亦可通过 `COOKIE_SECURE` 覆盖） |
 | 批量操作 | 上限 500 条（admin media batch / import execute ≤1000） |
 | Admin 约束 | 最后一个 ADMIN 不可降级 / 不可自停用 / 不可删除 ADMIN |
 | 登录记录 | IP、UA、device 解析口径与 TS 版一致（`mileusna/useragent`） |
@@ -207,7 +207,7 @@ m3u8-preview-go/
 |---|---|---|
 | `PORT` | `3000` | HTTP 监听端口 |
 | `BIND_ADDRESS` | 生产 `127.0.0.1` / 开发 `0.0.0.0` | 监听地址，生产默认走 nginx 反代 |
-| `NODE_ENV` | `development` | `production` 时启用密钥强度校验、`Secure` cookie |
+| `NODE_ENV` | `development` | `production` 时启用密钥强度校验 |
 | `DATABASE_URL` | `file:./data/m3u8preview.db` | 可加 `file:` 前缀；支持绝对 / 相对路径 |
 | `DATA_DIR` | `./data` | SQLite 文件与 SQLite WAL 所在目录 |
 | `UPLOADS_DIR` | `./uploads` | 封面与缩略图存储目录 |
@@ -225,11 +225,12 @@ m3u8-preview-go/
 | `JWT_SECRET_PREV` | 上一代 access 密钥（配合 `JWT_KID_PREV`） |
 | `JWT_REFRESH_SECRET_PREV` | 上一代 refresh 密钥 |
 
-### CORS / CDN
+### CORS / CDN / Cookie
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `CORS_ORIGIN` | `http://localhost:5173` | 生产必须显式配置，禁止 `*` |
+| `CORS_ORIGIN` | `http://localhost:5173` | 生产必须显式配置，禁止 `*`；**必须与浏览器实际访问地址一致** |
+| `COOKIE_SECURE` | 自动推断 | Cookie `Secure` 标志。未设置时根据 `CORS_ORIGIN` 协议自动推断：`https://` → `true`，`http://` → `false`。也可显式设为 `true` / `false` 覆盖 |
 | `TRUST_CDN` | `true` | 是否信任 `CF-Connecting-IP` / `True-Client-IP`；未部署 CDN 请设 `false` 防伪造 |
 
 ### 容量 / 并发
@@ -253,7 +254,7 @@ m3u8-preview-go/
 
 - [ ] `NODE_ENV=production`
 - [ ] `JWT_SECRET` / `JWT_REFRESH_SECRET` / `PROXY_SECRET` 三者互不相同，每项 ≥ 32 字符
-- [ ] `CORS_ORIGIN` 设为实际前端地址（不是 `*`）
+- [ ] `CORS_ORIGIN` 设为实际前端地址（不是 `*`），**必须与浏览器地址栏一致**（含协议和端口）
 - [ ] `TRUST_CDN` 与实际 CDN 链路匹配（未部署请设 `false`）
 - [ ] `ADMIN_SEED_PASSWORD` / `DEMO_SEED_PASSWORD` 首次启动后立刻登录改掉
 - [ ] nginx 层已开启 HTTPS，并补全 `X-Forwarded-For` / `X-Forwarded-Proto`
@@ -298,24 +299,40 @@ entrypoint 已处理这个：每次 app 容器启动会强制覆盖 `client-dist
 - `docker compose up -d --build` → app 容器会重启 → entrypoint 同步 → nginx 读到新 dist
 - 若依然看到旧内容：浏览器强刷（Ctrl+Shift+R）或 `docker compose down -v && docker compose up -d --build`（会清 volume，注意 DB 也会清）
 
-**Q5. Go 版启动但 `/api/v1/auth/login` 返回 401，账号确认是对的？**
+**Q5. 登录后刷新页面跳回登录页？**
+Cookie `Secure` 标志与访问协议不匹配。`Secure` Cookie 只能通过 HTTPS 发送，若通过 HTTP 访问则浏览器不会携带 refresh token。
+
+- 纯 HTTP 内网访问 → 确保 `CORS_ORIGIN` 以 `http://` 开头（`COOKIE_SECURE` 自动为 `false`）
+- 外部 HTTPS 反代 → `CORS_ORIGIN` 必须设为 `https://你的域名`（`COOKIE_SECURE` 自动为 `true`）
+- 特殊场景 → 可通过 `COOKIE_SECURE=true/false` 显式覆盖
+
+**Q6. 宝塔 nginx 反代 HTTPS，内部容器走 HTTP，怎么配？**
+
+```
+浏览器 (HTTPS) → 宝塔 Nginx (SSL 终止) → 容器 Nginx (HTTP :28000) → Go (:3000)
+```
+
+只需设置 `CORS_ORIGIN=https://你的域名`，`COOKIE_SECURE` 会自动推断为 `true`。
+`Secure` Cookie 只影响浏览器与最外层 nginx 之间的连接，内网 HTTP 跳转不受影响。
+
+**Q7. Go 版启动但 `/api/v1/auth/login` 返回 401，账号确认是对的？**
 检查 `JWT_SECRET` 是否与 TS 版完全一致（包括尾部换行）。
 如果确实轮换了密钥，登录时应使用**当前 `JWT_SECRET`**；对**已发 refresh token** 的解码，
 通过 `JWT_SECRET_PREV` + `JWT_KID_PREV` 让老 token 在过渡期继续可用。
 
-**Q6. `/proxy/m3u8` 报 403 "segment domain not allowed"？**
+**Q8. `/proxy/m3u8` 报 403 "segment domain not allowed"？**
 代理只放行已在 DB 中出现过的 `media.m3u8_url` 的 scheme + host。新加源站需要：
 
 1. 先通过正常 `POST /admin/media` 建一条记录，让该域进入白名单
 2. 或者临时 `INSERT INTO media(..., status='ACTIVE', m3u8_url='https://new.host/xxx.m3u8')`
 
-**Q7. 前端 `/api/v1/proxy/m3u8?...` 请求返回 504？**
+**Q9. 前端 `/api/v1/proxy/m3u8?...` 请求返回 504？**
 默认整体超时 120s，连接 15s。源站慢是常见原因。可以：
 
 - 检查 nginx `proxy_read_timeout` 是否 ≥ 120s（默认 nginx.conf 已设 300s）
 - 源站本身 latency 高时考虑提高 `SignatureTTL`，或改为 HLS VOD 模式（固定 mediasequence）
 
-**Q8. 管理后台改了 `proxyAllowedExtensions` 但没生效？**
+**Q10. 管理后台改了 `proxyAllowedExtensions` 但没生效？**
 `ProxyService` 对扩展名白名单做了 30s 缓存。admin 更新设置后，handler 会调
 `ProxyService.InvalidateExtensionsCache()`，若看到 "not invalidated" 日志，
 检查 `Deps.ProxySvc` 是否挂到了 app，以及 settings handler 路径是否命中。
