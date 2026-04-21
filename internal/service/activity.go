@@ -225,6 +225,8 @@ func (s *ActivityService) Aggregate() (dto.UserActivityAggregateResponse, error)
 			C      int64
 		}
 	)
+	resp.TopWatchedMedia = make([]dto.TopWatchedMedia, 0)
+	resp.TopActiveUsers = make([]dto.TopActiveUser, 0)
 	resp.LoginStats.TotalLogins = totalLogins
 	resp.LoginStats.UniqueUsers = uniqueUsers
 	resp.LoginStats.TodayLogins = todayLogins
