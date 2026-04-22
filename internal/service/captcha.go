@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -19,6 +21,10 @@ import (
 type CaptchaService struct {
 	db     *gorm.DB
 	client *http.Client
+
+	mu          sync.Mutex
+	cachedCSP   string
+	cacheExpiry time.Time
 }
 
 type CaptchaPublicConfig struct {
@@ -81,6 +87,28 @@ func (s *CaptchaService) GetPublicConfig() CaptchaPublicConfig {
 }
 
 const maxCaptchaTokenLen = 4096
+
+const cspCacheTTL = 30 * time.Second
+
+func (s *CaptchaService) CSPOrigin() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if time.Now().Before(s.cacheExpiry) {
+		return s.cachedCSP
+	}
+
+	origin := ""
+	cs, err := s.loadSettings()
+	if err == nil && cs.enabled && cs.endpoint != "" {
+		if u, e := url.Parse(cs.endpoint); e == nil && u.Scheme != "" && u.Host != "" {
+			origin = u.Scheme + "://" + u.Host
+		}
+	}
+	s.cachedCSP = origin
+	s.cacheExpiry = time.Now().Add(cspCacheTTL)
+	return origin
+}
 
 func (s *CaptchaService) VerifyIfEnabled(ctx context.Context, token string) error {
 	cs, err := s.loadSettings()

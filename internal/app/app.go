@@ -3,8 +3,10 @@
 package app
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -84,7 +86,9 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	r.Use(gin.Logger())
 	r.Use(middleware.Recovery())
 	r.Use(middleware.ErrorHandler(cfg.NodeEnv == "production"))
-	r.Use(secureHeaders())
+
+	captchaSvc := service.NewCaptchaService(db)
+	r.Use(secureHeaders(captchaSvc))
 
 	// gzip：代理与 SSE 路由跳过（前者是二进制流、后者必须实时 flush）
 	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{
@@ -127,7 +131,6 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 
 	// ---- Auth 模块 ----
 	authSvc := service.NewAuthService(db, deps.JWT, cfg)
-	captchaSvc := service.NewCaptchaService(db)
 	authH := handler.NewAuthHandler(authSvc, captchaSvc, deps.Ticket, cfg, deps.ECDH, deps.Chal)
 	authDeps := &middleware.AuthDeps{JWT: deps.JWT, Ticket: deps.Ticket}
 
@@ -309,19 +312,55 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	backupSSE.Use(middleware.AuthenticateSSE(authDeps), requireAdmin)
 	backupH.RegisterSSE(backupSSE)
 
-	r.NoRoute(func(c *gin.Context) {
-		c.JSON(404, gin.H{"success": false, "error": "Route not found"})
-	})
+	r.NoRoute(spaFallback(cfg))
 
 	return r, deps
 }
 
-// secureHeaders 写应用层安全响应头；nginx 层还会再覆盖一轮 CSP。
-func secureHeaders() gin.HandlerFunc {
+// secureHeaders 写应用层安全响应头，CSP 根据验证码服务地址动态生成。
+func secureHeaders(captcha *service.CaptchaService) gin.HandlerFunc {
+	const baseCSP = "default-src 'self'; " +
+		"script-src 'self' 'wasm-unsafe-eval'%s; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data: blob: https:; " +
+		"media-src 'self' blob: https:; " +
+		"connect-src 'self'%s; " +
+		"font-src 'self'"
+
 	return func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("X-Frame-Options", "SAMEORIGIN")
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		extra := ""
+		if origin := captcha.CSPOrigin(); origin != "" {
+			extra = " " + origin
+		}
+		c.Header("Content-Security-Policy", fmt.Sprintf(baseCSP, extra, extra))
 		c.Next()
+	}
+}
+
+// spaFallback 尝试用构建好的 index.html 响应前端路由；
+// 若 dist 不存在（本地开发走 Vite DevServer），退回 404 JSON。
+func spaFallback(cfg *config.Config) gin.HandlerFunc {
+	candidates := []string{
+		filepath.Join(cfg.DataDir, "..", "web", "dist", "index.html"),
+		filepath.Join("web", "client", "dist", "index.html"),
+	}
+	var indexPath string
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			indexPath = p
+			break
+		}
+	}
+	return func(c *gin.Context) {
+		if indexPath == "" || strings.HasPrefix(c.Request.URL.Path, "/api/") ||
+			filepath.Ext(c.Request.URL.Path) != "" {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Route not found"})
+			return
+		}
+		c.File(indexPath)
 	}
 }
