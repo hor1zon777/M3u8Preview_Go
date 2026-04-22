@@ -80,8 +80,9 @@ type ChallengeRequest struct {
 // AES-GCM 的 AAD 在 handler 层按端点名绑定（"login"/"register"/"change-password"），
 // 防止攻击者把 login 的密文原样当 change-password 提交。
 type EncryptedAuthRequest struct {
-	Challenge  string `json:"challenge" binding:"required"`
-	ClientPub  string `json:"clientPub" binding:"required"`
-	IV         string `json:"iv"        binding:"required"`
-	Ciphertext string `json:"ct"        binding:"required"`
+	Challenge    string `json:"challenge"    binding:"required"`
+	ClientPub    string `json:"clientPub"    binding:"required"`
+	IV           string `json:"iv"           binding:"required"`
+	Ciphertext   string `json:"ct"           binding:"required"`
+	CaptchaToken string `json:"captchaToken"`
 }

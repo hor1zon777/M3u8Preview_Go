@@ -127,7 +127,8 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 
 	// ---- Auth 模块 ----
 	authSvc := service.NewAuthService(db, deps.JWT, cfg)
-	authH := handler.NewAuthHandler(authSvc, deps.Ticket, cfg, deps.ECDH, deps.Chal)
+	captchaSvc := service.NewCaptchaService(db)
+	authH := handler.NewAuthHandler(authSvc, captchaSvc, deps.Ticket, cfg, deps.ECDH, deps.Chal)
 	authDeps := &middleware.AuthDeps{JWT: deps.JWT, Ticket: deps.Ticket}
 
 	// 公开 auth 路由：register/login/refresh/logout/register-status

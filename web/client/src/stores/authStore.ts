@@ -8,8 +8,8 @@ interface AuthState {
   isAuthenticated: boolean;
   isLoading: boolean;
 
-  login: (username: string, password: string) => Promise<void>;
-  register: (username: string, password: string) => Promise<void>;
+  login: (username: string, password: string, captchaToken?: string) => Promise<void>;
+  register: (username: string, password: string, captchaToken?: string) => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
   setUser: (user: User | null) => void;
@@ -24,14 +24,14 @@ export const useAuthStore = create<AuthState>((set) => ({
   isAuthenticated: false,
   isLoading: true,
 
-  login: async (username, password) => {
-    const result = await authApi.login(username, password);
+  login: async (username, password, captchaToken) => {
+    const result = await authApi.login(username, password, captchaToken);
     setAccessToken(result.accessToken);
     set({ user: result.user, isAuthenticated: true, isLoading: false });
   },
 
-  register: async (username, password) => {
-    const result = await authApi.register(username, password);
+  register: async (username, password, captchaToken) => {
+    const result = await authApi.register(username, password, captchaToken);
     setAccessToken(result.accessToken);
     set({ user: result.user, isAuthenticated: true, isLoading: false });
   },

@@ -245,6 +245,10 @@ var allowedSettingKeys = map[string]struct{}{
 	"enableRateLimit":         {},
 	"proxyAllowedExtensions":  {},
 	"downloadExternalPosters": {},
+	"enableCaptcha":           {},
+	"captchaEndpoint":         {},
+	"captchaSiteKey":          {},
+	"captchaSecretKey":        {},
 }
 
 // UpdateSetting upsert 单个 key，返回当前值。

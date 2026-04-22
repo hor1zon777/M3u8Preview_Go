@@ -45,3 +45,4 @@ web/package-lock.json
 
 # claude配置
 .claude
+docs/AI_INTEGRATION_PROMPT.md

@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, Link, useLocation, Navigate } from 'react-router-dom';
 import { Clapperboard } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore.js';
 import { authApi } from '../../services/authApi.js';
+import type { CaptchaPublicConfig } from '../../services/authApi.js';
+import { CaptchaWidget } from './CaptchaWidget.js';
 
 export function LoginForm() {
   const [username, setUsername] = useState('');
@@ -10,6 +12,9 @@ export function LoginForm() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [allowRegistration, setAllowRegistration] = useState<boolean | null>(null);
+  const [captchaConfig, setCaptchaConfig] = useState<CaptchaPublicConfig | null>(null);
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null);
+  const captchaKeyRef = useRef(0);
   const login = useAuthStore((s) => s.login);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const navigate = useNavigate();
@@ -17,24 +22,28 @@ export function LoginForm() {
 
   useEffect(() => {
     authApi.getRegisterStatus().then((res) => setAllowRegistration(res.allowRegistration)).catch(() => { setAllowRegistration(false); });
+    authApi.getCaptchaConfig().then(setCaptchaConfig).catch(() => setCaptchaConfig({ enabled: false }));
   }, []);
 
-  // 登录后重定向到来源页，过滤登录/注册页防止循环
   const rawFrom = (location.state as { from?: { pathname: string } })?.from?.pathname || '/';
   const from = rawFrom === '/login' || rawFrom === '/register' ? '/' : rawFrom;
 
-  // 声明式重定向后备：已认证用户自动跳转
   if (isAuthenticated) return <Navigate to={from} replace />;
+
+  const captchaRequired = captchaConfig?.enabled === true;
+  const canSubmit = !loading && (!captchaRequired || !!captchaToken);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
     setLoading(true);
     try {
-      await login(username, password);
+      await login(username, password, captchaToken ?? undefined);
       navigate(from, { replace: true });
     } catch (err: any) {
       setError(err.response?.data?.error || '登录失败，请重试');
+      setCaptchaToken(null);
+      captchaKeyRef.current += 1;
     } finally {
       setLoading(false);
     }
@@ -81,9 +90,20 @@ export function LoginForm() {
             />
           </div>
 
+          {captchaRequired && captchaConfig.endpoint && captchaConfig.siteKey && (
+            <CaptchaWidget
+              key={captchaKeyRef.current}
+              endpoint={captchaConfig.endpoint}
+              siteKey={captchaConfig.siteKey}
+              onSuccess={setCaptchaToken}
+              onExpired={() => setCaptchaToken(null)}
+              onError={() => setCaptchaToken(null)}
+            />
+          )}
+
           <button
             type="submit"
-            disabled={loading}
+            disabled={!canSubmit}
             className="w-full py-2.5 bg-emby-green hover:bg-emby-green-dark disabled:opacity-50 text-white font-medium rounded-md transition-colors"
           >
             {loading ? '登录中...' : '登录'}

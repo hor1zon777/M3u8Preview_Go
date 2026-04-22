@@ -47,14 +47,28 @@ export function AdminDashboardPage() {
   const enableRateLimit = settings?.find((s) => s.key === 'enableRateLimit')?.value !== 'false';
   const downloadExternalPosters = settings?.find((s) => s.key === 'downloadExternalPosters')?.value === 'true';
   const siteName = settings?.find((s) => s.key === 'siteName')?.value || '';
+  const enableCaptcha = settings?.find((s) => s.key === 'enableCaptcha')?.value === 'true';
+  const captchaEndpoint = settings?.find((s) => s.key === 'captchaEndpoint')?.value || '';
+  const captchaSiteKey = settings?.find((s) => s.key === 'captchaSiteKey')?.value || '';
+  const captchaSecretKey = settings?.find((s) => s.key === 'captchaSecretKey')?.value || '';
   const [siteNameDraft, setSiteNameDraft] = useState('');
+  const [captchaEndpointDraft, setCaptchaEndpointDraft] = useState('');
+  const [captchaSiteKeyDraft, setCaptchaSiteKeyDraft] = useState('');
+  const [captchaSecretKeyDraft, setCaptchaSecretKeyDraft] = useState('');
   const siteNameSynced = useRef(false);
+  const captchaSynced = useRef(false);
   useEffect(() => {
     if (settings && !siteNameSynced.current) {
       setSiteNameDraft(siteName);
       siteNameSynced.current = true;
     }
-  }, [settings, siteName]);
+    if (settings && !captchaSynced.current) {
+      setCaptchaEndpointDraft(captchaEndpoint);
+      setCaptchaSiteKeyDraft(captchaSiteKey);
+      setCaptchaSecretKeyDraft(captchaSecretKey);
+      captchaSynced.current = true;
+    }
+  }, [settings, siteName, captchaEndpoint, captchaSiteKey, captchaSecretKey]);
   const DEFAULT_PROXY_EXTENSIONS = '.m3u8,.ts,.m4s,.mp4,.aac,.key,.jpg,.jpeg,.png,.webp';
   const DEFAULT_EXTENSIONS = new Set(DEFAULT_PROXY_EXTENSIONS.split(','));
   const proxyAllowedExtensions = settings?.find((s) => s.key === 'proxyAllowedExtensions')?.value || DEFAULT_PROXY_EXTENSIONS;
@@ -350,6 +364,115 @@ export function AdminDashboardPage() {
                 <Plus className="w-3.5 h-3.5" />
                 添加
               </button>
+            </div>
+          </div>
+
+          {/* CAPTCHA Settings */}
+          <div className="border-t border-emby-border-subtle pt-4 mt-4">
+            <p className="text-emby-text-secondary text-xs font-medium uppercase tracking-wide mb-3">PoW 验证码</p>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-white text-sm">启用验证码</p>
+                  <p className="text-emby-text-muted text-xs mt-0.5">开启后登录和注册页面需要完成 PoW 验证</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={enableCaptcha}
+                  disabled={updateSettingMutation.isPending || !settingsLoaded}
+                  onClick={() =>
+                    updateSettingMutation.mutate({
+                      key: 'enableCaptcha',
+                      value: enableCaptcha ? 'false' : 'true',
+                    })
+                  }
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
+                    enableCaptcha ? 'bg-emby-green' : 'bg-emby-bg-input'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      enableCaptcha ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <p className="text-white text-sm">验证服务地址</p>
+                  <p className="text-emby-text-muted text-xs mt-0.5">PoW CAPTCHA 服务的完整 URL</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={captchaEndpointDraft}
+                    onChange={(e) => setCaptchaEndpointDraft(e.target.value)}
+                    placeholder="https://captcha.example.com"
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64"
+                  />
+                  {captchaEndpointDraft !== captchaEndpoint && (
+                    <button
+                      onClick={() => updateSettingMutation.mutate({ key: 'captchaEndpoint', value: captchaEndpointDraft.trim() })}
+                      disabled={updateSettingMutation.isPending}
+                      className="px-3 py-1.5 bg-emby-green text-white text-xs font-medium rounded-md hover:bg-emby-green-dark disabled:opacity-50 transition-colors"
+                    >
+                      保存
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <p className="text-white text-sm">站点公钥 (Site Key)</p>
+                  <p className="text-emby-text-muted text-xs mt-0.5">从验证服务管理面板获取，前端可见</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={captchaSiteKeyDraft}
+                    onChange={(e) => setCaptchaSiteKeyDraft(e.target.value)}
+                    placeholder="pk_..."
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64"
+                  />
+                  {captchaSiteKeyDraft !== captchaSiteKey && (
+                    <button
+                      onClick={() => updateSettingMutation.mutate({ key: 'captchaSiteKey', value: captchaSiteKeyDraft.trim() })}
+                      disabled={updateSettingMutation.isPending}
+                      className="px-3 py-1.5 bg-emby-green text-white text-xs font-medium rounded-md hover:bg-emby-green-dark disabled:opacity-50 transition-colors"
+                    >
+                      保存
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <p className="text-white text-sm">站点私钥 (Secret Key)</p>
+                  <p className="text-emby-text-muted text-xs mt-0.5">仅服务端使用，用于 siteverify 接口核验 token</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="password"
+                    value={captchaSecretKeyDraft}
+                    onChange={(e) => setCaptchaSecretKeyDraft(e.target.value)}
+                    placeholder="sk_..."
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64"
+                  />
+                  {captchaSecretKeyDraft !== captchaSecretKey && (
+                    <button
+                      onClick={() => updateSettingMutation.mutate({ key: 'captchaSecretKey', value: captchaSecretKeyDraft.trim() })}
+                      disabled={updateSettingMutation.isPending}
+                      className="px-3 py-1.5 bg-emby-green text-white text-xs font-medium rounded-md hover:bg-emby-green-dark disabled:opacity-50 transition-colors"
+                    >
+                      保存
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         </div>

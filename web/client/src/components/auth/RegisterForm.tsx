@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, Link, Navigate } from 'react-router-dom';
 import { Clapperboard } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore.js';
 import { authApi } from '../../services/authApi.js';
+import type { CaptchaPublicConfig } from '../../services/authApi.js';
+import { CaptchaWidget } from './CaptchaWidget.js';
 
 export function RegisterForm() {
   const [username, setUsername] = useState('');
@@ -11,18 +13,20 @@ export function RegisterForm() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [allowRegistration, setAllowRegistration] = useState<boolean | null>(null);
+  const [captchaConfig, setCaptchaConfig] = useState<CaptchaPublicConfig | null>(null);
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null);
+  const captchaKeyRef = useRef(0);
   const register = useAuthStore((s) => s.register);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const navigate = useNavigate();
 
   useEffect(() => {
     authApi.getRegisterStatus().then((res) => setAllowRegistration(res.allowRegistration)).catch(() => setAllowRegistration(true));
+    authApi.getCaptchaConfig().then(setCaptchaConfig).catch(() => setCaptchaConfig({ enabled: false }));
   }, []);
 
-  // 声明式重定向后备：已认证用户自动跳转
   if (isAuthenticated) return <Navigate to="/" replace />;
 
-  // 加载中
   if (allowRegistration === null) {
     return (
       <div className="min-h-screen bg-emby-bg-base flex items-center justify-center px-4">
@@ -34,7 +38,6 @@ export function RegisterForm() {
     );
   }
 
-  // 注册已关闭
   if (!allowRegistration) {
     return (
       <div className="min-h-screen bg-emby-bg-base flex items-center justify-center px-4">
@@ -58,6 +61,9 @@ export function RegisterForm() {
     );
   }
 
+  const captchaRequired = captchaConfig?.enabled === true;
+  const canSubmit = !loading && (!captchaRequired || !!captchaToken);
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
@@ -69,10 +75,12 @@ export function RegisterForm() {
 
     setLoading(true);
     try {
-      await register(username, password);
+      await register(username, password, captchaToken ?? undefined);
       navigate('/');
     } catch (err: any) {
       setError(err.response?.data?.error || '注册失败，请重试');
+      setCaptchaToken(null);
+      captchaKeyRef.current += 1;
     } finally {
       setLoading(false);
     }
@@ -131,9 +139,20 @@ export function RegisterForm() {
             />
           </div>
 
+          {captchaRequired && captchaConfig.endpoint && captchaConfig.siteKey && (
+            <CaptchaWidget
+              key={captchaKeyRef.current}
+              endpoint={captchaConfig.endpoint}
+              siteKey={captchaConfig.siteKey}
+              onSuccess={setCaptchaToken}
+              onExpired={() => setCaptchaToken(null)}
+              onError={() => setCaptchaToken(null)}
+            />
+          )}
+
           <button
             type="submit"
-            disabled={loading}
+            disabled={!canSubmit}
             className="w-full py-2.5 bg-emby-green hover:bg-emby-green-dark disabled:opacity-50 text-white font-medium rounded-md transition-colors"
           >
             {loading ? '注册中...' : '注册'}

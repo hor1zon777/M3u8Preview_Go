@@ -25,6 +25,7 @@ import (
 // AuthHandler 汇总 auth 端点。
 type AuthHandler struct {
 	svc        *service.AuthService
+	captcha    *service.CaptchaService
 	ticket     *util.SSETicketStore
 	cfg        *config.Config
 	ecdh       *util.ECDHService
@@ -35,6 +36,7 @@ type AuthHandler struct {
 // ecdh / challenges 用于加密登录协议：前端先拉 challenge，再用 ECDH+HKDF+AES-GCM 提交密文。
 func NewAuthHandler(
 	svc *service.AuthService,
+	captcha *service.CaptchaService,
 	ticket *util.SSETicketStore,
 	cfg *config.Config,
 	ecdhSvc *util.ECDHService,
@@ -42,6 +44,7 @@ func NewAuthHandler(
 ) *AuthHandler {
 	return &AuthHandler{
 		svc:        svc,
+		captcha:    captcha,
 		ticket:     ticket,
 		cfg:        cfg,
 		ecdh:       ecdhSvc,
@@ -58,6 +61,7 @@ func (h *AuthHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/refresh", h.refresh)
 	rg.POST("/logout", h.logout)
 	rg.GET("/register-status", h.registerStatus)
+	rg.GET("/captcha-config", h.captchaConfig)
 }
 
 // RegisterAuthed 挂需要登录的端点（调用方在 Use(Authenticate) 之后传入此 group）。
@@ -90,6 +94,10 @@ func (h *AuthHandler) register(c *gin.Context) {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
 		return
 	}
+	if err := h.verifyCaptchaIfEnabled(&enc); err != nil {
+		middleware.AbortWithAppError(c, err)
+		return
+	}
 	plaintext, err := h.decryptAuth(&enc, aadRegister)
 	if err != nil {
 		middleware.AbortWithAppError(c, err)
@@ -113,6 +121,10 @@ func (h *AuthHandler) login(c *gin.Context) {
 	var enc dto.EncryptedAuthRequest
 	if err := c.ShouldBindJSON(&enc); err != nil {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
+		return
+	}
+	if err := h.verifyCaptchaIfEnabled(&enc); err != nil {
+		middleware.AbortWithAppError(c, err)
 		return
 	}
 	plaintext, err := h.decryptAuth(&enc, aadLogin)
@@ -209,6 +221,29 @@ func (h *AuthHandler) sseTicket(c *gin.Context) {
 	role := middleware.CurrentRole(c)
 	ticket := h.ticket.Issue(uid, role)
 	c.JSON(http.StatusOK, dto.OK(dto.SSETicketResponse{Ticket: ticket}))
+}
+
+// --- CAPTCHA helpers ---
+
+func (h *AuthHandler) captchaConfig(c *gin.Context) {
+	c.JSON(http.StatusOK, dto.OK(h.captcha.GetPublicConfig()))
+}
+
+func (h *AuthHandler) verifyCaptchaIfEnabled(enc *dto.EncryptedAuthRequest) *middleware.AppError {
+	if !h.captcha.IsEnabled() {
+		return nil
+	}
+	if enc.CaptchaToken == "" {
+		return middleware.NewAppError(http.StatusBadRequest, "请完成验证码")
+	}
+	if err := h.captcha.VerifyToken(enc.CaptchaToken); err != nil {
+		var appErr *middleware.AppError
+		if errors.As(err, &appErr) {
+			return appErr
+		}
+		return middleware.WrapAppError(http.StatusInternalServerError, "验证码校验异常", err)
+	}
+	return nil
 }
 
 // --- Cookie helpers ---

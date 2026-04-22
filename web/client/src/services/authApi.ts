@@ -3,16 +3,28 @@ import api from './api.js';
 import type { ApiResponse, AuthResponse, User } from '@m3u8-preview/shared';
 import { encryptAuthPayload } from '../utils/crypto.js';
 
+export interface CaptchaPublicConfig {
+  enabled: boolean;
+  endpoint?: string;
+  siteKey?: string;
+}
+
 export const authApi = {
-  async register(username: string, password: string) {
+  async register(username: string, password: string, captchaToken?: string) {
     const envelope = await encryptAuthPayload('register', { username, password });
-    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/register', envelope);
+    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/register', {
+      ...envelope,
+      ...(captchaToken ? { captchaToken } : {}),
+    });
     return data.data!;
   },
 
-  async login(username: string, password: string) {
+  async login(username: string, password: string, captchaToken?: string) {
     const envelope = await encryptAuthPayload('login', { username, password });
-    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/login', envelope);
+    const { data } = await api.post<ApiResponse<AuthResponse>>('/auth/login', {
+      ...envelope,
+      ...(captchaToken ? { captchaToken } : {}),
+    });
     return data.data!;
   },
 
@@ -47,6 +59,14 @@ export const authApi = {
   async getRegisterStatus() {
     const { data } = await axios.get<ApiResponse<{ allowRegistration: boolean }>>(
       '/api/v1/auth/register-status',
+      { timeout: 10000 },
+    );
+    return data.data!;
+  },
+
+  async getCaptchaConfig() {
+    const { data } = await axios.get<ApiResponse<CaptchaPublicConfig>>(
+      '/api/v1/auth/captcha-config',
       { timeout: 10000 },
     );
     return data.data!;

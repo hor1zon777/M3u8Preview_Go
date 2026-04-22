@@ -48,6 +48,10 @@ func EnsureDefaultSettings(db *gorm.DB) error {
 		model.SettingEnableRateLimit:        "true",
 		model.SettingProxyAllowedExtensions: ".m3u8,.ts,.m4s,.mp4,.aac,.key,.jpg,.jpeg,.png,.webp",
 		model.SettingDownloadExternalPosters: "false",
+		model.SettingEnableCaptcha:           "false",
+		model.SettingCaptchaEndpoint:         "",
+		model.SettingCaptchaSiteKey:          "",
+		model.SettingCaptchaSecretKey:        "",
 	}
 
 	// 一次性查出已存在的 key，避免每条都走一次 SELECT
