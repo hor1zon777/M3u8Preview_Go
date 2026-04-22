@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -100,11 +101,18 @@ func (s *CaptchaService) CSPOrigin() string {
 
 	origin := ""
 	cs, err := s.loadSettings()
-	if err == nil && cs.endpoint != "" {
+	if err != nil {
+		log.Printf("[captcha] CSPOrigin loadSettings error: %v", err)
+	} else if cs.endpoint == "" {
+		log.Printf("[captcha] CSPOrigin: endpoint is empty")
+	} else {
 		if u, e := url.Parse(cs.endpoint); e == nil && u.Scheme != "" && u.Host != "" {
 			origin = u.Scheme + "://" + u.Host
+		} else {
+			log.Printf("[captcha] CSPOrigin: url.Parse(%q) → scheme=%q host=%q err=%v", cs.endpoint, u.Scheme, u.Host, e)
 		}
 	}
+	log.Printf("[captcha] CSPOrigin resolved: %q", origin)
 	s.cachedCSP = origin
 	s.cacheExpiry = time.Now().Add(cspCacheTTL)
 	return origin
