@@ -100,7 +100,7 @@ func (s *CaptchaService) CSPOrigin() string {
 
 	origin := ""
 	cs, err := s.loadSettings()
-	if err == nil && cs.enabled && cs.endpoint != "" {
+	if err == nil && cs.endpoint != "" {
 		if u, e := url.Parse(cs.endpoint); e == nil && u.Scheme != "" && u.Host != "" {
 			origin = u.Scheme + "://" + u.Host
 		}
