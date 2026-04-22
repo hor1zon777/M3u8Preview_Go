@@ -2,8 +2,10 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -39,7 +41,7 @@ type captchaSettings struct {
 	secretKey string
 }
 
-func (s *CaptchaService) loadSettings() captchaSettings {
+func (s *CaptchaService) loadSettings() (captchaSettings, error) {
 	keys := []string{
 		model.SettingEnableCaptcha,
 		model.SettingCaptchaEndpoint,
@@ -47,7 +49,9 @@ func (s *CaptchaService) loadSettings() captchaSettings {
 		model.SettingCaptchaSecretKey,
 	}
 	var rows []model.SystemSetting
-	s.db.Where("key IN ?", keys).Find(&rows)
+	if err := s.db.Where("key IN ?", keys).Find(&rows).Error; err != nil {
+		return captchaSettings{}, fmt.Errorf("load captcha settings: %w", err)
+	}
 
 	m := make(map[string]string, len(rows))
 	for _, r := range rows {
@@ -61,16 +65,12 @@ func (s *CaptchaService) loadSettings() captchaSettings {
 	}
 	cs.enabled = m[model.SettingEnableCaptcha] == "true" &&
 		cs.endpoint != "" && cs.siteKey != "" && cs.secretKey != ""
-	return cs
-}
-
-func (s *CaptchaService) IsEnabled() bool {
-	return s.loadSettings().enabled
+	return cs, nil
 }
 
 func (s *CaptchaService) GetPublicConfig() CaptchaPublicConfig {
-	cs := s.loadSettings()
-	if !cs.enabled {
+	cs, err := s.loadSettings()
+	if err != nil || !cs.enabled {
 		return CaptchaPublicConfig{Enabled: false}
 	}
 	return CaptchaPublicConfig{
@@ -80,48 +80,55 @@ func (s *CaptchaService) GetPublicConfig() CaptchaPublicConfig {
 	}
 }
 
-func (s *CaptchaService) VerifyToken(token string) error {
-	cs := s.loadSettings()
+const maxCaptchaTokenLen = 4096
+
+func (s *CaptchaService) VerifyIfEnabled(ctx context.Context, token string) error {
+	cs, err := s.loadSettings()
+	if err != nil {
+		return middleware.WrapAppError(http.StatusInternalServerError, "读取验证码配置失败", err)
+	}
 	if !cs.enabled {
 		return nil
 	}
+	if token == "" {
+		return middleware.NewAppError(http.StatusBadRequest, "请完成验证码")
+	}
+	if len(token) > maxCaptchaTokenLen {
+		return middleware.NewAppError(http.StatusBadRequest, "验证码 token 无效")
+	}
 
-	body, _ := json.Marshal(map[string]string{
+	reqBody, _ := json.Marshal(map[string]string{
 		"token":      token,
 		"secret_key": cs.secretKey,
 	})
 
-	resp, err := s.client.Post(
-		cs.endpoint+"/api/v1/siteverify",
-		"application/json",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cs.endpoint+"/api/v1/siteverify", bytes.NewReader(reqBody))
 	if err != nil {
-		return middleware.WrapAppError(
-			http.StatusBadGateway,
-			"验证服务不可用",
-			fmt.Errorf("captcha siteverify: %w", err),
-		)
+		return middleware.WrapAppError(http.StatusInternalServerError, "构造验证请求失败", err)
 	}
-	defer resp.Body.Close()
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return middleware.WrapAppError(http.StatusBadGateway, "验证服务不可用", fmt.Errorf("captcha siteverify: %w", err))
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	if resp.StatusCode/100 != 2 {
+		return middleware.NewAppError(http.StatusBadGateway,
+			fmt.Sprintf("验证服务异常 (HTTP %d)", resp.StatusCode))
+	}
 
 	var result struct {
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return middleware.WrapAppError(
-			http.StatusBadGateway,
-			"验证服务响应异常",
-			fmt.Errorf("captcha decode: %w", err),
-		)
+		return middleware.WrapAppError(http.StatusBadGateway, "验证服务响应异常", fmt.Errorf("captcha decode: %w", err))
 	}
 	if !result.Success {
-		msg := "验证码校验失败"
-		if result.Error != "" {
-			msg = result.Error
-		}
-		return middleware.NewAppError(http.StatusForbidden, msg)
+		return middleware.NewAppError(http.StatusForbidden, "验证码校验失败")
 	}
 	return nil
 }

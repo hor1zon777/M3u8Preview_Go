@@ -62,7 +62,8 @@ export function RegisterForm() {
   }
 
   const captchaRequired = captchaConfig?.enabled === true;
-  const canSubmit = !loading && (!captchaRequired || !!captchaToken);
+  const captchaLoading = captchaConfig === null;
+  const canSubmit = !loading && !captchaLoading && (!captchaRequired || !!captchaToken);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();

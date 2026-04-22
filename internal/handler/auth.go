@@ -94,8 +94,8 @@ func (h *AuthHandler) register(c *gin.Context) {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
 		return
 	}
-	if err := h.verifyCaptchaIfEnabled(&enc); err != nil {
-		middleware.AbortWithAppError(c, err)
+	if err := h.captcha.VerifyIfEnabled(c.Request.Context(), enc.CaptchaToken); err != nil {
+		_ = c.Error(err)
 		return
 	}
 	plaintext, err := h.decryptAuth(&enc, aadRegister)
@@ -123,8 +123,8 @@ func (h *AuthHandler) login(c *gin.Context) {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
 		return
 	}
-	if err := h.verifyCaptchaIfEnabled(&enc); err != nil {
-		middleware.AbortWithAppError(c, err)
+	if err := h.captcha.VerifyIfEnabled(c.Request.Context(), enc.CaptchaToken); err != nil {
+		_ = c.Error(err)
 		return
 	}
 	plaintext, err := h.decryptAuth(&enc, aadLogin)
@@ -227,23 +227,6 @@ func (h *AuthHandler) sseTicket(c *gin.Context) {
 
 func (h *AuthHandler) captchaConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.OK(h.captcha.GetPublicConfig()))
-}
-
-func (h *AuthHandler) verifyCaptchaIfEnabled(enc *dto.EncryptedAuthRequest) *middleware.AppError {
-	if !h.captcha.IsEnabled() {
-		return nil
-	}
-	if enc.CaptchaToken == "" {
-		return middleware.NewAppError(http.StatusBadRequest, "请完成验证码")
-	}
-	if err := h.captcha.VerifyToken(enc.CaptchaToken); err != nil {
-		var appErr *middleware.AppError
-		if errors.As(err, &appErr) {
-			return appErr
-		}
-		return middleware.WrapAppError(http.StatusInternalServerError, "验证码校验异常", err)
-	}
-	return nil
 }
 
 // --- Cookie helpers ---

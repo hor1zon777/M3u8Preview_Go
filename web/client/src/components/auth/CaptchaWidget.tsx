@@ -42,16 +42,14 @@ function loadScript(src: string, dataAttrs?: Record<string, string>): Promise<vo
 
   const existingTag = document.querySelector<HTMLScriptElement>(`script[src="${src}"]`);
   const promise = new Promise<void>((resolve, reject) => {
+    const onError = (el: HTMLScriptElement) => {
+      loadPromises.delete(src);
+      el.remove();
+      reject(new Error(`加载验证码 SDK 失败: ${src}`));
+    };
     const attach = (el: HTMLScriptElement) => {
       el.addEventListener('load', () => resolve(), { once: true });
-      el.addEventListener(
-        'error',
-        () => {
-          loadPromises.delete(src);
-          reject(new Error(`加载验证码 SDK 失败: ${src}`));
-        },
-        { once: true },
-      );
+      el.addEventListener('error', () => onError(el), { once: true });
     };
     if (existingTag) {
       attach(existingTag);
