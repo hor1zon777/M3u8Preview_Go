@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -343,19 +344,31 @@ func secureHeaders(captcha *service.CaptchaService) gin.HandlerFunc {
 
 // spaFallback 尝试用构建好的 index.html 响应前端路由；
 // 若 dist 不存在（本地开发走 Vite DevServer），退回 404 JSON。
+// 使用 sync.Once 延迟到首次请求时查找，确保 Docker volume 已就绪。
 func spaFallback(cfg *config.Config) gin.HandlerFunc {
 	candidates := []string{
+		"/app/web/dist/index.html",
 		filepath.Join(cfg.DataDir, "..", "web", "dist", "index.html"),
+		filepath.Join("web", "dist", "index.html"),
 		filepath.Join("web", "client", "dist", "index.html"),
 	}
+
 	var indexPath string
-	for _, p := range candidates {
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			indexPath = p
-			break
+	var once sync.Once
+
+	findIndex := func() {
+		for _, p := range candidates {
+			if info, err := os.Stat(p); err == nil && !info.IsDir() {
+				indexPath = p
+				log.Printf("[spa] index.html found at %s", p)
+				return
+			}
 		}
+		log.Printf("[spa] index.html not found in any candidate: %v", candidates)
 	}
+
 	return func(c *gin.Context) {
+		once.Do(findIndex)
 		if indexPath == "" || strings.HasPrefix(c.Request.URL.Path, "/api/") ||
 			filepath.Ext(c.Request.URL.Path) != "" {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Route not found"})
