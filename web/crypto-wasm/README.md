@@ -10,14 +10,20 @@
 
 1. JS 拉 `GET /auth/challenge` 得到 `{serverPub, challenge, ttl=60s}`
 2. WASM 生成一次性 ECDH P-256 密钥对，与 `serverPub` 协商共享密钥
-3. HKDF-SHA256(shared, salt=challenge, info="m3u8preview-auth-v1") 派生 32B AES key
+3. HKDF-SHA256(shared, salt=SHA256(challenge || fingerprint), info="m3u8preview-auth-v1") 派生 32B AES key
 4. AES-256-GCM(iv=12B 随机, aad=端点常量, plaintext=JSON) → ct(含 16B tag)
 5. JS 打包 `{challenge, clientPub, iv, ct}`（全 base64url）POST
 
-## 混淆
+## 关于混淆（历史）
 
-- HKDF info 在 Rust 里以 XOR(0xA7) 存储，运行时解码
-- `wasm-decompile` 看到的是解码函数 + 乱码字节，不是明文 `"m3u8preview-auth-v1"`
+早期版本在 WASM 里加了一层 XOR(0xA7) 常量混淆 + `dispatch_hkdf` 分派 + `dummy_transform_a/b`
+作为抗逆向辅助。2026-04 审查结论：
+- dummy 分支里的 `Vec::collect` 有堆分配副作用，Rust 不会 DCE，每次登录都在白白分配
+- 一字节 XOR 对 `wasm-decompile` 毫无拖延
+- 整体对真实逆向收益为 0，对 CPU / 包体积反而负收益
+
+因此现在直接使用字面量 `b"m3u8preview-auth-v1"`，不再做常量混淆。
+真正的抗逆向靠外部 `wasm-opt --strip` 做 DWARF / 名称表清理，以及上线后的协议层监控。
 
 ## 构建
 
@@ -67,4 +73,4 @@ src/
   lib.rs       # 唯一入口：encrypt_auth_payload() 导出到 JS
 ```
 
-测试覆盖 XOR 混淆还原正确性；协议端到端正确性由 Go 侧 handler test 覆盖。
+测试覆盖 `blend_salt` 确定性与 `hex_decode` 往返；协议端到端正确性由 Go 侧 handler test 覆盖。
