@@ -239,6 +239,8 @@ func (s *AdminService) GetSettings() ([]dto.AdminSettingEntry, error) {
 }
 
 // allowedSettingKeys 是系统设置允许的 key 白名单。
+// 同一份表供 admin 写入、backup 导入两条路径复用——任何未列入的 key 一律拒绝，
+// 防止旧 / 被篡改的备份往 system_settings 表里植入白名单外的配置。
 var allowedSettingKeys = map[string]struct{}{
 	"siteName":                {},
 	"allowRegistration":       {},
@@ -249,6 +251,12 @@ var allowedSettingKeys = map[string]struct{}{
 	"captchaEndpoint":         {},
 	"captchaSiteKey":          {},
 	"captchaSecretKey":        {},
+}
+
+// IsAllowedSettingKey 供其它 service（如 backup 导入）复用白名单检查。
+func IsAllowedSettingKey(key string) bool {
+	_, ok := allowedSettingKeys[key]
+	return ok
 }
 
 // UpdateSetting upsert 单个 key，返回当前值。

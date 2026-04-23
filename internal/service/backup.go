@@ -399,17 +399,25 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			return err
 		}
 
-		// systemSettings 用 upsert
+		// systemSettings 用 upsert；应用 admin 同一份白名单，防止被篡改 / 老版本的备份
+		// 往 system_settings 表里注入白名单外的 key，恢复后这些脏数据会被 GetSettings 原样读出
+		settingsWritten := 0
 		for _, row := range data.Tables.SystemSettings {
 			if row.Key == "" {
+				continue
+			}
+			if !IsAllowedSettingKey(row.Key) {
 				continue
 			}
 			if err := tx.Save(&model.SystemSetting{Key: row.Key, Value: row.Value}).Error; err != nil {
 				return err
 			}
 			totalRecords++
+			settingsWritten++
 		}
-		tablesRestored++
+		if settingsWritten > 0 {
+			tablesRestored++
+		}
 		emit(BackupProgress{Phase: "write", Message: "已写入 systemSettings",
 			Current: 11, Total: 11, Percentage: 75})
 		return nil
@@ -770,9 +778,29 @@ func sanitizeUsers(in []backupUser) []backupUser {
 		if u.Role != "USER" && u.Role != "ADMIN" {
 			continue
 		}
+		if !isValidBcryptHash(u.PasswordHash) {
+			// 损坏/未 bcrypt 编码的 hash 会让该用户永久无法登录；直接跳过该用户。
+			// 这是故意比"整体拒绝导入"更宽松——保留其它合法用户的恢复能力。
+			continue
+		}
 		out = append(out, u)
 	}
 	return out
+}
+
+// isValidBcryptHash 检查是否是合法 bcrypt 摘要格式。
+// 格式为 $2[aby]$<cost>$<22 字节 salt><31 字节 hash>，标准长度 60；
+// 允许 59-72 兜底异常实现差异，再由实际 bcrypt.Compare 做最终裁决。
+func isValidBcryptHash(h string) bool {
+	if len(h) < 59 || len(h) > 72 {
+		return false
+	}
+	if !(strings.HasPrefix(h, "$2a$") ||
+		strings.HasPrefix(h, "$2b$") ||
+		strings.HasPrefix(h, "$2y$")) {
+		return false
+	}
+	return true
 }
 
 func sanitizeCategories(in []model.Category) []model.Category   { return in }
