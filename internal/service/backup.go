@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -439,6 +440,17 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 		return RestoreResult{}, middleware.WrapAppError(http.StatusInternalServerError, "恢复文件失败", upErr)
 	}
 
+	// 清理本地封面孤儿引用：backup 不含封面时，poster_url 指向 /uploads/posters/xxx 但文件不存在
+	orphaned := s.cleanOrphanPosterRefs()
+	if orphaned > 0 {
+		emit(BackupProgress{Phase: "files",
+			Message:    fmt.Sprintf("已清理 %d 个失效的本地封面引用", orphaned),
+			Current:    restored,
+			Total:      restored,
+			Percentage: 96,
+		})
+	}
+
 	// 拷贝 invalidators 切片后释放锁再调用回调，避免持锁执行业务方法导致死锁
 	s.mu.Lock()
 	fns := append([]func(){}, s.invalidators...)
@@ -455,6 +467,54 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 	}
 	emit(BackupProgress{Phase: "complete", Message: "恢复完成", Current: 1, Total: 1, Percentage: 100, Result: &res})
 	return res, nil
+}
+
+// cleanOrphanPosterRefs 扫描 poster_url 为本地路径但文件不存在的记录，置为 NULL。
+// 典型场景：备份不含封面（includePosters=false）时恢复，DB 中的路径指向不存在的文件。
+func (s *BackupService) cleanOrphanPosterRefs() int {
+	type posterRef struct {
+		ID        string `gorm:"column:id"`
+		PosterURL string `gorm:"column:poster_url"`
+	}
+	var refs []posterRef
+	if err := s.db.Model(&model.Media{}).
+		Select("id, poster_url").
+		Where("poster_url IS NOT NULL AND poster_url <> '' AND poster_url NOT LIKE 'http%'").
+		Scan(&refs).Error; err != nil {
+		log.Printf("[backup] cleanOrphanPosterRefs: query failed: %v", err)
+		return 0
+	}
+
+	var orphanIDs []string
+	for _, r := range refs {
+		rel := strings.TrimPrefix(r.PosterURL, "/uploads/")
+		if rel == r.PosterURL {
+			continue
+		}
+		absPath := filepath.Join(s.uploadsDir, rel)
+		if _, err := os.Stat(absPath); os.IsNotExist(err) {
+			orphanIDs = append(orphanIDs, r.ID)
+		}
+	}
+
+	if len(orphanIDs) == 0 {
+		return 0
+	}
+
+	for i := 0; i < len(orphanIDs); i += 100 {
+		end := i + 100
+		if end > len(orphanIDs) {
+			end = len(orphanIDs)
+		}
+		if err := s.db.Model(&model.Media{}).
+			Where("id IN ?", orphanIDs[i:end]).
+			Update("poster_url", nil).Error; err != nil {
+			log.Printf("[backup] cleanOrphanPosterRefs: batch update failed: %v", err)
+		}
+	}
+
+	log.Printf("[backup] cleaned %d orphan poster references", len(orphanIDs))
+	return len(orphanIDs)
 }
 
 // ---- helpers ----

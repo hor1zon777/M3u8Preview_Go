@@ -219,8 +219,8 @@ export function AdminDashboardPage() {
           <h3 className="text-white font-semibold">系统设置</h3>
         </div>
         <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+            <div>
               <p className="text-white text-sm">站点名称</p>
               <p className="text-emby-text-muted text-xs mt-0.5">自定义显示的站点名称</p>
             </div>
@@ -230,7 +230,7 @@ export function AdminDashboardPage() {
                 value={siteNameDraft}
                 onChange={(e) => setSiteNameDraft(e.target.value)}
                 placeholder="M3u8 Preview"
-                className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-48"
+                className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent flex-1 min-w-0 sm:flex-initial sm:w-48"
               />
               {siteNameDraft !== siteName && (
                 <button
@@ -243,8 +243,8 @@ export function AdminDashboardPage() {
               )}
             </div>
           </div>
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1 min-w-0">
               <p className="text-white text-sm">允许新用户注册</p>
               <p className="text-emby-text-muted text-xs mt-0.5">关闭后新用户将无法注册账号</p>
             </div>
@@ -259,7 +259,7 @@ export function AdminDashboardPage() {
                   value: allowRegistration ? 'false' : 'true',
                 })
               }
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
+              className={`shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
                 allowRegistration ? 'bg-emby-green' : 'bg-emby-bg-input'
               }`}
             >
@@ -270,8 +270,8 @@ export function AdminDashboardPage() {
               />
             </button>
           </div>
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1 min-w-0">
               <p className="text-white text-sm">启用网站速率限制</p>
               <p className="text-emby-text-muted text-xs mt-0.5">
                 关闭后将跳过全局、认证、代理、签名与播放量限流
@@ -288,7 +288,7 @@ export function AdminDashboardPage() {
                   value: enableRateLimit ? 'false' : 'true',
                 })
               }
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
+              className={`shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
                 enableRateLimit ? 'bg-emby-green' : 'bg-emby-bg-input'
               }`}
             >
@@ -299,8 +299,8 @@ export function AdminDashboardPage() {
               />
             </button>
           </div>
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1 min-w-0">
               <p className="text-white text-sm">外部封面下载到本地</p>
               <p className="text-emby-text-muted text-xs mt-0.5">
                 开启后新建/编辑媒体时会把外部 http(s) 封面同步下载到 uploads/posters/；关闭则保留原 URL
@@ -317,7 +317,7 @@ export function AdminDashboardPage() {
                   value: downloadExternalPosters ? 'false' : 'true',
                 })
               }
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
+              className={`shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
                 downloadExternalPosters ? 'bg-emby-green' : 'bg-emby-bg-input'
               }`}
             >
@@ -394,8 +394,8 @@ export function AdminDashboardPage() {
           <div className="border-t border-emby-border-subtle pt-4 mt-4">
             <p className="text-emby-text-secondary text-xs font-medium uppercase tracking-wide mb-3">PoW 验证码</p>
             <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex-1 min-w-0">
                   <p className="text-white text-sm">启用验证码</p>
                   <p className="text-emby-text-muted text-xs mt-0.5">开启后登录和注册页面需要完成 PoW 验证</p>
                 </div>
@@ -410,7 +410,7 @@ export function AdminDashboardPage() {
                       value: enableCaptcha ? 'false' : 'true',
                     })
                   }
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
+                  className={`shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emby-green focus:ring-offset-2 focus:ring-offset-emby-bg-card disabled:opacity-50 ${
                     enableCaptcha ? 'bg-emby-green' : 'bg-emby-bg-input'
                   }`}
                 >
@@ -422,8 +422,8 @@ export function AdminDashboardPage() {
                 </button>
               </div>
 
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+                <div>
                   <p className="text-white text-sm">验证服务地址</p>
                   <p className="text-emby-text-muted text-xs mt-0.5">PoW CAPTCHA 服务的完整 URL</p>
                 </div>
@@ -433,7 +433,7 @@ export function AdminDashboardPage() {
                     value={captchaEndpointDraft}
                     onChange={(e) => setCaptchaEndpointDraft(e.target.value)}
                     placeholder="https://captcha.example.com"
-                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64"
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent flex-1 min-w-0 sm:flex-initial sm:w-64"
                   />
                   {captchaEndpointDraft !== captchaEndpoint && (
                     <button
@@ -447,8 +447,8 @@ export function AdminDashboardPage() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+                <div>
                   <p className="text-white text-sm">站点公钥 (Site Key)</p>
                   <p className="text-emby-text-muted text-xs mt-0.5">从验证服务管理面板获取，前端可见</p>
                 </div>
@@ -458,7 +458,7 @@ export function AdminDashboardPage() {
                     value={captchaSiteKeyDraft}
                     onChange={(e) => setCaptchaSiteKeyDraft(e.target.value)}
                     placeholder="pk_..."
-                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64"
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent flex-1 min-w-0 sm:flex-initial sm:w-64"
                   />
                   {captchaSiteKeyDraft !== captchaSiteKey && (
                     <button
@@ -472,8 +472,8 @@ export function AdminDashboardPage() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+                <div>
                   <p className="text-white text-sm">站点私钥 (Secret Key)</p>
                   <p className="text-emby-text-muted text-xs mt-0.5">仅服务端使用，用于 siteverify 接口核验 token</p>
                 </div>
@@ -483,7 +483,7 @@ export function AdminDashboardPage() {
                     value={captchaSecretKeyDraft}
                     onChange={(e) => setCaptchaSecretKeyDraft(e.target.value)}
                     placeholder="sk_..."
-                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64"
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent flex-1 min-w-0 sm:flex-initial sm:w-64"
                   />
                   {captchaSecretKeyDraft !== captchaSecretKey && (
                     <button
@@ -497,8 +497,8 @@ export function AdminDashboardPage() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+                <div>
                   <p className="text-white text-sm">Manifest 签名公钥 (Tier 2，可选)</p>
                   <p className="text-emby-text-muted text-xs mt-0.5">
                     Portcullis Ed25519 公钥 base64(32B)。留空则仅依赖 SRI；填入后强制校验 X-Portcullis-Signature，防中间人篡改 manifest。
@@ -510,7 +510,7 @@ export function AdminDashboardPage() {
                     value={captchaManifestPubKeyDraft}
                     onChange={(e) => setCaptchaManifestPubKeyDraft(e.target.value)}
                     placeholder="base64(32 bytes)"
-                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64 font-mono"
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent flex-1 min-w-0 sm:flex-initial sm:w-64 font-mono"
                   />
                   {captchaManifestPubKeyDraft !== captchaManifestPubKey && (
                     <button

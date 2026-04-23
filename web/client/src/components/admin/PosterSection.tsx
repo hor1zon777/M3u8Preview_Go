@@ -76,6 +76,7 @@ export function PosterSection() {
     : [];
 
   const hasExternal = (stats?.external ?? 0) > 0;
+  const hasMissing = (stats?.missing ?? 0) > 0;
   const hasFailed = (migrationStatus?.failed ?? 0) > 0 && !isRunning;
 
   return (
@@ -129,7 +130,9 @@ export function PosterSection() {
         )}
 
         {!hasExternal && !isRunning && (
-          <span className="text-emby-text-muted text-xs">所有封面均已本地化</span>
+          <span className="text-emby-text-muted text-xs">
+            {hasMissing ? '无外部封面需要迁移' : '所有封面均已本地化'}
+          </span>
         )}
       </div>
 

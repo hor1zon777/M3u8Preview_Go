@@ -419,7 +419,7 @@ export function BackupSection() {
               <CheckCircle className="w-5 h-5 text-green-400" />
               <p className="text-green-200 text-sm font-medium">恢复完成</p>
             </div>
-            <div className="mt-2 grid grid-cols-4 gap-3 text-xs text-emby-text-muted">
+            <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs text-emby-text-muted">
               <div>
                 <span className="text-white font-medium">{restoreResult.tablesRestored}</span> 张表
               </div>
