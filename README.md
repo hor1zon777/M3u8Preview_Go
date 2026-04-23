@@ -149,13 +149,16 @@ docker compose -f docker-compose.dev.yml up --build
 
 ## 从 TS 版 M3u8Preview_R 迁移
 
+> **完整教程**：[docs/MIGRATION_FROM_NODE.md](docs/MIGRATION_FROM_NODE.md) — 含零停机灰度、回滚预案、行为差异清单、FAQ。
+> 本节给出精简 5 步版本。
+
 迁移核心原则：**数据库字段、Cookie 名、JWT 签名、代理签名** 都逐字节兼容。
 
 1. **备份现有数据**
 
    ```bash
    cp M3u8Preview_R/data/m3u8preview.db m3u8-preview-go/data/m3u8preview.db
-   # 或直接挂卷复用同一份 db-data（推荐 Docker 场景）
+   cp -a M3u8Preview_R/uploads/. m3u8-preview-go/uploads/
    ```
 
 2. **`.env` 整个复制过来**，**保持 `JWT_SECRET` / `JWT_REFRESH_SECRET` / `PROXY_SECRET` 不变**
