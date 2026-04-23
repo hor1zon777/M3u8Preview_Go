@@ -1,20 +1,17 @@
 //! crypto-wasm
 //!
 //! 登录加密核心的 WASM 实现。协议与后端 `internal/util/ecdh.go` 一一对齐：
-//! ECDH P-256 + HKDF-SHA256(info=XOR混淆, salt=SHA256(challenge||fp)) + AES-256-GCM。
+//! ECDH P-256 + HKDF-SHA256(info="m3u8preview-auth-v1", salt=SHA256(challenge||fp)) + AES-256-GCM。
 //!
 //! WASM 层只负责密码学：导入 server_pub / challenge / fingerprint 与明文 JSON，
 //! 导出 {clientPub, iv, ct}。fetch challenge、解 JSON 等 I/O 由 JS 层负责。
 //!
-//! 混淆策略：
-//!   - HKDF info 常量用 XOR(0xA7) 存储，运行时解码
-//!   - HKDF salt = SHA256(challenge_bytes || fingerprint_bytes)：
-//!     设备指纹混入 salt，换设备 → fp 变 → AES key 不同 → 后端解密失败
-//!   - AAD 由调用方传入
-//!
-//! T2.5 加固：
-//!   - 增加 dummy 函数和 match dispatch 让 wasm-decompile 输出更混乱
-//!   - 外部 wasm-opt --flatten --rse 进一步打散控制流
+//! 历史：之前存在一层 XOR(0xA7) 混淆常量 + dispatch match 分派 + dummy_transform_a/b。
+//! 审查发现：
+//!   - dummy 分支的 Vec::collect 有堆分配副作用，Rust 不会 DCE（每次登录多 2 次无用分配）
+//!   - XOR(0xA7) 一字节被 wasm-decompile 一眼识破
+//!   - 整体"混淆"对真实逆向无增益，对 CPU / 包体积反而负收益
+//! 现在统一删除，回归直白实现；外部 wasm-opt / strip 仍可做名称/DWARF 清理。
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -27,61 +24,7 @@ use p256::PublicKey;
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 
-// --- 常量混淆 ---
-
-const XOR_KEY: u8 = 0xA7;
-
-const HKDF_INFO_ENC: [u8; 19] = [
-    0xCA, 0x94, 0xD2, 0x9F, 0xD7, 0xD5, 0xC2, 0xD1, 0xCE, 0xC2, 0xD0, 0x8A, 0xC6, 0xD2, 0xD3,
-    0xCF, 0x8A, 0xD1, 0x96,
-];
-
-#[inline(never)]
-fn xor_decode(enc: &[u8]) -> Vec<u8> {
-    enc.iter().map(|b| b ^ XOR_KEY).collect()
-}
-
-// --- T2.5 控制流混淆辅助 ---
-
-// dummy 函数：编译进 WASM 但运行时不执行。
-// wasm-decompile 看到这些函数会增加分析复杂度。
-#[inline(never)]
-#[allow(dead_code)]
-fn dummy_transform_a(data: &[u8]) -> Vec<u8> {
-    data.iter().rev().map(|b| b.wrapping_add(0x5A)).collect()
-}
-
-#[inline(never)]
-#[allow(dead_code)]
-fn dummy_transform_b(data: &[u8]) -> Vec<u8> {
-    data.iter()
-        .enumerate()
-        .map(|(i, b)| b ^ (i as u8).wrapping_mul(0x37))
-        .collect()
-}
-
-// match dispatch：用数值选择器调用真实路径。
-// 编译器无法静态确定分支，wasm-decompile 看到 br_table 指令。
-#[inline(never)]
-fn dispatch_hkdf(
-    selector: u32,
-    shared: &[u8],
-    salt: &[u8],
-    info: &[u8],
-) -> Result<[u8; 32], &'static str> {
-    match selector % 4 {
-        0 => {
-            let _ = dummy_transform_a(salt);
-            compute_hkdf(shared, salt, info)
-        }
-        1 => compute_hkdf(shared, salt, info),
-        2 => {
-            let _ = dummy_transform_b(shared);
-            compute_hkdf(shared, salt, info)
-        }
-        _ => compute_hkdf(shared, salt, info),
-    }
-}
+const HKDF_INFO: &[u8] = b"m3u8preview-auth-v1";
 
 #[inline(never)]
 fn compute_hkdf(shared: &[u8], salt: &[u8], info: &[u8]) -> Result<[u8; 32], &'static str> {
@@ -165,10 +108,7 @@ pub fn encrypt_auth_payload(
     // salt = SHA256(challenge || fingerprint)
     let blended_salt = blend_salt(&challenge, &fp_bytes);
 
-    let info = xor_decode(&HKDF_INFO_ENC);
-    // dispatch selector 用 challenge 首字节做伪随机选择
-    let selector = challenge.first().copied().unwrap_or(0) as u32;
-    let aes_key = dispatch_hkdf(selector, shared.raw_secret_bytes(), &blended_salt, &info)
+    let aes_key = compute_hkdf(shared.raw_secret_bytes(), &blended_salt, HKDF_INFO)
         .map_err(|e| JsError::new(e))?;
 
     let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|_| JsError::new("aes key"))?;
@@ -209,12 +149,6 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hkdf_info_xor_roundtrips() {
-        let decoded = xor_decode(&HKDF_INFO_ENC);
-        assert_eq!(decoded, b"m3u8preview-auth-v1");
-    }
 
     #[test]
     fn blend_salt_deterministic() {

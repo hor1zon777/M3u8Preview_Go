@@ -363,12 +363,21 @@ func (h *AuthHandler) decryptAuth(enc *dto.EncryptedAuthRequest, aad string) (pl
 
 // unmarshalAndValidate 把明文 JSON 解入 dst 并跑 validator binding tag。
 // dst 应为 *RegisterRequest / *LoginRequest / *ChangePasswordRequest 之一。
+//
+// 安全注意：此函数处理的是已解密的密文内容，必须返回统一错误"请求无效"，
+// 不回显具体字段名和规则。否则攻击者能据此区分：
+//   - "解密成功但内容校验失败"（会看到 'password: password_complex'）
+//   - "解密失败 / challenge 重放"（会看到 '请求无效'）
+//
+// 形成弱 oracle，帮助攻击者判断伪造的密文是否构造成功。
+// 详细原因仅在调用侧通过 c.Error 写入日志（由 ErrorHandler 中间件落盘）。
 func unmarshalAndValidate(plaintext []byte, dst any) *middleware.AppError {
 	if err := json.Unmarshal(plaintext, dst); err != nil {
-		return middleware.NewAppError(http.StatusBadRequest, "请求无效")
+		return middleware.WrapAppError(http.StatusBadRequest, "请求无效", err)
 	}
 	if err := binding.Validator.ValidateStruct(dst); err != nil {
-		return bindErrorToAppError(err)
+		// 保留原 err 到 AppError.Unwrap 链供日志审计，但用户可见 message 统一为"请求无效"
+		return middleware.WrapAppError(http.StatusBadRequest, "请求无效", err)
 	}
 	return nil
 }
