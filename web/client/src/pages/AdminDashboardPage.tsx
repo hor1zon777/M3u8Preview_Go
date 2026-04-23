@@ -23,23 +23,42 @@ export function AdminDashboardPage() {
   const updateSettingMutation = useMutation({
     mutationFn: ({ key, value }: { key: string; value: string }) =>
       adminApi.updateSetting(key, value),
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'settings'] });
+      showSettingSuccess(`已保存 ${variables.key}`);
     },
-    onError: () => {
-      showSettingError('设置更新失败，请重试');
+    onError: (err: unknown) => {
+      // 回显服务端具体原因（如 ValidateCaptchaEndpoint 拒绝时的'不允许指向内网'等）
+      const msg =
+        (err as any)?.response?.data?.error ||
+        (err as any)?.message ||
+        '设置更新失败，请重试';
+      console.error('[admin] updateSetting 失败', err);
+      showSettingError(msg);
     },
   });
 
   const [settingError, setSettingError] = useState('');
+  const [settingSuccess, setSettingSuccess] = useState('');
   const errorTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const successTimerRef = useRef<ReturnType<typeof setTimeout>>();
   useEffect(() => {
-    return () => { if (errorTimerRef.current) clearTimeout(errorTimerRef.current); };
+    return () => {
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+      if (successTimerRef.current) clearTimeout(successTimerRef.current);
+    };
   }, []);
   const showSettingError = useCallback((msg: string) => {
     setSettingError(msg);
+    setSettingSuccess('');
     if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
-    errorTimerRef.current = setTimeout(() => setSettingError(''), 3000);
+    errorTimerRef.current = setTimeout(() => setSettingError(''), 5000);
+  }, []);
+  const showSettingSuccess = useCallback((msg: string) => {
+    setSettingSuccess(msg);
+    setSettingError('');
+    if (successTimerRef.current) clearTimeout(successTimerRef.current);
+    successTimerRef.current = setTimeout(() => setSettingSuccess(''), 2500);
   }, []);
   const [newExt, setNewExt] = useState('');
   const settingsLoaded = !!settings;
@@ -513,6 +532,7 @@ export function AdminDashboardPage() {
           </div>
         </div>
         {settingError && <p className="text-red-400 text-xs mt-2">{settingError}</p>}
+        {settingSuccess && <p className="text-emby-green text-xs mt-2">{settingSuccess}</p>}
       </div>
 
       {/* Poster Management */}
