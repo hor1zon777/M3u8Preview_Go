@@ -7,6 +7,13 @@ export interface CaptchaPublicConfig {
   enabled: boolean;
   endpoint?: string;
   siteKey?: string;
+  /**
+   * Portcullis Tier 2 manifest 签名的 Ed25519 公钥，base64(32B)。
+   * 非空时 CaptchaWidget 强制校验 /sdk/manifest.json 的 X-Portcullis-Signature；
+   * 缺失或失配直接拒绝加载 SDK（不静默降级，防去头绕过）。
+   * 为空则跳过签名校验，仅依赖 SRI integrity（Tier 1 兼容）。
+   */
+  manifestPubKey?: string;
 }
 
 export const authApi = {

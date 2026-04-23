@@ -45,4 +45,8 @@ const (
 	SettingCaptchaEndpoint  = "captchaEndpoint"
 	SettingCaptchaSiteKey   = "captchaSiteKey"
 	SettingCaptchaSecretKey = "captchaSecretKey"
+	// SettingCaptchaManifestPubKey 是 Portcullis Tier 2 manifest 签名的 Ed25519 公钥，base64(32B)。
+	// 配置后前端强制校验 /sdk/manifest.json 的 X-Portcullis-Signature；缺失或失配直接拒绝加载 SDK。
+	// 留空则跳过签名校验，行为与 Tier 1 一致（仅 SRI integrity 防篡改）。
+	SettingCaptchaManifestPubKey = "captchaManifestPubKey"
 )

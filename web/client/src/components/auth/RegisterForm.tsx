@@ -145,6 +145,7 @@ export function RegisterForm() {
               key={captchaKeyRef.current}
               endpoint={captchaConfig.endpoint}
               siteKey={captchaConfig.siteKey}
+              manifestPubKey={captchaConfig.manifestPubKey}
               onSuccess={setCaptchaToken}
               onExpired={() => setCaptchaToken(null)}
               onError={() => setCaptchaToken(null)}

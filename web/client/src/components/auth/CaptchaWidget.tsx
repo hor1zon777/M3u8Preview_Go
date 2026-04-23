@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import * as ed from '@noble/ed25519';
 
 declare global {
   interface Window {
@@ -22,19 +23,29 @@ declare global {
 interface CaptchaWidgetProps {
   endpoint: string;
   siteKey: string;
+  /**
+   * Portcullis Tier 2 Ed25519 公钥（base64 32 字节），由 /api/v1/auth/captcha-config 返回。
+   * 非空时强制校验 /sdk/manifest.json 的 X-Portcullis-Signature；缺失 header 或失配直接 onError。
+   * 为空时跳过签名校验（Tier 1 行为）。
+   */
+  manifestPubKey?: string;
   onSuccess: (token: string) => void;
   onError?: (err: Error) => void;
   onExpired?: () => void;
 }
 
-// --- SDK 加载（带 SRI manifest 支持）---
+// --- SDK 加载（对齐 captcha/docs/INTEGRATION.md 方式 D + TIER2_IMPLEMENTATION.md）---
 //
-// 策略（对齐 captcha 服务 docs/INTEGRATION.md 方式 D）：
-//   1. 拉 GET /sdk/manifest.json（3s 超时），带 cache: 'no-store' 避开浏览器缓存漂移
-//   2. 用 manifest.artifacts['pow-captcha.js'] 的 {url, integrity} 注入 <script>
-//   3. 失败（网络 / 解析 / 超时）→ 降级到旧路径 ${endpoint}/sdk/pow-captcha.js（无 integrity）
-//
-// 这样 SDK 被篡改时浏览器 SRI 校验直接拒绝执行，同时老 captcha 服务器也仍兼容。
+// 决策树：
+//   1. 拉 GET /sdk/manifest.json（3s 超时，cache: no-store）
+//   2. 若配置了 manifestPubKey：
+//      a. 响应必须带 X-Portcullis-Signature header，否则 reject（防去头绕过）
+//      b. Ed25519 verify(sig, raw response bytes, pubKey)；失败 reject
+//   3. 解析 manifest.artifacts['pow-captcha.js'] → {url, integrity}
+//   4. 注入 <script integrity=... crossorigin=anonymous src=...>
+//   5. manifest 不可用（网络 / 超时 / 非 2xx / 解析失败）→ 降级到旧路径 ${endpoint}/sdk/pow-captcha.js
+//      - 降级路径不带 integrity，依赖 HTTPS + HSTS
+//      - 若本地配置了 pubKey 但 manifest 拉不到，**不降级**——视为强校验失败（未来 Portcullis 故障不应变成静默不验签）
 
 interface PortcullisManifest {
   version: string;
@@ -47,25 +58,58 @@ interface SdkLoadPlan {
   wasmBase: string;
   /** fromManifest=true 时是带 SRI 的 v{version} 路径；false 表示降级到旧路径 */
   fromManifest: boolean;
+  /** 标记本次 plan 是否已通过 Ed25519 签名校验（配置了 pubKey 时必须 true） */
+  signatureVerified: boolean;
 }
 
+/** 缓存 key：endpoint + "|" + pubKey（不同 pubKey 不复用） */
 const manifestCache = new Map<string, Promise<SdkLoadPlan>>();
 
-/**
- * resolveSdkPlan 决定本次应加载哪个 SDK 资源：
- *   - 成功拉到 manifest → 用版本化路径 + integrity
- *   - manifest 不可用（超时 / 404 / 老 captcha 服务未部署 Tier 1）→ 降级到 ${endpoint}/sdk/pow-captcha.js 无 SRI
- * 单个 endpoint 的结果在会话内缓存，避免每次 render 重拉。
- */
-function resolveSdkPlan(endpoint: string): Promise<SdkLoadPlan> {
-  const cached = manifestCache.get(endpoint);
+/** base64 (标准 / URL-safe / padding 变体) → Uint8Array */
+function decodeBase64(s: string): Uint8Array | null {
+  const trimmed = s.trim();
+  // 先尝试标准 base64（含 padding）；不行再试 URL-safe
+  try {
+    const normalized = trimmed.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyManifestSignature(
+  rawBody: Uint8Array,
+  sigB64: string,
+  pubKeyB64: string,
+): Promise<boolean> {
+  const sig = decodeBase64(sigB64);
+  const pub = decodeBase64(pubKeyB64);
+  if (!sig || sig.length !== 64) return false;
+  if (!pub || pub.length !== 32) return false;
+  try {
+    return await ed.verifyAsync(sig, rawBody, pub);
+  } catch {
+    return false;
+  }
+}
+
+function resolveSdkPlan(endpoint: string, manifestPubKey?: string): Promise<SdkLoadPlan> {
+  const cacheKey = `${endpoint}|${manifestPubKey ?? ''}`;
+  const cached = manifestCache.get(cacheKey);
   if (cached) return cached;
 
   const legacy: SdkLoadPlan = {
     scriptSrc: `${endpoint}/sdk/pow-captcha.js`,
     wasmBase: `${endpoint}/sdk/`,
     fromManifest: false,
+    signatureVerified: false,
   };
+
+  const requireSignature = !!manifestPubKey && manifestPubKey.trim() !== '';
 
   const promise = (async (): Promise<SdkLoadPlan> => {
     const ctl = new AbortController();
@@ -75,29 +119,56 @@ function resolveSdkPlan(endpoint: string): Promise<SdkLoadPlan> {
         cache: 'no-store',
         signal: ctl.signal,
       });
-      if (!resp.ok) return legacy;
-      const manifest = (await resp.json()) as PortcullisManifest;
+      if (!resp.ok) {
+        if (requireSignature) {
+          throw new Error(`manifest HTTP ${resp.status}（已配置公钥，禁止降级）`);
+        }
+        return legacy;
+      }
+      // 必须先拿 raw bytes（ArrayBuffer），再 parse；签名对象是原始字节，不是规范化 JSON
+      const rawBuf = await resp.arrayBuffer();
+      const rawBytes = new Uint8Array(rawBuf);
+      if (requireSignature) {
+        const sigHeader = resp.headers.get('X-Portcullis-Signature');
+        if (!sigHeader) {
+          throw new Error('Portcullis 已配置签名但响应缺少 X-Portcullis-Signature header');
+        }
+        const ok = await verifyManifestSignature(rawBytes, sigHeader, manifestPubKey!);
+        if (!ok) {
+          throw new Error('Portcullis manifest 签名校验失败');
+        }
+      }
+      const manifest = JSON.parse(new TextDecoder().decode(rawBytes)) as PortcullisManifest;
       const sdk = manifest?.artifacts?.['pow-captcha.js'];
-      if (!sdk || !sdk.url) return legacy;
+      if (!sdk || !sdk.url) {
+        if (requireSignature) {
+          throw new Error('manifest 缺少 pow-captcha.js artifact');
+        }
+        return legacy;
+      }
       const scriptSrc = `${endpoint}${sdk.url}`;
       return {
         scriptSrc,
         integrity: sdk.integrity,
         wasmBase: scriptSrc.replace(/[^/]+$/, ''),
         fromManifest: true,
+        signatureVerified: requireSignature,
       };
-    } catch {
+    } catch (err) {
+      if (requireSignature) throw err;
       return legacy;
     } finally {
       clearTimeout(timer);
     }
   })();
 
-  manifestCache.set(endpoint, promise);
-  // 降级后允许下次重试（可能 captcha 服务刚上线 Tier 1）
-  promise.then((plan) => {
-    if (!plan.fromManifest) manifestCache.delete(endpoint);
-  });
+  manifestCache.set(cacheKey, promise);
+  // 降级 / 拒绝后允许下次重试（部署升级后无感恢复）
+  promise
+    .then((plan) => {
+      if (!plan.fromManifest) manifestCache.delete(cacheKey);
+    })
+    .catch(() => manifestCache.delete(cacheKey));
   return promise;
 }
 
@@ -135,14 +206,9 @@ function loadScript(
     const script = document.createElement('script');
     script.src = src;
     script.async = true;
-    // SRI 校验要求同时设置 integrity + crossorigin=anonymous，否则浏览器不 enforce
-    if (attrs?.integrity) {
-      script.integrity = attrs.integrity;
-      script.crossOrigin = 'anonymous';
-    } else {
-      // 没有 integrity 时也加 crossorigin，方便 captcha 服务将来追加 SRI 响应头
-      script.crossOrigin = 'anonymous';
-    }
+    // SRI 校验要求同时设置 integrity + crossorigin=anonymous
+    if (attrs?.integrity) script.integrity = attrs.integrity;
+    script.crossOrigin = 'anonymous';
     if (attrs?.siteKey) script.setAttribute('data-site-key', attrs.siteKey);
     if (attrs?.wasmBase) script.setAttribute('data-wasm-base', attrs.wasmBase);
     attach(script);
@@ -152,7 +218,14 @@ function loadScript(
   return promise;
 }
 
-export function CaptchaWidget({ endpoint, siteKey, onSuccess, onError, onExpired }: CaptchaWidgetProps) {
+export function CaptchaWidget({
+  endpoint,
+  siteKey,
+  manifestPubKey,
+  onSuccess,
+  onError,
+  onExpired,
+}: CaptchaWidgetProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const widgetRef = useRef<ReturnType<NonNullable<typeof window.PowCaptcha>['render']> | null>(null);
 
@@ -168,7 +241,13 @@ export function CaptchaWidget({ endpoint, siteKey, onSuccess, onError, onExpired
     const base = endpoint.replace(/\/+$/, '');
 
     (async () => {
-      const plan = await resolveSdkPlan(base);
+      let plan: SdkLoadPlan;
+      try {
+        plan = await resolveSdkPlan(base, manifestPubKey);
+      } catch (err) {
+        if (!cancelled) stableOnError.current?.(err as Error);
+        return;
+      }
       try {
         await loadScript(plan.scriptSrc, {
           integrity: plan.integrity,
@@ -197,7 +276,7 @@ export function CaptchaWidget({ endpoint, siteKey, onSuccess, onError, onExpired
       widgetRef.current?.destroy();
       widgetRef.current = null;
     };
-  }, [endpoint, siteKey]);
+  }, [endpoint, siteKey, manifestPubKey]);
 
   return <div ref={containerRef} className="w-full [&>div]:w-full" />;
 }

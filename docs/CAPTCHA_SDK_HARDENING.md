@@ -3,31 +3,51 @@
 > 背景：2026-04 审查提出 M9——CaptchaWidget 前端通过 `<script src="${captchaEndpoint}/sdk/pow-captcha.js">` 动态加载 SDK，无 `integrity=` (SRI)。
 > Captcha 服务若被攻陷，可在登录 / 注册页注入任意 JS 窃取凭据。
 >
-> **状态：Portcullis Tier 1 已落地**（`captcha/docs/INTEGRATION.md` 方式 D）。主站在 2026-04-23 对接完成，
-> `CaptchaWidget.tsx` 已切换到 manifest + SRI 加载路径。本文保留作为完整需求与后续 Tier 2 参考。
+> **状态：Portcullis Tier 1 + Tier 2 均已落地**，主站已完成对接：
+> - Tier 1：manifest + SRI（2026-04-23 接入）
+> - Tier 2：Ed25519 manifest 签名（2026-04-23 接入）
+>
+> 参考：`captcha/docs/INTEGRATION.md`（方式 D）、`captcha/docs/TIER1_IMPLEMENTATION.md`、`captcha/docs/TIER2_IMPLEMENTATION.md`
 
 ---
 
 ## 本项目接入现状
 
-**已完成（2026-04-23）**：
+**Tier 1 已完成（2026-04-23）**：
 - `CaptchaWidget.tsx` 切换到 manifest + SRI 加载：启动时先 `GET /sdk/manifest.json`（3s 超时、`cache: 'no-store'`），
   解析出 `artifacts['pow-captcha.js']` 的 `url` 与 `integrity`，注入 `<script integrity=... crossorigin=anonymous src=.../sdk/v1.1.2/...>`
 - 降级保护：manifest 拉取失败 / 老 captcha 服务器未部署 Tier 1 → 回退到旧路径 `${endpoint}/sdk/pow-captcha.js`（无 integrity，依赖 HTTPS+HSTS）
 - 同 endpoint 的 manifest 结果在会话内缓存；降级路径每次 render 重试一次（部署后无感升级）
-- `script-src` / `connect-src` 在 Go 侧 CSP 中已包含 `captchaEndpoint` origin，无需调整
 
-**当前未接入（待 Portcullis Tier 2）**：
-- **Manifest 本体签名**：目前 Portcullis 的 manifest 不带 Ed25519 签名，威胁模型依赖传输层 HTTPS + HSTS
-  （Tier 2 上线后本项目需补公钥校验逻辑）
-- **WASM 文件的 SRI**：manifest 声明了 `captcha_wasm.js` / `captcha_wasm_bg.wasm` 的 integrity，但这两个文件
-  由 SDK 自己 fetch 加载，本项目无法从外部 enforce。Tier 2 若把 WASM 加载移到主站侧可解；否则要等 SDK 自身校验
+**Tier 2 已完成（2026-04-23）**：
+- 新增系统设置项 `captchaManifestPubKey`（admin 面板可配置，`/admin/settings` 白名单已纳入）
+- 后端 `internal/service/captcha.go::ValidateEd25519PubKey` 校验：base64 可解码且正好 32 字节
+- `/api/v1/auth/captcha-config` 公开接口返回 `manifestPubKey` 字段（不是秘密，公钥）
+- 前端 `CaptchaWidget` 收到 `manifestPubKey`（非空）时：
+  1. 用 `fetch().arrayBuffer()` 拿 manifest 原始字节（不能先 parse 后重新 serialize，签名对象是原始字节）
+  2. 从 `X-Portcullis-Signature` 响应头读 base64 签名
+  3. `@noble/ed25519` `verifyAsync(sig, rawBytes, pubKey)`
+  4. 缺 header / 签名失败 / pubKey 解码失败 → `throw` 让 `onError` 捕获，**不降级**
+- `manifestPubKey` 为空时：跳过签名校验，仅依赖 Tier 1 的 SRI（完全向后兼容）
+
+**CSP 兼容性**：`script-src` 和 `connect-src` 都已包含 `captchaEndpoint` origin，无需任何 CSP 改动即可接入 Tier 1 和 Tier 2。
+
+**当前未做**：
+- **双密钥轮换**：Portcullis Tier 2 暂时只支持单 signing key；轮换走两步部署方案（先主站加新 pubKey、Portcullis 切换私钥、主站再删旧 pubKey）。如频次高再设计。
+- **WASM 文件 SRI enforce**：manifest 声明了 WASM integrity，但 SDK 内部 fetch WASM 主站无法 enforce。SDK 自校验是更合适的位置（非主站范围）。
 
 ---
 
-## 原始需求（保留作 Tier 2 参考）
+## 运维 Checklist（启用 Tier 2）
 
-本文原本是给 Portcullis 维护者的需求清单，此处保留以便未来继续迭代。
+1. **生成密钥对**：在 Portcullis 主机上执行 `captcha-server gen-manifest-key`，记下私钥 seed + 公钥
+2. **私钥配置**：`CAPTCHA_MANIFEST_SIGNING_KEY=<base64 seed>` 写入 Portcullis 运行环境
+3. **重启 Portcullis**：`curl -sI <endpoint>/sdk/manifest.json` 确认响应头里有 `X-Portcullis-Signature`
+4. **Portcullis admin 导出公钥**：`GET /admin/api/manifest-pubkey`（需 admin token），拿到 `{pubkey: base64}`
+5. **主站 admin 面板**：进入 Dashboard → 验证码配置 → 填入 `Manifest 签名公钥`，保存
+6. **验证**：前端打开登录页 → DevTools Network 看 `manifest.json` 被 fetch + 后续 `sdk/v*/pow-captcha.js` 加载成功。篡改 pubKey（改一个字符）应立即让 widget 报错。
+
+---
 
 ```html
 <!-- CaptchaWidget.tsx:58-67 运行时注入 -->
@@ -150,22 +170,23 @@ c.Header("Permissions-Policy",
 
 ---
 
-## 本项目暂不实施的原因（Tier 2 及以后）
+## 本项目暂不实施的原因（后续演进参考）
 
-1. Manifest 签名（方案 A 的 Ed25519 签名部分）需要 Portcullis Tier 2 上线
-2. Trusted Types 需要全站 React 树审计 `dangerouslySetInnerHTML` 与 `eval`（项目目前默认禁用）
-3. Permissions-Policy 可以低成本加，但不解决"SDK 偷密码"的核心风险，只是降级
+1. **双密钥轮换**：Portcullis Tier 2 暂时只支持单 signing key；如频次高再设计"current + previous"双密钥
+2. **Trusted Types + 严格 CSP（方案 B）**：需要全站 React 树审计 `dangerouslySetInnerHTML` 与 `eval`（项目目前默认禁用）
+3. **Permissions-Policy（方案 C）**：可以低成本加，但不解决"SDK 偷密码"的核心风险，只是降级
 
 ---
 
-## 现状兜底（即使 SRI manifest 被绕过也起作用）
+## 现状兜底（多层纵深防御）
 
-主站已经做的风险抑制：
-- `CaptchaWidget.tsx` 切到 SRI manifest（首要防线，2026-04-23 落地）
+主站已做的风险抑制：
+- `CaptchaWidget.tsx` 使用 SRI manifest + Ed25519 签名校验（首要防线，Tier 1+2 已落地）
 - `captchaEndpoint` 经 `ValidateCaptchaEndpoint` 白名单 → 不能指向内网
+- `captchaManifestPubKey` 经 `ValidateEd25519PubKey` 校验 → 写入前必须 base64(32B)
 - siteverify 走 `util.SafeFetch` → DNS rebinding 防护
 - siteverify hostname / challenge_ts 校验 → token 跨站重放拦截
 - CSP `frame-ancestors 'none'` / `object-src 'none'` / `base-uri 'self'` → 通用注入面收窄
 - siteverify 熔断 → captcha 服务不可用时快速失败不拖累登录
 
-这些措施使"captcha 服务临时异常"和"captcha 服务被攻陷后的短期时间窗"两种情况的影响被压到可接受。
+即使 Portcullis 主机被攻陷（私钥泄露）、或 TLS 链路被中间人，这些措施组合可让攻击窗口 / 爆炸半径压到最低。

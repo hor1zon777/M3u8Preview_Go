@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@m3u8-preview/shared": "*",
+    "@noble/ed25519": "^3.1.0",
     "@tanstack/react-query": "^5.62.0",
     "axios": "^1.7.0",
     "class-variance-authority": "^0.7.0",

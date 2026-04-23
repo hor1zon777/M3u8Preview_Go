@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,9 +43,10 @@ type CaptchaService struct {
 }
 
 type CaptchaPublicConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Endpoint string `json:"endpoint,omitempty"`
-	SiteKey  string `json:"siteKey,omitempty"`
+	Enabled        bool   `json:"enabled"`
+	Endpoint       string `json:"endpoint,omitempty"`
+	SiteKey        string `json:"siteKey,omitempty"`
+	ManifestPubKey string `json:"manifestPubKey,omitempty"`
 }
 
 // NewCaptchaService 构造。
@@ -72,11 +74,12 @@ func NewCaptchaService(db *gorm.DB, allowedHostnames []string) *CaptchaService {
 }
 
 type captchaSettings struct {
-	enabled     bool
-	endpoint    string   // 已 trimRight("/")、校验通过的 origin+path
-	endpointURL *url.URL // 解析后的 URL（Scheme/Host 已校验）
-	siteKey     string
-	secretKey   string
+	enabled        bool
+	endpoint       string   // 已 trimRight("/")、校验通过的 origin+path
+	endpointURL    *url.URL // 解析后的 URL（Scheme/Host 已校验）
+	siteKey        string
+	secretKey      string
+	manifestPubKey string // base64(32B) Ed25519 公钥，可空；空时前端跳过签名校验（Tier 1 兼容）
 }
 
 // ValidateCaptchaEndpoint 校验一个 captchaEndpoint 配置值是否安全可用。
@@ -110,6 +113,39 @@ func ValidateCaptchaEndpoint(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// ValidateEd25519PubKey 校验一个 Ed25519 公钥配置值是否合法。
+// 要求 base64 可解码且正好 32 字节；允许 standard / URL-safe / 含 padding 三种变体。
+func ValidateEd25519PubKey(raw string) error {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return errors.New("ed25519 公钥不能为空")
+	}
+	decoders := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+	var decoded []byte
+	var lastErr error
+	for _, dec := range decoders {
+		if b, err := dec.DecodeString(s); err == nil {
+			decoded = b
+			lastErr = nil
+			break
+		} else {
+			lastErr = err
+		}
+	}
+	if decoded == nil {
+		return fmt.Errorf("ed25519 公钥 base64 解码失败: %w", lastErr)
+	}
+	if len(decoded) != 32 {
+		return fmt.Errorf("ed25519 公钥必须是 32 字节，实际 %d", len(decoded))
+	}
+	return nil
+}
+
 // loadSettings 读取 captcha 配置；结果走 30s 软缓存。
 // 热路径每次登录都会调用这个方法，不能每次都 4 行 DB 查询。
 // admin 改配置最多 30s 后生效（admin 低频操作，可接受）；CSPOrigin 复用同份缓存。
@@ -139,6 +175,7 @@ func (s *CaptchaService) loadSettingsFromDB() (captchaSettings, error) {
 		model.SettingCaptchaEndpoint,
 		model.SettingCaptchaSiteKey,
 		model.SettingCaptchaSecretKey,
+		model.SettingCaptchaManifestPubKey,
 	}
 	var rows []model.SystemSetting
 	if err := s.db.Where("key IN ?", keys).Find(&rows).Error; err != nil {
@@ -160,6 +197,12 @@ func (s *CaptchaService) loadSettingsFromDB() (captchaSettings, error) {
 			cs.endpoint = u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/")
 		}
 	}
+	if pk := strings.TrimSpace(m[model.SettingCaptchaManifestPubKey]); pk != "" {
+		// 保存前 admin.go 已校验过；再次 validate 一次防止手工直改 DB 写入非法值后端自断
+		if err := ValidateEd25519PubKey(pk); err == nil {
+			cs.manifestPubKey = pk
+		}
+	}
 	cs.enabled = m[model.SettingEnableCaptcha] == "true" &&
 		cs.endpoint != "" && cs.siteKey != "" && cs.secretKey != ""
 	return cs, nil
@@ -171,9 +214,10 @@ func (s *CaptchaService) GetPublicConfig() CaptchaPublicConfig {
 		return CaptchaPublicConfig{Enabled: false}
 	}
 	return CaptchaPublicConfig{
-		Enabled:  true,
-		Endpoint: cs.endpoint,
-		SiteKey:  cs.siteKey,
+		Enabled:        true,
+		Endpoint:       cs.endpoint,
+		SiteKey:        cs.siteKey,
+		ManifestPubKey: cs.manifestPubKey,
 	}
 }
 

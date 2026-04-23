@@ -251,6 +251,7 @@ var allowedSettingKeys = map[string]struct{}{
 	"captchaEndpoint":         {},
 	"captchaSiteKey":          {},
 	"captchaSecretKey":        {},
+	"captchaManifestPubKey":   {},
 }
 
 // IsAllowedSettingKey 供其它 service（如 backup 导入）复用白名单检查。
@@ -298,6 +299,13 @@ func validateSettingValue(key, value string) error {
 			return nil
 		}
 		if _, err := ValidateCaptchaEndpoint(value); err != nil {
+			return middleware.NewAppError(http.StatusBadRequest, err.Error())
+		}
+	case "captchaManifestPubKey":
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		if err := ValidateEd25519PubKey(value); err != nil {
 			return middleware.NewAppError(http.StatusBadRequest, err.Error())
 		}
 	}

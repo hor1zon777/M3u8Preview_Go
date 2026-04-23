@@ -51,10 +51,13 @@ export function AdminDashboardPage() {
   const captchaEndpoint = settings?.find((s) => s.key === 'captchaEndpoint')?.value || '';
   const captchaSiteKey = settings?.find((s) => s.key === 'captchaSiteKey')?.value || '';
   const captchaSecretKey = settings?.find((s) => s.key === 'captchaSecretKey')?.value || '';
+  const captchaManifestPubKey =
+    settings?.find((s) => s.key === 'captchaManifestPubKey')?.value || '';
   const [siteNameDraft, setSiteNameDraft] = useState('');
   const [captchaEndpointDraft, setCaptchaEndpointDraft] = useState('');
   const [captchaSiteKeyDraft, setCaptchaSiteKeyDraft] = useState('');
   const [captchaSecretKeyDraft, setCaptchaSecretKeyDraft] = useState('');
+  const [captchaManifestPubKeyDraft, setCaptchaManifestPubKeyDraft] = useState('');
   const siteNameSynced = useRef(false);
   const captchaSynced = useRef(false);
   useEffect(() => {
@@ -66,9 +69,10 @@ export function AdminDashboardPage() {
       setCaptchaEndpointDraft(captchaEndpoint);
       setCaptchaSiteKeyDraft(captchaSiteKey);
       setCaptchaSecretKeyDraft(captchaSecretKey);
+      setCaptchaManifestPubKeyDraft(captchaManifestPubKey);
       captchaSynced.current = true;
     }
-  }, [settings, siteName, captchaEndpoint, captchaSiteKey, captchaSecretKey]);
+  }, [settings, siteName, captchaEndpoint, captchaSiteKey, captchaSecretKey, captchaManifestPubKey]);
   const DEFAULT_PROXY_EXTENSIONS = '.m3u8,.ts,.m4s,.mp4,.aac,.key,.jpg,.jpeg,.png,.webp';
   const DEFAULT_EXTENSIONS = new Set(DEFAULT_PROXY_EXTENSIONS.split(','));
   const proxyAllowedExtensions = settings?.find((s) => s.key === 'proxyAllowedExtensions')?.value || DEFAULT_PROXY_EXTENSIONS;
@@ -465,6 +469,38 @@ export function AdminDashboardPage() {
                   {captchaSecretKeyDraft !== captchaSecretKey && (
                     <button
                       onClick={() => updateSettingMutation.mutate({ key: 'captchaSecretKey', value: captchaSecretKeyDraft.trim() })}
+                      disabled={updateSettingMutation.isPending}
+                      className="px-3 py-1.5 bg-emby-green text-white text-xs font-medium rounded-md hover:bg-emby-green-dark disabled:opacity-50 transition-colors"
+                    >
+                      保存
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <p className="text-white text-sm">Manifest 签名公钥 (Tier 2，可选)</p>
+                  <p className="text-emby-text-muted text-xs mt-0.5">
+                    Portcullis Ed25519 公钥 base64(32B)。留空则仅依赖 SRI；填入后强制校验 X-Portcullis-Signature，防中间人篡改 manifest。
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={captchaManifestPubKeyDraft}
+                    onChange={(e) => setCaptchaManifestPubKeyDraft(e.target.value)}
+                    placeholder="base64(32 bytes)"
+                    className="px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded-md text-white text-sm placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green focus:border-transparent w-64 font-mono"
+                  />
+                  {captchaManifestPubKeyDraft !== captchaManifestPubKey && (
+                    <button
+                      onClick={() =>
+                        updateSettingMutation.mutate({
+                          key: 'captchaManifestPubKey',
+                          value: captchaManifestPubKeyDraft.trim(),
+                        })
+                      }
                       disabled={updateSettingMutation.isPending}
                       className="px-3 py-1.5 bg-emby-green text-white text-xs font-medium rounded-md hover:bg-emby-green-dark disabled:opacity-50 transition-colors"
                     >
