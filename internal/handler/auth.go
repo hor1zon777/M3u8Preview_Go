@@ -5,7 +5,6 @@ package handler
 
 import (
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -328,20 +327,19 @@ func (h *AuthHandler) decryptAuth(enc *dto.EncryptedAuthRequest, aad string) (pl
 		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
 	}
 
-	// 消费 challenge（单次 + TTL 60s）+ 取出绑定的设备指纹。
-	salt, fp, ok := h.challenges.Consume(enc.Challenge)
+	// 消费 challenge（单次 + TTL 60s）。
+	// fingerprint 仍从 store 取出，但不再参与 AES key 派生（H8 Phase 1）。
+	// Phase 2 会利用这个值做"新设备登录"风控记录。
+	salt, _fp, ok := h.challenges.Consume(enc.Challenge)
 	if !ok {
 		return nil, middleware.NewAppError(http.StatusBadRequest, "挑战已过期或无效")
 	}
+	_ = _fp // 保留读取通道，待 Phase 2 接入 DeviceService
 
-	// 混合 salt：SHA256(challengeSalt || fingerprint)，与 Rust WASM blend_salt 对齐。
-	fpBytes, err := hex.DecodeString(fp)
-	if err != nil {
-		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
-	}
-	blendedSalt := util.BlendSalt(salt, fpBytes)
-
-	pt, err := h.ecdh.DecryptAuthPayload(clientPub, iv, ct, []byte(aad), blendedSalt)
+	// HKDF salt 直接用 challenge 原值（原先 BlendSalt(salt, fp) 对合法用户造成假阳性
+	// 登录失败——浏览器升级 / 隐身切换 / 硬件变化都会让 fp 漂移 → 密钥不匹配）。
+	// 威胁模型见 docs/FINGERPRINT_REDESIGN.md：fp 对攻击者 ~10 行代码绕过成本，不值得。
+	pt, err := h.ecdh.DecryptAuthPayload(clientPub, iv, ct, []byte(aad), salt)
 	if err != nil {
 		return nil, middleware.NewAppError(http.StatusBadRequest, "请求无效")
 	}

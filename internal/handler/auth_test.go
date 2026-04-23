@@ -11,7 +11,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"maps"
@@ -61,7 +60,7 @@ func encryptAsClient(t *testing.T, h *AuthHandler, aad string, payload map[strin
 		t.Fatalf("gen client priv: %v", err)
 	}
 
-	// 3. ECDH 协商 + HKDF 派生 AES key（salt = BlendSalt(challenge, fp)）
+	// 3. ECDH 协商 + HKDF 派生 AES key（salt = challenge 原值，H8 Phase 1 起不再 blend fp）
 	serverPubKey, err := ecdh.P256().NewPublicKey(h.ecdh.PublicKeyRaw())
 	if err != nil {
 		t.Fatalf("parse server pub: %v", err)
@@ -70,9 +69,7 @@ func encryptAsClient(t *testing.T, h *AuthHandler, aad string, payload map[strin
 	if err != nil {
 		t.Fatalf("ecdh: %v", err)
 	}
-	fpBytes, _ := hex.DecodeString(testFP)
-	blendedSalt := util.BlendSalt(salt, fpBytes)
-	r := hkdf.New(sha256.New, shared, blendedSalt, []byte("m3u8preview-auth-v1"))
+	r := hkdf.New(sha256.New, shared, salt, []byte("m3u8preview-auth-v1"))
 	aesKey := make([]byte, 32)
 	if _, err := io.ReadFull(r, aesKey); err != nil {
 		t.Fatalf("hkdf: %v", err)
@@ -172,9 +169,7 @@ func TestAuthHandler_DecryptAuth_StaleTimestamp_Rejects(t *testing.T) {
 	clientPriv, _ := ecdh.P256().GenerateKey(rand.Reader)
 	serverPubKey, _ := ecdh.P256().NewPublicKey(h.ecdh.PublicKeyRaw())
 	shared, _ := clientPriv.ECDH(serverPubKey)
-	fpBytes, _ := hex.DecodeString(testFP)
-	blendedSalt := util.BlendSalt(salt, fpBytes)
-	r := hkdf.New(sha256.New, shared, blendedSalt, []byte("m3u8preview-auth-v1"))
+	r := hkdf.New(sha256.New, shared, salt, []byte("m3u8preview-auth-v1"))
 	aesKey := make([]byte, 32)
 	_, _ = io.ReadFull(r, aesKey)
 

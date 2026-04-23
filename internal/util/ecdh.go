@@ -191,12 +191,7 @@ func deriveAESKey(sharedSecret, salt []byte) ([]byte, error) {
 	return out, nil
 }
 
-// BlendSalt 混合 challenge salt 与设备指纹：SHA256(challengeSalt || fingerprintBytes)。
-// 与 Rust WASM 的 blend_salt 函数一一对齐。
-// 前端指纹是 hex string，调用方负责 hex.DecodeString 后传入 fpBytes。
-func BlendSalt(challengeSalt, fpBytes []byte) []byte {
-	h := sha256.New()
-	h.Write(challengeSalt)
-	h.Write(fpBytes)
-	return h.Sum(nil)
-}
+// BlendSalt 已在 H8 Phase 1 移除：原本 SHA256(challengeSalt || fingerprint) 会让
+// 浏览器升级 / 隐身切换 / 硬件变化造成的 fingerprint 漂移直接导致登录失败，
+// 而对攻击者只增加约 10 行自定义 fingerprint 的脚本工作量——ROI 负值。
+// 详见 docs/FINGERPRINT_REDESIGN.md。

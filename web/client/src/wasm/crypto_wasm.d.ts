@@ -15,18 +15,17 @@ export class EncryptResult {
  *
  * * aad              AES-GCM AAD，端点绑定常量，如 "auth:login:v1"
  * * server_pub_b64   服务端公钥 65B uncompressed 的 base64url
- * * challenge_b64    challenge salt 的 base64url
- * * fingerprint_hex  设备指纹 SHA-256 hex（64 字符），混入 HKDF salt
+ * * challenge_b64    challenge salt 的 base64url（直接作为 HKDF salt，不再 blend）
  * * plaintext_json   明文 JSON
  */
-export function encrypt_auth_payload(aad: string, server_pub_b64: string, challenge_b64: string, fingerprint_hex: string, plaintext_json: string): EncryptResult;
+export function encrypt_auth_payload(aad: string, server_pub_b64: string, challenge_b64: string, plaintext_json: string): EncryptResult;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_encryptresult_free: (a: number, b: number) => void;
-    readonly encrypt_auth_payload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
+    readonly encrypt_auth_payload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly encryptresult_clientPub: (a: number, b: number) => void;
     readonly encryptresult_ct: (a: number, b: number) => void;
     readonly encryptresult_iv: (a: number, b: number) => void;
