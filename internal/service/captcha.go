@@ -28,11 +28,10 @@ type CaptchaService struct {
 	// 为空时表示跳过 hostname 校验（向后兼容旧 captcha 服务）。
 	allowedHostnames []string
 
-	mu          sync.Mutex
-	cachedCSP   string
-	cacheExpiry time.Time
-	// cachedSettings 缓存整份 captchaSettings 30s，减少登录热路径 4 行 DB 查询。
-	// 管理员改配置后最多 30s 生效——admin 修改本就低频，可接受。
+	mu sync.Mutex
+	// settingsCacheExpiry / cachedSettings / cachedSettingsErr 走 30s 软缓存；
+	// 登录热路径每请求都调 loadSettings，DB 开销压成 1/30s。
+	// CSPOrigin 复用同一份缓存（不再单独持锁，防 CSPOrigin → loadSettings 重入死锁）。
 	cachedSettings      captchaSettings
 	cachedSettingsErr   error
 	settingsCacheExpiry time.Time
@@ -223,7 +222,6 @@ func (s *CaptchaService) GetPublicConfig() CaptchaPublicConfig {
 
 const (
 	maxCaptchaTokenLen    = 4096
-	cspCacheTTL           = 30 * time.Second
 	settingsCacheTTL      = 30 * time.Second
 	captchaTimestampSkew  = 60 * time.Second // siteverify 返回 challenge_ts 的允许时间漂移
 	captchaSiteverifyPath = "/api/v1/siteverify"
@@ -254,23 +252,17 @@ func (s *CaptchaService) cbRecord(success bool) {
 	}
 }
 
+// CSPOrigin 返回 captcha endpoint 的 scheme://host，用于 CSP 白名单。
+// 复用 loadSettings 的 30s 缓存——loadSettings 已经做了并发安全的缓存逻辑，
+// 这里不再单独加锁，否则会和 loadSettings 的内部锁形成同 goroutine 重入死锁
+// （sync.Mutex 不可重入，secureHeaders middleware 每请求调用此方法，
+// 死锁会让全部 HTTP 请求 hang 住）。
 func (s *CaptchaService) CSPOrigin() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if time.Now().Before(s.cacheExpiry) {
-		return s.cachedCSP
-	}
-
-	origin := ""
 	cs, err := s.loadSettings()
-	if err == nil && cs.endpointURL != nil {
-		// 只输出经过 ValidateCaptchaEndpoint 白名单过滤的 scheme://host
-		origin = cs.endpointURL.Scheme + "://" + cs.endpointURL.Host
+	if err != nil || cs.endpointURL == nil {
+		return ""
 	}
-	s.cachedCSP = origin
-	s.cacheExpiry = time.Now().Add(cspCacheTTL)
-	return origin
+	return cs.endpointURL.Scheme + "://" + cs.endpointURL.Host
 }
 
 // siteverifyResponse 对齐 captcha 服务 /api/v1/siteverify 响应。
