@@ -3,11 +3,31 @@
 > 背景：2026-04 审查提出 M9——CaptchaWidget 前端通过 `<script src="${captchaEndpoint}/sdk/pow-captcha.js">` 动态加载 SDK，无 `integrity=` (SRI)。
 > Captcha 服务若被攻陷，可在登录 / 注册页注入任意 JS 窃取凭据。
 >
-> 因 `captchaEndpoint` 由 admin 面板动态配置，无法在构建期生成固定 SRI hash。本文给出两条可组合的配合路径，**由验证码服务端主动配合实现**，把主站的攻击面收敛到协议级。
+> **状态：Portcullis Tier 1 已落地**（`captcha/docs/INTEGRATION.md` 方式 D）。主站在 2026-04-23 对接完成，
+> `CaptchaWidget.tsx` 已切换到 manifest + SRI 加载路径。本文保留作为完整需求与后续 Tier 2 参考。
 
 ---
 
-## 问题定义
+## 本项目接入现状
+
+**已完成（2026-04-23）**：
+- `CaptchaWidget.tsx` 切换到 manifest + SRI 加载：启动时先 `GET /sdk/manifest.json`（3s 超时、`cache: 'no-store'`），
+  解析出 `artifacts['pow-captcha.js']` 的 `url` 与 `integrity`，注入 `<script integrity=... crossorigin=anonymous src=.../sdk/v1.1.2/...>`
+- 降级保护：manifest 拉取失败 / 老 captcha 服务器未部署 Tier 1 → 回退到旧路径 `${endpoint}/sdk/pow-captcha.js`（无 integrity，依赖 HTTPS+HSTS）
+- 同 endpoint 的 manifest 结果在会话内缓存；降级路径每次 render 重试一次（部署后无感升级）
+- `script-src` / `connect-src` 在 Go 侧 CSP 中已包含 `captchaEndpoint` origin，无需调整
+
+**当前未接入（待 Portcullis Tier 2）**：
+- **Manifest 本体签名**：目前 Portcullis 的 manifest 不带 Ed25519 签名，威胁模型依赖传输层 HTTPS + HSTS
+  （Tier 2 上线后本项目需补公钥校验逻辑）
+- **WASM 文件的 SRI**：manifest 声明了 `captcha_wasm.js` / `captcha_wasm_bg.wasm` 的 integrity，但这两个文件
+  由 SDK 自己 fetch 加载，本项目无法从外部 enforce。Tier 2 若把 WASM 加载移到主站侧可解；否则要等 SDK 自身校验
+
+---
+
+## 原始需求（保留作 Tier 2 参考）
+
+本文原本是给 Portcullis 维护者的需求清单，此处保留以便未来继续迭代。
 
 ```html
 <!-- CaptchaWidget.tsx:58-67 运行时注入 -->
@@ -130,23 +150,22 @@ c.Header("Permissions-Policy",
 
 ---
 
-## 本项目暂不实施的原因
+## 本项目暂不实施的原因（Tier 2 及以后）
 
-1. SRI 需要 captcha 服务端先支持版本化 URL + manifest
+1. Manifest 签名（方案 A 的 Ed25519 签名部分）需要 Portcullis Tier 2 上线
 2. Trusted Types 需要全站 React 树审计 `dangerouslySetInnerHTML` 与 `eval`（项目目前默认禁用）
 3. Permissions-Policy 可以低成本加，但不解决"SDK 偷密码"的核心风险，只是降级
 
-若 captcha 服务升级到支持 SRI manifest，主站会在 `CaptchaWidget.tsx` 切换到方案 A。
-
 ---
 
-## 现状兜底
+## 现状兜底（即使 SRI manifest 被绕过也起作用）
 
-主站已经做的风险抑制（即使没有 SRI 也起作用）：
+主站已经做的风险抑制：
+- `CaptchaWidget.tsx` 切到 SRI manifest（首要防线，2026-04-23 落地）
 - `captchaEndpoint` 经 `ValidateCaptchaEndpoint` 白名单 → 不能指向内网
 - siteverify 走 `util.SafeFetch` → DNS rebinding 防护
 - siteverify hostname / challenge_ts 校验 → token 跨站重放拦截
 - CSP `frame-ancestors 'none'` / `object-src 'none'` / `base-uri 'self'` → 通用注入面收窄
 - siteverify 熔断 → captcha 服务不可用时快速失败不拖累登录
 
-这些措施使"captcha 服务临时异常"和"captcha 服务被攻陷后的短期时间窗"两种情况的影响被压到最低，在 SRI 方案落地前可以接受。
+这些措施使"captcha 服务临时异常"和"captcha 服务被攻陷后的短期时间窗"两种情况的影响被压到可接受。
