@@ -46,3 +46,5 @@ web/package-lock.json
 # claude配置
 .claude
 docs/AI_INTEGRATION_PROMPT.md
+docs/CODE_REVIEW_2026-04-22.md
+docs/VULNERABILITIES_2026-04-22.md
