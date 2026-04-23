@@ -609,11 +609,15 @@ func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters bool) err
 }
 
 // restoreUploads 将 ZIP 里的 uploads/* 还原到磁盘。
-// 采用"两阶段原子切换"设计防止数据永久丢失：
-//  1. 先把所有文件解压到临时目录 <uploadsDir>.new-<ts>
-//  2. 解压期间任一写失败 → 删除临时目录，原 uploadsDir 完好保留，返回 error
-//  3. 全部成功后：rename(old → .old-<ts>) + rename(new → uploadsDir) 原子切换
-//  4. 异步清理 .old-<ts>
+// 采用"两阶段子目录原子切换"设计防止数据永久丢失：
+//  1. 先把所有文件解压到 <uploadsDir>/.staging-new-<ts> （staging 置于 uploadsDir 内部，
+//     保证与生产目录同属一个文件系统 + 同属 appuser，避免 bind-mount 场景下跨 FS rename(EXDEV)
+//     及 /app 只读导致的 mkdir permission denied）
+//  2. 解压期间任一写失败 → 删除 staging，原 uploadsDir 完好保留，返回 error
+//  3. 全部成功后：对 staging 顶层每个子目录（posters/thumbnails/...）执行 rename 切换：
+//     rename(absRoot/X → .staging-old-<ts>/X) + rename(.staging-new-<ts>/X → absRoot/X)
+//     子目录粒度的原子性；中途失败会尝试把已完成的子目录回滚
+//  4. 成功后异步清理 .staging-old-<ts>
 //
 // 返回 (成功文件数, error)。原先忽略 io.Copy 错误 + 先删后写的做法已废弃。
 func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, total int)) (int, error) {
@@ -633,19 +637,34 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 	if err != nil {
 		return 0, fmt.Errorf("resolve uploads dir: %w", err)
 	}
+	// 确保 absRoot 存在（首次恢复 / 空卷场景）
+	if err := os.MkdirAll(absRoot, 0o755); err != nil {
+		return 0, fmt.Errorf("ensure uploads dir: %w", err)
+	}
 	ts := time.Now().UTC().Format("20060102-150405")
-	newDir := absRoot + ".new-" + ts
-	oldDir := absRoot + ".old-" + ts
+	// staging 必须与 absRoot 同属一个 FS。bind-mount 下 absRoot 的父级 /app 可能
+	// 1) 属于 root 不可写 2) 位于容器 overlayfs 与 absRoot 跨 FS。
+	// 放在 absRoot 内部一并解决两个问题。
+	newDir := filepath.Join(absRoot, ".staging-new-"+ts)
+	oldDir := filepath.Join(absRoot, ".staging-old-"+ts)
 
 	// 清理可能残留的同名临时目录
 	_ = os.RemoveAll(newDir)
+	_ = os.RemoveAll(oldDir)
 	if err := os.MkdirAll(newDir, 0o755); err != nil {
 		return 0, fmt.Errorf("create staging dir: %w", err)
 	}
 	staged := false
 	defer func() {
-		if !staged {
-			_ = os.RemoveAll(newDir)
+		// newDir 完成 swap 后会只剩空壳（顶层子目录已被 rename 出去），直接删；
+		// 失败路径也应删掉未提交的内容。
+		_ = os.RemoveAll(newDir)
+		if staged {
+			// 成功：老数据备份异步清理
+			go func(p string) { _ = os.RemoveAll(p) }(oldDir)
+		} else {
+			// 失败：同步清理回滚遗留
+			_ = os.RemoveAll(oldDir)
 		}
 	}()
 
@@ -698,26 +717,43 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 		progress(done, total)
 	}
 
-	// 原子切换：先把旧目录搬走，再把新目录顶上；任何一步失败都尝试回滚
-	if st, statErr := os.Stat(absRoot); statErr == nil && st.IsDir() {
-		if err := os.Rename(absRoot, oldDir); err != nil {
-			return 0, fmt.Errorf("swap old uploads dir: %w", err)
-		}
-		if err := os.Rename(newDir, absRoot); err != nil {
-			// 回滚：把 old 搬回原位
-			_ = os.Rename(oldDir, absRoot)
-			return 0, fmt.Errorf("swap new uploads dir: %w", err)
-		}
-		staged = true
-		// 异步删除旧目录，失败只记录到日志
-		go func(p string) { _ = os.RemoveAll(p) }(oldDir)
-	} else {
-		// 原目录不存在：直接把新目录改名为正式目录
-		if err := os.Rename(newDir, absRoot); err != nil {
-			return 0, fmt.Errorf("promote new uploads dir: %w", err)
-		}
-		staged = true
+	// 顶层子目录粒度的原子切换（同 FS 内 rename 保证原子性）
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		return 0, fmt.Errorf("create rollback dir: %w", err)
 	}
+	newEntries, err := os.ReadDir(newDir)
+	if err != nil {
+		return 0, fmt.Errorf("read staging dir: %w", err)
+	}
+	renamed := make([]string, 0, len(newEntries))
+	for _, e := range newEntries {
+		name := e.Name()
+		src := filepath.Join(newDir, name)
+		dst := filepath.Join(absRoot, name)
+		backup := filepath.Join(oldDir, name)
+
+		// 先把现存同名项搬到 oldDir（作为回滚快照）
+		if _, statErr := os.Stat(dst); statErr == nil {
+			if err := os.Rename(dst, backup); err != nil {
+				// 回滚已切换的子目录
+				for _, rn := range renamed {
+					_ = os.Rename(filepath.Join(oldDir, rn), filepath.Join(absRoot, rn))
+				}
+				return 0, fmt.Errorf("backup existing %s: %w", name, err)
+			}
+		}
+		if err := os.Rename(src, dst); err != nil {
+			// 先回滚当前项：把刚备份的老数据搬回来
+			_ = os.Rename(backup, dst)
+			// 再回滚之前已切换的
+			for _, rn := range renamed {
+				_ = os.Rename(filepath.Join(oldDir, rn), filepath.Join(absRoot, rn))
+			}
+			return 0, fmt.Errorf("promote %s: %w", name, err)
+		}
+		renamed = append(renamed, name)
+	}
+	staged = true
 	return done, nil
 }
 
