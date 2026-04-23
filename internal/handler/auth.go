@@ -80,7 +80,17 @@ func (h *AuthHandler) challenge(c *gin.Context) {
 		middleware.AbortWithAppError(c, bindErrorToAppError(err))
 		return
 	}
-	id, _ := h.challenges.Issue(req.Fingerprint)
+	id, _, err := h.challenges.Issue(req.Fingerprint, c.ClientIP())
+	if err != nil {
+		if errors.Is(err, util.ErrChallengeStoreBusy) {
+			middleware.AbortWithAppError(c, middleware.NewAppError(
+				http.StatusServiceUnavailable, "请求过于频繁，请稍后再试"))
+			return
+		}
+		middleware.AbortWithAppError(c, middleware.WrapAppError(
+			http.StatusInternalServerError, "签发 challenge 失败", err))
+		return
+	}
 	c.JSON(http.StatusOK, dto.OK(dto.ChallengeResponse{
 		ServerPub: base64.RawURLEncoding.EncodeToString(h.ecdh.PublicKeyRaw()),
 		Challenge: id,

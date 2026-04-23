@@ -50,7 +50,10 @@ func encryptAsClient(t *testing.T, h *AuthHandler, aad string, payload map[strin
 	const testFP = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 	// 1. 从 store issue 一个 challenge + 绑定指纹
-	challengeID, salt := h.challenges.Issue(testFP)
+	challengeID, salt, err := h.challenges.Issue(testFP, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("issue challenge: %v", err)
+	}
 
 	// 2. 客户端一次性 ECDH 密钥对
 	clientPriv, err := ecdh.P256().GenerateKey(rand.Reader)
@@ -162,7 +165,10 @@ func TestAuthHandler_DecryptAuth_InvalidBase64_Rejects(t *testing.T) {
 func TestAuthHandler_DecryptAuth_StaleTimestamp_Rejects(t *testing.T) {
 	h := buildTestHandler(t)
 	const testFP = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-	challengeID, salt := h.challenges.Issue(testFP)
+	challengeID, salt, err := h.challenges.Issue(testFP, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
 	clientPriv, _ := ecdh.P256().GenerateKey(rand.Reader)
 	serverPubKey, _ := ecdh.P256().NewPublicKey(h.ecdh.PublicKeyRaw())
 	shared, _ := clientPriv.ECDH(serverPubKey)
