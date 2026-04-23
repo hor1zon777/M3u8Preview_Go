@@ -260,6 +260,9 @@ func (s *AdminService) UpdateSetting(key, value string) (dto.AdminSettingEntry, 
 	if _, ok := allowedSettingKeys[key]; !ok {
 		return dto.AdminSettingEntry{}, middleware.NewAppError(http.StatusBadRequest, "不支持的设置项: "+key)
 	}
+	if err := validateSettingValue(key, value); err != nil {
+		return dto.AdminSettingEntry{}, err
+	}
 	var existing model.SystemSetting
 	err := s.db.Where("key = ?", key).Take(&existing).Error
 	if err == nil {
@@ -276,6 +279,21 @@ func (s *AdminService) UpdateSetting(key, value string) (dto.AdminSettingEntry, 
 		return dto.AdminSettingEntry{}, middleware.WrapAppError(http.StatusInternalServerError, "写入失败", err)
 	}
 	return dto.AdminSettingEntry{Key: key, Value: value}, nil
+}
+
+// validateSettingValue 对敏感 key 做内容校验，防止通过 admin 面板写入恶意值。
+// captchaEndpoint 为空字符串视为"清除配置"，允许通过；非空则必须是可信 URL。
+func validateSettingValue(key, value string) error {
+	switch key {
+	case "captchaEndpoint":
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		if _, err := ValidateCaptchaEndpoint(value); err != nil {
+			return middleware.NewAppError(http.StatusBadRequest, err.Error())
+		}
+	}
+	return nil
 }
 
 // AdminListMedia 管理员视角：额外支持 status 过滤；其他复用 media service 相同逻辑。

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,7 +89,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	r.Use(middleware.Recovery())
 	r.Use(middleware.ErrorHandler(cfg.NodeEnv == "production"))
 
-	captchaSvc := service.NewCaptchaService(db)
+	captchaSvc := service.NewCaptchaService(db, extractHostnames(cfg.CORS.Origins))
 	r.Use(secureHeaders(captchaSvc))
 
 	// gzip：代理与 SSE 路由跳过（前者是二进制流、后者必须实时 flush）
@@ -376,4 +377,18 @@ func spaFallback(cfg *config.Config) gin.HandlerFunc {
 		}
 		c.File(indexPath)
 	}
+}
+
+// extractHostnames 从 CORS 原点 URL 列表中提取 host 部分（小写、去端口也保留）用于 captcha hostname 等值校验。
+// 解析失败的条目跳过；重复项由调用方（NewCaptchaService）去重。
+func extractHostnames(origins []string) []string {
+	out := make([]string, 0, len(origins))
+	for _, o := range origins {
+		u, err := url.Parse(strings.TrimSpace(o))
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		out = append(out, strings.ToLower(u.Hostname()))
+	}
+	return out
 }
