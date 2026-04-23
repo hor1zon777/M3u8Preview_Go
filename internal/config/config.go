@@ -60,8 +60,11 @@ type Config struct {
 	Bcrypt       BcryptConfig
 	TrustCDN     bool
 	CookieSecure bool
-	UploadsDir   string
-	DataDir      string
+	// CookieSecureAuto 为 true 时，handler 按 TLS 连接或可信 X-Forwarded-Proto=https 动态决定
+	// cookie 的 Secure 标志；user 显式设置 COOKIE_SECURE=true/false 会退回静态值。
+	CookieSecureAuto bool
+	UploadsDir       string
+	DataDir          string
 	// ECDHPrivateKeyPath 登录加密协议用的长寿 ECDH P-256 私钥存放路径。
 	// 默认 <DataDir>/ecdh.pem；首次启动自动生成（0600）。
 	ECDHPrivateKeyPath string
@@ -129,6 +132,7 @@ func Load(projectRoot string) (*Config, error) {
 		},
 		TrustCDN:             parseBoolDefault(os.Getenv("TRUST_CDN"), true),
 		CookieSecure:         parseCookieSecure(os.Getenv("COOKIE_SECURE"), getenv("CORS_ORIGIN", "http://localhost:5173")),
+		CookieSecureAuto:     os.Getenv("COOKIE_SECURE") == "",
 		UploadsDir:           getenv("UPLOADS_DIR", filepath.Join(projectRoot, "uploads")),
 		DataDir:              getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
 		ThumbnailConcurrency: clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
@@ -278,8 +282,11 @@ func parseCookieSecure(explicit, corsOrigin string) bool {
 	return false
 }
 
-// parseOrigins 按逗号拆分 CORS_ORIGIN，trim 空格，去掉空元素。
-// 这样一来 .env 写 "http://localhost:5173,http://127.0.0.1:5173" 能得到两条。
+// parseOrigins 按逗号拆分 CORS_ORIGIN，trim 空格，去掉空元素，规范化后去重。
+// 规范化：
+//   - 去掉尾部 `/`（gin-contrib/cors 做精确比较，`http://x/` 永远不会匹配浏览器发来的 `http://x`）
+//   - scheme 小写（`HTTP://X` → `http://X`；host 保留原大小写：IDN/punycode 语义允许但不规范）
+//
 // 不在这里做 URL 合法性校验——校验放在 Config.validate()，保持本函数纯粹。
 func parseOrigins(raw string) []string {
 	if raw == "" {
@@ -287,10 +294,31 @@ func parseOrigins(raw string) []string {
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
 	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			out = append(out, s)
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
 		}
+		s = normalizeOrigin(s)
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
 	}
 	return out
+}
+
+// normalizeOrigin 把 scheme 小写、去掉尾 `/`，其它部分保持原样。
+// 单星号 `*` 保持原样（validate 会拒掉生产环境的 `*`）。
+func normalizeOrigin(s string) string {
+	if s == "*" {
+		return s
+	}
+	s = strings.TrimRight(s, "/")
+	if idx := strings.Index(s, "://"); idx > 0 {
+		s = strings.ToLower(s[:idx]) + s[idx:]
+	}
+	return s
 }

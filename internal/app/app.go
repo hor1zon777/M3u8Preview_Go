@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -343,6 +344,19 @@ func secureHeaders(captcha *service.CaptchaService) gin.HandlerFunc {
 	}
 }
 
+// staticAssetExts 白名单：路径带这些扩展名的请求视为静态资源，未命中 dist 直接 404；
+// 其它一律 fallback 到 index.html 让 React Router 处理。
+// 白名单策略（而非"任意扩展名都 404"）可以正确处理 /tags/sci-fi.v2、/media/movie.2024 这类
+// 合法 SPA 路由，避免它们被错误地当作静态资源请求而看不到前端页面。
+var staticAssetExts = map[string]struct{}{
+	".js": {}, ".mjs": {}, ".cjs": {}, ".map": {},
+	".css": {}, ".json": {}, ".xml": {}, ".txt": {}, ".svg": {},
+	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".webp": {}, ".avif": {}, ".ico": {},
+	".woff": {}, ".woff2": {}, ".ttf": {}, ".otf": {}, ".eot": {},
+	".mp3": {}, ".mp4": {}, ".webm": {}, ".ogg": {}, ".wav": {},
+	".wasm": {}, ".pdf": {},
+}
+
 // spaFallback 尝试用构建好的 index.html 响应前端路由；
 // 若 dist 不存在（本地开发走 Vite DevServer），退回 404 JSON。
 // 使用 sync.Once 延迟到首次请求时查找，确保 Docker volume 已就绪。
@@ -370,13 +384,25 @@ func spaFallback(cfg *config.Config) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		once.Do(findIndex)
-		if indexPath == "" || strings.HasPrefix(c.Request.URL.Path, "/api/") ||
-			filepath.Ext(c.Request.URL.Path) != "" {
+		reqPath := c.Request.URL.Path
+		if indexPath == "" || strings.HasPrefix(reqPath, "/api/") || isStaticAssetPath(reqPath) {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Route not found"})
 			return
 		}
 		c.File(indexPath)
 	}
+}
+
+// isStaticAssetPath 按扩展名白名单判断 URL 路径是否是静态资源请求。
+// 用 path.Ext（URL 语义）而不是 filepath.Ext（OS 路径分隔符）；
+// Windows 下后者会把 `\\` 当分隔符，导致含反斜杠的 URL 判错。
+func isStaticAssetPath(p string) bool {
+	ext := strings.ToLower(path.Ext(p))
+	if ext == "" {
+		return false
+	}
+	_, ok := staticAssetExts[ext]
+	return ok
 }
 
 // extractHostnames 从 CORS 原点 URL 列表中提取 host 部分（小写、去端口也保留）用于 captcha hostname 等值校验。

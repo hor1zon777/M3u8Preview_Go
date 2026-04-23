@@ -15,6 +15,12 @@ func TestParseOrigins(t *testing.T) {
 		{"comma-separated", "http://a.com,http://b.com", []string{"http://a.com", "http://b.com"}},
 		{"with-spaces", " http://a.com , http://b.com ", []string{"http://a.com", "http://b.com"}},
 		{"drops-empty", "http://a.com,,http://b.com,", []string{"http://a.com", "http://b.com"}},
+		{"strips-trailing-slash", "http://a.com/", []string{"http://a.com"}},
+		{"lowercases-scheme", "HTTPS://app.example.com", []string{"https://app.example.com"}},
+		{"dedupes-after-normalize", "http://a.com/,HTTP://a.com,http://a.com", []string{"http://a.com"}},
+		{"star-preserved", "*", []string{"*"}},
+		{"mixed-with-ports", " HTTP://localhost:5173/ , https://app.example.com ",
+			[]string{"http://localhost:5173", "https://app.example.com"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

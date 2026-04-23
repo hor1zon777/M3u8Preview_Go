@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -243,15 +244,34 @@ func (h *AuthHandler) captchaConfig(c *gin.Context) {
 
 const refreshCookieName = "refreshToken"
 
+// resolveCookieSecure 决定本次请求的 Set-Cookie Secure 标志：
+//   - 若 COOKIE_SECURE 被显式设置（CookieSecureAuto=false），直接用静态值
+//   - 否则按请求动态判定：直连 TLS，或 TrustCDN 下 X-Forwarded-Proto=https
+//
+// 典型反代部署（nginx HTTPS → Go HTTP）中，静态 CookieSecure 常被错配成 false
+// 导致 https 前端拿到的 refreshToken 缺失 Secure 标志；动态判定能自愈该类错配。
+func (h *AuthHandler) resolveCookieSecure(c *gin.Context) bool {
+	if !h.cfg.CookieSecureAuto {
+		return h.cfg.CookieSecure
+	}
+	if c.Request.TLS != nil {
+		return true
+	}
+	if h.cfg.TrustCDN && strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
+		return true
+	}
+	return h.cfg.CookieSecure
+}
+
 func (h *AuthHandler) setRefreshCookie(c *gin.Context, token string) {
 	maxAge := int(h.cfg.JWT.RefreshExpiresIn.Seconds())
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(refreshCookieName, token, maxAge, "/", "", h.cfg.CookieSecure, true)
+	c.SetCookie(refreshCookieName, token, maxAge, "/", "", h.resolveCookieSecure(c), true)
 }
 
 func (h *AuthHandler) clearRefreshCookie(c *gin.Context) {
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(refreshCookieName, "", -1, "/", "", h.cfg.CookieSecure, true)
+	c.SetCookie(refreshCookieName, "", -1, "/", "", h.resolveCookieSecure(c), true)
 }
 
 func refreshCookieValue(c *gin.Context) string {
