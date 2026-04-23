@@ -30,6 +30,15 @@ type CaptchaService struct {
 	mu          sync.Mutex
 	cachedCSP   string
 	cacheExpiry time.Time
+	// cachedSettings 缓存整份 captchaSettings 30s，减少登录热路径 4 行 DB 查询。
+	// 管理员改配置后最多 30s 生效——admin 修改本就低频，可接受。
+	cachedSettings      captchaSettings
+	cachedSettingsErr   error
+	settingsCacheExpiry time.Time
+	// 熔断器：连续 N 次失败后进入 open 状态 cooldown 期，快速失败避免 captcha 服务
+	// 抖动时把每次登录请求阻塞 5s×QPS。
+	cbFailures  int
+	cbOpenUntil time.Time
 }
 
 type CaptchaPublicConfig struct {
@@ -101,7 +110,30 @@ func ValidateCaptchaEndpoint(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// loadSettings 读取 captcha 配置；结果走 30s 软缓存。
+// 热路径每次登录都会调用这个方法，不能每次都 4 行 DB 查询。
+// admin 改配置最多 30s 后生效（admin 低频操作，可接受）；CSPOrigin 复用同份缓存。
 func (s *CaptchaService) loadSettings() (captchaSettings, error) {
+	s.mu.Lock()
+	if time.Now().Before(s.settingsCacheExpiry) {
+		cs, err := s.cachedSettings, s.cachedSettingsErr
+		s.mu.Unlock()
+		return cs, err
+	}
+	s.mu.Unlock()
+
+	cs, err := s.loadSettingsFromDB()
+
+	s.mu.Lock()
+	s.cachedSettings = cs
+	s.cachedSettingsErr = err
+	s.settingsCacheExpiry = time.Now().Add(settingsCacheTTL)
+	s.mu.Unlock()
+	return cs, err
+}
+
+// loadSettingsFromDB 绕过缓存直查 DB。
+func (s *CaptchaService) loadSettingsFromDB() (captchaSettings, error) {
 	keys := []string{
 		model.SettingEnableCaptcha,
 		model.SettingCaptchaEndpoint,
@@ -123,7 +155,6 @@ func (s *CaptchaService) loadSettings() (captchaSettings, error) {
 		secretKey: m[model.SettingCaptchaSecretKey],
 	}
 	if rawEndpoint := m[model.SettingCaptchaEndpoint]; rawEndpoint != "" {
-		// 解析失败视为未配置；enabled 判定会因 endpoint 为空而 false
 		if u, err := ValidateCaptchaEndpoint(rawEndpoint); err == nil {
 			cs.endpointURL = u
 			cs.endpoint = u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/")
@@ -149,9 +180,35 @@ func (s *CaptchaService) GetPublicConfig() CaptchaPublicConfig {
 const (
 	maxCaptchaTokenLen    = 4096
 	cspCacheTTL           = 30 * time.Second
+	settingsCacheTTL      = 30 * time.Second
 	captchaTimestampSkew  = 60 * time.Second // siteverify 返回 challenge_ts 的允许时间漂移
 	captchaSiteverifyPath = "/api/v1/siteverify"
+	// 熔断参数：连续 5 次失败打开，30s 内所有请求快速失败
+	cbFailureThreshold = 5
+	cbCooldown         = 30 * time.Second
 )
+
+// cbCheckOpen 返回熔断是否仍处于 open（快速失败）状态。
+func (s *CaptchaService) cbCheckOpen() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.cbOpenUntil.IsZero() && time.Now().Before(s.cbOpenUntil)
+}
+
+// cbRecord 记录一次调用结果；连续失败达阈值则进入 open。
+func (s *CaptchaService) cbRecord(success bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if success {
+		s.cbFailures = 0
+		s.cbOpenUntil = time.Time{}
+		return
+	}
+	s.cbFailures++
+	if s.cbFailures >= cbFailureThreshold {
+		s.cbOpenUntil = time.Now().Add(cbCooldown)
+	}
+}
 
 func (s *CaptchaService) CSPOrigin() string {
 	s.mu.Lock()
@@ -197,6 +254,10 @@ func (s *CaptchaService) VerifyIfEnabled(ctx context.Context, token string) erro
 	if len(token) > maxCaptchaTokenLen {
 		return middleware.NewAppError(http.StatusBadRequest, "验证码 token 无效")
 	}
+	// 熔断打开期间所有请求走快速失败路径；cooldown 结束后自动进入 half-open（下次调用会真实请求）
+	if s.cbCheckOpen() {
+		return middleware.NewAppError(http.StatusBadGateway, "验证服务暂时不可用，请稍后再试")
+	}
 
 	reqBody, _ := json.Marshal(map[string]string{
 		"token":      token,
@@ -215,6 +276,7 @@ func (s *CaptchaService) VerifyIfEnabled(ctx context.Context, token string) erro
 		MaxRedirects: 0, // siteverify 不应该有重定向
 	})
 	if err != nil {
+		s.cbRecord(false)
 		if _, ok := util.SSRFCode(err); ok {
 			return middleware.WrapAppError(http.StatusForbidden, "验证服务地址不允许访问", err)
 		}
@@ -226,6 +288,7 @@ func (s *CaptchaService) VerifyIfEnabled(ctx context.Context, token string) erro
 	}()
 
 	if resp.StatusCode/100 != 2 {
+		s.cbRecord(false)
 		return middleware.NewAppError(http.StatusBadGateway,
 			fmt.Sprintf("验证服务异常 (HTTP %d)", resp.StatusCode))
 	}
@@ -233,12 +296,17 @@ func (s *CaptchaService) VerifyIfEnabled(ctx context.Context, token string) erro
 	// 限制响应体大小，防恶意 captcha 服务返回超大响应耗尽内存
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
 	if err != nil {
+		s.cbRecord(false)
 		return middleware.WrapAppError(http.StatusBadGateway, "读取验证响应失败", err)
 	}
 	var result siteverifyResponse
 	if err := json.Unmarshal(body, &result); err != nil {
+		s.cbRecord(false)
 		return middleware.WrapAppError(http.StatusBadGateway, "验证服务响应异常", fmt.Errorf("captcha decode: %w", err))
 	}
+	// 到这里 HTTP 语义成功：熔断计数清零（无论业务 success 如何；token 错是正常业务不是服务抖动）
+	s.cbRecord(true)
+
 	if !result.Success {
 		return middleware.NewAppError(http.StatusForbidden, "验证码校验失败")
 	}

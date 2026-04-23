@@ -321,6 +321,18 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 }
 
 // secureHeaders 写应用层安全响应头，CSP 根据验证码服务地址动态生成。
+//
+// 指令选择依据:
+//   - default-src 'self'：兜底，不落在具体指令的资源一律本站
+//   - script-src 'self' 'wasm-unsafe-eval' [+captcha]：WASM 加密核心依赖 wasm-unsafe-eval
+//   - style-src 'self' 'unsafe-inline'：React / shadcn 运行时 style 属性需要
+//   - img-src/media-src 允许 https: 与 data:/blob:（m3u8 预览）
+//   - connect-src 加 captcha origin 覆盖 widget XHR；frame-src 同样加入以覆盖未来 iframe 版 widget
+//   - font-src 'self'（无 Google Fonts）
+//   - base-uri 'self'：防止 <base href> 注入改写相对链接到攻击者域
+//   - form-action 'self'：防止被注入的 <form action="evil"> 提交到外站
+//   - frame-ancestors 'none'：等价于 X-Frame-Options: DENY，禁止被 iframe 嵌入
+//   - object-src 'none'：禁止 <object>/<embed>/<applet>，关闭 legacy 插件攻击面
 func secureHeaders(captcha *service.CaptchaService) gin.HandlerFunc {
 	const baseCSP = "default-src 'self'; " +
 		"script-src 'self' 'wasm-unsafe-eval'%s; " +
@@ -328,7 +340,12 @@ func secureHeaders(captcha *service.CaptchaService) gin.HandlerFunc {
 		"img-src 'self' data: blob: https:; " +
 		"media-src 'self' blob: https:; " +
 		"connect-src 'self'%s; " +
-		"font-src 'self'"
+		"frame-src 'self'%s; " +
+		"font-src 'self'; " +
+		"base-uri 'self'; " +
+		"form-action 'self'; " +
+		"frame-ancestors 'none'; " +
+		"object-src 'none'"
 
 	return func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
@@ -339,7 +356,7 @@ func secureHeaders(captcha *service.CaptchaService) gin.HandlerFunc {
 		if origin := captcha.CSPOrigin(); origin != "" {
 			extra = " " + origin
 		}
-		c.Header("Content-Security-Policy", fmt.Sprintf(baseCSP, extra, extra))
+		c.Header("Content-Security-Policy", fmt.Sprintf(baseCSP, extra, extra, extra))
 		c.Next()
 	}
 }
