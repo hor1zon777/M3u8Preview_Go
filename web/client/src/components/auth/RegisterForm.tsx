@@ -79,7 +79,12 @@ export function RegisterForm() {
       await register(username, password, captchaToken ?? undefined);
       navigate('/');
     } catch (err: any) {
-      setError(err.response?.data?.error || '注册失败，请重试');
+      const msg =
+        err?.response?.data?.error ||
+        err?.message ||
+        '注册失败，请重试';
+      console.error('[register] 注册失败', err);
+      setError(msg);
       setCaptchaToken(null);
       captchaKeyRef.current += 1;
     } finally {

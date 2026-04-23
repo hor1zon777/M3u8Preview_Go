@@ -49,7 +49,16 @@ function ensureWasm(): Promise<void> {
   if (!wasmReady) {
     // wasm-pack --target web 产物会通过 new URL('crypto_wasm_bg.wasm', import.meta.url) 自行定位 .wasm。
     // Vite 在 build 时会把 .wasm 作为 asset 输出并重写 URL。
-    wasmReady = initWasm().then(() => undefined);
+    wasmReady = initWasm()
+      .then(() => {
+        console.info('[crypto] WASM 初始化成功');
+        return undefined;
+      })
+      .catch((err) => {
+        console.error('[crypto] WASM 初始化失败', err);
+        wasmReady = null; // 允许重试
+        throw new Error(`WASM 初始化失败: ${err?.message ?? err}`);
+      });
   }
   return wasmReady;
 }
@@ -57,15 +66,26 @@ function ensureWasm(): Promise<void> {
 async function fetchChallenge(fingerprint: string): Promise<ChallengeResponse> {
   // fingerprint 继续上报：服务端存 challenge_store 供 Phase 2 风控读取，
   // 但不再参与 HKDF salt 派生（H8 Phase 1）。
-  const { data } = await axios.post<{ success: boolean; data?: ChallengeResponse; error?: string }>(
-    CHALLENGE_URL,
-    { fingerprint },
-    { timeout: 10000 },
-  );
-  if (!data.success || !data.data) {
-    throw new Error(data.error || '无法获取登录挑战');
+  try {
+    const { data } = await axios.post<{ success: boolean; data?: ChallengeResponse; error?: string }>(
+      CHALLENGE_URL,
+      { fingerprint },
+      { timeout: 10000 },
+    );
+    if (!data.success || !data.data) {
+      throw new Error(data.error || '无法获取登录挑战');
+    }
+    return data.data;
+  } catch (err: any) {
+    // 把 axios 错误细节暴露出来便于诊断
+    const msg =
+      err?.response?.data?.error ||
+      err?.response?.statusText ||
+      err?.message ||
+      '网络异常';
+    console.error('[crypto] fetchChallenge 失败', err);
+    throw new Error(`获取登录挑战失败: ${msg}`);
   }
-  return data.data;
 }
 
 /**
@@ -79,18 +99,30 @@ export async function encryptAuthPayload(
 ): Promise<EncryptedEnvelope> {
   await ensureWasm();
 
-  const fingerprint = await getDeviceFingerprint();
+  let fingerprint: string;
+  try {
+    fingerprint = await getDeviceFingerprint();
+  } catch (err: any) {
+    console.error('[crypto] 设备指纹采集失败', err);
+    throw new Error(`设备指纹采集失败: ${err?.message ?? err}`);
+  }
+
   const challengeResp = await fetchChallenge(fingerprint);
   const plaintextJson = JSON.stringify({ ...payload, ts: Date.now() });
 
   let result: EncryptResult | null = null;
   try {
-    result = encrypt_auth_payload(
-      AuthAAD[aadKey],
-      challengeResp.serverPub,
-      challengeResp.challenge,
-      plaintextJson,
-    );
+    try {
+      result = encrypt_auth_payload(
+        AuthAAD[aadKey],
+        challengeResp.serverPub,
+        challengeResp.challenge,
+        plaintextJson,
+      );
+    } catch (err: any) {
+      console.error('[crypto] WASM encrypt_auth_payload 失败', err);
+      throw new Error(`加密失败: ${err?.message ?? err}`);
+    }
     return {
       challenge: challengeResp.challenge,
       clientPub: result.clientPub,

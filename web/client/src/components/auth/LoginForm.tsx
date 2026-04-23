@@ -42,7 +42,13 @@ export function LoginForm() {
       await login(username, password, captchaToken ?? undefined);
       navigate(from, { replace: true });
     } catch (err: any) {
-      setError(err.response?.data?.error || '登录失败，请重试');
+      // 优先显示 axios 响应里的服务端错误；其次 Error.message（前端本地抛错，如 WASM/指纹/加密失败）；兜底才是通用文案
+      const msg =
+        err?.response?.data?.error ||
+        err?.message ||
+        '登录失败，请重试';
+      console.error('[login] 登录失败', err);
+      setError(msg);
       setCaptchaToken(null);
       captchaKeyRef.current += 1;
     } finally {
