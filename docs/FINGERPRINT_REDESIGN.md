@@ -4,11 +4,17 @@
 > 既不能防越权（攻击者任意构造合法 fingerprint），也不构成风控信号（无历史对比），
 > 但对合法用户引入可感知的失败（浏览器升级 / 隐身切换 / 硬件变化 → 登录失败）。
 >
-> 本文给出"现状分析 → 威胁模型重写 → 三阶段演进方案"的完整设计，用于后续决策与实施。
-> 决策后按阶段分别提 issue / PR 执行。
+> **决策（2026-04-23）**：
+> - ✅ **Phase 1 已实施**（commit `81281c2`）：解除 fingerprint 对加密 key 的硬绑定
+> - ❌ **Phase 2 / Phase 3 不实施**：现有 m3u8preview 使用场景不需要"新设备告警 / WebAuthn"
+>   等级的风控能力；Phase 1 已解决合法用户假阳性登录失败问题，属于立竿见影的收益
 >
-> 关联代码：`web/client/src/utils/fingerprint.ts`、`internal/util/challenge.go`、`internal/util/ecdh.go:BlendSalt`、
-> `web/crypto-wasm/src/lib.rs:blend_salt`、`internal/handler/auth.go:decryptAuth`
+> 本文保留 Phase 2/3 的完整设计作为**未来决策参考**——如果后续威胁模型变化
+> （例如接入企业 SSO、出现明显的自动化撞库攻击、或用户基数增加到值得风控投入），
+> 可依据本文直接排期实施，无需重新论证。
+>
+> 关联代码：`web/client/src/utils/fingerprint.ts`、`internal/util/challenge.go`、
+> `internal/handler/auth.go:decryptAuth`、`web/crypto-wasm/src/lib.rs`
 
 ---
 
@@ -122,7 +128,9 @@
 
 ## 4. 三阶段方案
 
-### Phase 1：解除加密硬绑定（1-2 天）
+### Phase 1：解除加密硬绑定（1-2 天） ✅ 已完成
+
+**状态**：commit `81281c2`（2026-04-23）
 
 **目标**：让 fingerprint 变化**不再**导致登录失败，但保留采集通道以供 Phase 2 使用。
 
@@ -158,9 +166,20 @@
 
 ---
 
-### Phase 2：升级为风控信号（1-2 周）
+### Phase 2：升级为风控信号（1-2 周） ❌ 不实施
 
-**目标**：把 fingerprint 变成"新设备检测 + 异常登录告警"的依据。
+**决策**：2026-04-23 搁置。理由：
+- m3u8preview 是个人 / 小团队场景，未出现明显撞库 / 异地登录需求
+- 实现"新设备告警 + 邮件通知 + 用户设备面板"需要 ~600 行代码 + SMTP 基础设施
+- Phase 1 已解决对合法用户的假阳性失败（首要痛点）
+- captcha + 限流 + challenge 单次消费 + AAD 端点绑定 已覆盖主流威胁
+
+**触发重评估的条件**（满足任一则重新排期）：
+- 日均登录失败率持续 > 5%（暗示撞库压力）
+- 用户基数 > 1000 且出现实际盗号反馈
+- 接入企业 SSO / 多租户部署
+
+**目标**（保留备查）：把 fingerprint 变成"新设备检测 + 异常登录告警"的依据。
 
 #### 4.2.1 数据模型
 
@@ -233,9 +252,16 @@ go s.deviceSvc.RecordLogin(user.ID, fingerprint, c.ClientIP(), c.GetHeader("User
 
 ---
 
-### Phase 3：真正设备绑定（WebAuthn / Passkeys）
+### Phase 3：真正设备绑定（WebAuthn / Passkeys） ❌ 不实施
 
-**目标**：提供**真正** "换设备无法登录"的强安全选项。fingerprint 到此已成纯风控信号，WebAuthn 才是绑定载体。
+**决策**：2026-04-23 搁置（依赖 Phase 2 数据）。理由：
+- Phase 2 未启动，缺乏"新设备告警真的有价值"的运行数据支撑
+- WebAuthn 工作量 > 1000 行 + 新的恢复流程设计（丢失 passkey 紧急通道）
+- 对个人 / 小团队场景收益远低于成本
+
+**触发重评估的条件**：Phase 2 落地且运行 3+ 个月后，若新设备告警抓到过实际攻击 → 考虑启用 Phase 3。
+
+**目标**（保留备查）：提供**真正** "换设备无法登录"的强安全选项。fingerprint 到此已成纯风控信号，WebAuthn 才是绑定载体。
 
 #### 4.3.1 适用场景
 
