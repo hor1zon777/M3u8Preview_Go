@@ -17,6 +17,11 @@ SKIP_CHOWN="${SKIP_CHOWN:-0}"
 # 1) 目录兜底（docker volume / bind mount 首次挂载时可能是空）
 mkdir -p "$DATA_DIR" "$UPLOADS_DIR/posters" "$UPLOADS_DIR/thumbnails" "$WEB_DIST_DIR"
 
+# 1.5) bind-mount 场景下，宿主机 docker compose up 自动创建的目录默认 root:root 755，
+#      容器降权到 appuser 后无法写入（SQLite 报 out of memory / 备份恢复 permission denied）。
+#      在 root 阶段直接放开权限，确保 appuser 可读写。
+chmod -R 777 "$DATA_DIR" "$UPLOADS_DIR" 2>/dev/null || true
+
 # 2) 同步前端构建产物到 volume。
 #    Docker 命名卷仅在首次从镜像初始化，后续重建镜像不会自动更新；
 #    这里每次启动都 rsync 式覆盖，确保 nginx 挂到的 volume 永远是最新一次 build。

@@ -709,6 +709,7 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 	if err := os.MkdirAll(absRoot, 0o755); err != nil {
 		return 0, fmt.Errorf("ensure uploads dir: %w", err)
 	}
+	_ = os.Chmod(absRoot, 0o777)
 	ts := time.Now().UTC().Format("20060102-150405")
 	// staging 必须与 absRoot 同属一个 FS。bind-mount 下 absRoot 的父级 /app 可能
 	// 1) 属于 root 不可写 2) 位于容器 overlayfs 与 absRoot 跨 FS。
@@ -722,6 +723,7 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 	if err := os.MkdirAll(newDir, 0o755); err != nil {
 		return 0, fmt.Errorf("create staging dir: %w", err)
 	}
+	_ = os.Chmod(newDir, 0o777)
 	staged := false
 	defer func() {
 		// newDir 完成 swap 后会只剩空壳（顶层子目录已被 rename 出去），直接删；
@@ -755,6 +757,10 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return 0, fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 		}
+		// 同时设置目录权限为 777（bind-mount 场景兼容）
+		if err := os.Chmod(filepath.Dir(dst), 0o777); err != nil {
+			return 0, fmt.Errorf("chmod dir %s: %w", filepath.Dir(dst), err)
+		}
 		rc, err := f.Open()
 		if err != nil {
 			return 0, fmt.Errorf("open zip entry %s: %w", f.Name, err)
@@ -774,6 +780,11 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 			return 0, fmt.Errorf("close %s: %w", dst, err)
 		}
 		_ = rc.Close()
+		// 设置解压后的文件权限为 777，确保容器内 appuser 可读写
+		// （bind-mount 场景下，默认 0o644 会导致权限不足）
+		if err := os.Chmod(dst, 0o777); err != nil {
+			return 0, fmt.Errorf("chmod %s: %w", dst, err)
+		}
 		done++
 		if done%20 == 0 || done == total {
 			if progress != nil {
@@ -789,6 +800,7 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 	if err := os.MkdirAll(oldDir, 0o755); err != nil {
 		return 0, fmt.Errorf("create rollback dir: %w", err)
 	}
+	_ = os.Chmod(oldDir, 0o777)
 	newEntries, err := os.ReadDir(newDir)
 	if err != nil {
 		return 0, fmt.Errorf("read staging dir: %w", err)
