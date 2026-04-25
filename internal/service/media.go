@@ -226,6 +226,10 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 	}
 	// 是否把外部 poster URL 同步下载到本地，由系统设置 downloadExternalPosters 控制。
 	resolvedPoster := req.PosterURL
+	var originalPosterURL *string
+	if req.PosterURL != nil && (strings.HasPrefix(*req.PosterURL, "http://") || strings.HasPrefix(*req.PosterURL, "https://")) {
+		originalPosterURL = req.PosterURL
+	}
 	if s.shouldDownloadExternalPoster() {
 		rp, err := s.poster.Resolve(req.PosterURL)
 		if err != nil {
@@ -235,16 +239,17 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 	}
 
 	m := model.Media{
-		Title:       req.Title,
-		M3u8URL:     req.M3u8URL,
-		PosterURL:   resolvedPoster,
-		Description: req.Description,
-		Year:        req.Year,
-		Rating:      req.Rating,
-		Duration:    req.Duration,
-		Artist:      req.Artist,
-		CategoryID:  req.CategoryID,
-		Status:      model.MediaStatusActive,
+		Title:             req.Title,
+		M3u8URL:           req.M3u8URL,
+		PosterURL:         resolvedPoster,
+		OriginalPosterURL: originalPosterURL,
+		Description:       req.Description,
+		Year:              req.Year,
+		Rating:            req.Rating,
+		Duration:          req.Duration,
+		Artist:            req.Artist,
+		CategoryID:        req.CategoryID,
+		Status:            model.MediaStatusActive,
 	}
 	if req.Status != nil {
 		m.Status = *req.Status
@@ -285,9 +290,13 @@ func (s *MediaService) Update(id string, req dto.MediaUpdateRequest) (*dto.Media
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
 	}
 
+	var originalPosterURL *string
 	if req.PosterURL != nil {
 		if err := validateLocalPosterURL(req.PosterURL); err != nil {
 			return nil, err
+		}
+		if strings.HasPrefix(*req.PosterURL, "http://") || strings.HasPrefix(*req.PosterURL, "https://") {
+			originalPosterURL = req.PosterURL
 		}
 		// 同 Create：由系统设置 downloadExternalPosters 决定是否同步下载到本地。
 		if s.shouldDownloadExternalPoster() {
@@ -300,6 +309,9 @@ func (s *MediaService) Update(id string, req dto.MediaUpdateRequest) (*dto.Media
 	}
 
 	updates := map[string]any{}
+	if originalPosterURL != nil {
+		updates["original_poster_url"] = *originalPosterURL
+	}
 	if req.Title != nil {
 		updates["title"] = *req.Title
 	}
@@ -488,20 +500,21 @@ func clampInt(n, lo, hi int) int {
 
 func serializeMedia(m *model.Media) dto.MediaResponse {
 	resp := dto.MediaResponse{
-		ID:          m.ID,
-		Title:       m.Title,
-		M3u8URL:     m.M3u8URL,
-		PosterURL:   m.PosterURL,
-		Description: m.Description,
-		Year:        m.Year,
-		Rating:      m.Rating,
-		Duration:    m.Duration,
-		Artist:      m.Artist,
-		Views:       m.Views,
-		Status:      m.Status,
-		CategoryID:  m.CategoryID,
-		CreatedAt:   util.FormatISO(m.CreatedAt),
-		UpdatedAt:   util.FormatISO(m.UpdatedAt),
+		ID:                m.ID,
+		Title:             m.Title,
+		M3u8URL:           m.M3u8URL,
+		PosterURL:         m.PosterURL,
+		OriginalPosterURL: m.OriginalPosterURL,
+		Description:       m.Description,
+		Year:              m.Year,
+		Rating:            m.Rating,
+		Duration:          m.Duration,
+		Artist:            m.Artist,
+		Views:             m.Views,
+		Status:            m.Status,
+		CategoryID:        m.CategoryID,
+		CreatedAt:         util.FormatISO(m.CreatedAt),
+		UpdatedAt:         util.FormatISO(m.UpdatedAt),
 	}
 	if m.Category != nil {
 		resp.Category = &dto.CategoryResponse{

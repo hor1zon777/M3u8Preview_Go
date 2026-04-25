@@ -212,15 +212,20 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 				errs = append(errs, dto.ImportError{Row: rowIdx[i], Field: "general", Message: err.Error()})
 				continue
 			}
+			var origPoster *string
+			if it.PosterURL != nil && isExternalPosterURL(*it.PosterURL) {
+				origPoster = it.PosterURL
+			}
 			m := model.Media{
-				Title:       it.Title,
-				M3u8URL:     it.M3u8URL,
-				PosterURL:   it.PosterURL,
-				Description: it.Description,
-				Year:        it.Year,
-				Artist:      it.Artist,
-				CategoryID:  categoryID,
-				Status:      model.MediaStatusActive,
+				Title:             it.Title,
+				M3u8URL:           it.M3u8URL,
+				PosterURL:         it.PosterURL,
+				OriginalPosterURL: origPoster,
+				Description:       it.Description,
+				Year:              it.Year,
+				Artist:            it.Artist,
+				CategoryID:        categoryID,
+				Status:            model.MediaStatusActive,
 			}
 			if err := tx.Create(&m).Error; err != nil {
 				_ = tx.RollbackTo(sp).Error

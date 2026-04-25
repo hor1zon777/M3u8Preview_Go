@@ -71,9 +71,10 @@ type TagResponse struct {
 type MediaResponse struct {
 	ID          string            `json:"id"`
 	Title       string            `json:"title"`
-	M3u8URL     string            `json:"m3u8Url"`
-	PosterURL   *string           `json:"posterUrl,omitempty"`
-	Description *string           `json:"description,omitempty"`
+	M3u8URL           string            `json:"m3u8Url"`
+	PosterURL         *string           `json:"posterUrl,omitempty"`
+	OriginalPosterURL *string           `json:"originalPosterUrl,omitempty"`
+	Description       *string           `json:"description,omitempty"`
 	Year        *int              `json:"year,omitempty"`
 	Rating      *float64          `json:"rating,omitempty"`
 	Duration    *int              `json:"duration,omitempty"`

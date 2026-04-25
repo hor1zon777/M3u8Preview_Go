@@ -22,9 +22,9 @@ import (
 )
 
 const (
-	posterMaxBytes   int64 = 5 * 1024 * 1024
-	posterTimeoutMS        = 15 * time.Second
-	posterUA               = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	posterMaxBytes  int64 = 5 * 1024 * 1024
+	posterTimeoutMS       = 15 * time.Second
+	posterUA              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 var posterAllowedExt = map[string]bool{
@@ -35,7 +35,7 @@ var posterAllowedExt = map[string]bool{
 type PosterDownloader struct {
 	postersDir   string
 	bucket       *util.TokenBucket
-	onDownloaded func(mediaID, localPath string) // 异步下载完成后的回调（更新 DB）
+	onDownloaded func(mediaID, localPath, originalURL string) // 异步下载完成后的回调（更新 DB）
 
 	// 队列 + 统计
 	jobs      chan posterJob
@@ -59,7 +59,7 @@ type posterJob struct {
 // NewPosterDownloader 构造；postersDir 不存在时会按需创建。
 // onDownloaded 在异步 worker 成功下载后被调用，用于更新 DB。
 // 速率：100 req/min ≈ 1.67 req/s。
-func NewPosterDownloader(uploadsDir string, concurrency int, onDownloaded func(mediaID, localPath string)) *PosterDownloader {
+func NewPosterDownloader(uploadsDir string, concurrency int, onDownloaded func(mediaID, localPath, originalURL string)) *PosterDownloader {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -234,7 +234,7 @@ func (d *PosterDownloader) worker() {
 				d.failed.Add(1)
 			} else {
 				if d.onDownloaded != nil {
-					d.onDownloaded(job.MediaID, localPath)
+					d.onDownloaded(job.MediaID, localPath, job.URL)
 				}
 				d.processed.Add(1)
 			}

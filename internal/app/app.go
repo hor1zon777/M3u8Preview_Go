@@ -153,8 +153,8 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 
 	// ---- 队列服务（需要在 media/admin handler 之前初始化）----
 	thumbQueue := service.NewThumbnailQueue(cfg.ThumbnailConcurrency, service.NewFFmpegProcessor(cfg.UploadsDir, db))
-	posterDL := service.NewPosterDownloader(cfg.UploadsDir, cfg.PosterConcurrency, func(mediaID, localPath string) {
-		db.Model(&model.Media{}).Where("id = ?", mediaID).Update("poster_url", localPath)
+	posterDL := service.NewPosterDownloader(cfg.UploadsDir, cfg.PosterConcurrency, func(mediaID, localPath, originalURL string) {
+		db.Model(&model.Media{}).Where("id = ?", mediaID).Updates(map[string]any{"poster_url": localPath, "original_poster_url": originalURL})
 	})
 
 	// ---- 核心业务模块（阶段 F）----

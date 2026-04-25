@@ -40,12 +40,12 @@ type ExportProgress struct {
 
 // BackupProgress 恢复阶段进度。
 type BackupProgress struct {
-	Phase      string          `json:"phase"`
-	Message    string          `json:"message"`
-	Current    int             `json:"current"`
-	Total      int             `json:"total"`
-	Percentage int             `json:"percentage"`
-	Result     *RestoreResult  `json:"result,omitempty"`
+	Phase      string         `json:"phase"`
+	Message    string         `json:"message"`
+	Current    int            `json:"current"`
+	Total      int            `json:"total"`
+	Percentage int            `json:"percentage"`
+	Result     *RestoreResult `json:"result,omitempty"`
 }
 
 // RestoreResult 恢复结果统计。
@@ -442,6 +442,17 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 
 	// 清理本地封面孤儿引用：backup 不含封面时，poster_url 指向 /uploads/posters/xxx 但文件不存在
 	orphaned := s.cleanOrphanPosterRefs()
+
+	// 检测 ZIP 是否包含封面：如果没有，保留外部 URL 供后续重新获取
+	hasPosters := s.zipHasPostersDir(&zr.Reader)
+	var needRefetch int
+	if !hasPosters {
+		needRefetch = s.countExternalPosters()
+		if needRefetch > 0 {
+			log.Printf("[Restore] ZIP 不含封面目录，保留 %d 个外部封面 URL 供后续重新获取", needRefetch)
+		}
+	}
+
 	if orphaned > 0 {
 		emit(BackupProgress{Phase: "files",
 			Message:    fmt.Sprintf("已清理 %d 个失效的本地封面引用", orphaned),
@@ -469,16 +480,39 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 	return res, nil
 }
 
-// cleanOrphanPosterRefs 扫描 poster_url 为本地路径但文件不存在的记录，置为 NULL。
+// zipHasPostersDir 检测 ZIP 中是否包含 uploads/posters/ 目录。
+func (s *BackupService) zipHasPostersDir(zr *zip.Reader) bool {
+	for _, f := range zr.File {
+		if strings.HasPrefix(f.Name, "uploads/posters/") {
+			return true
+		}
+	}
+	return false
+}
+
+// countExternalPosters 统计有外部封面 URL 的媒体数量。
+func (s *BackupService) countExternalPosters() int {
+	var count int64
+	if err := s.db.Model(&model.Media{}).
+		Where("poster_url LIKE 'http://%' OR poster_url LIKE 'https://%'").
+		Count(&count).Error; err != nil {
+		log.Printf("[backup] countExternalPosters: query failed: %v", err)
+		return 0
+	}
+	return int(count)
+}
+
+// cleanOrphanPosterRefs 扫描 poster_url 为本地路径但文件不存在的记录，如果存在 OriginalPosterURL 则回滚为它，否则置为 NULL。
 // 典型场景：备份不含封面（includePosters=false）时恢复，DB 中的路径指向不存在的文件。
 func (s *BackupService) cleanOrphanPosterRefs() int {
 	type posterRef struct {
-		ID        string `gorm:"column:id"`
-		PosterURL string `gorm:"column:poster_url"`
+		ID                string  `gorm:"column:id"`
+		PosterURL         string  `gorm:"column:poster_url"`
+		OriginalPosterURL *string `gorm:"column:original_poster_url"`
 	}
 	var refs []posterRef
 	if err := s.db.Model(&model.Media{}).
-		Select("id, poster_url").
+		Select("id, poster_url, original_poster_url").
 		Where("poster_url IS NOT NULL AND poster_url <> '' AND poster_url NOT LIKE 'http%'").
 		Scan(&refs).Error; err != nil {
 		log.Printf("[backup] cleanOrphanPosterRefs: query failed: %v", err)
@@ -486,6 +520,7 @@ func (s *BackupService) cleanOrphanPosterRefs() int {
 	}
 
 	var orphanIDs []string
+	var restoreMap = make(map[string]string)
 	for _, r := range refs {
 		rel := strings.TrimPrefix(r.PosterURL, "/uploads/")
 		if rel == r.PosterURL {
@@ -493,14 +528,19 @@ func (s *BackupService) cleanOrphanPosterRefs() int {
 		}
 		absPath := filepath.Join(s.uploadsDir, rel)
 		if _, err := os.Stat(absPath); os.IsNotExist(err) {
-			orphanIDs = append(orphanIDs, r.ID)
+			if r.OriginalPosterURL != nil && *r.OriginalPosterURL != "" {
+				restoreMap[r.ID] = *r.OriginalPosterURL
+			} else {
+				orphanIDs = append(orphanIDs, r.ID)
+			}
 		}
 	}
 
-	if len(orphanIDs) == 0 {
+	if len(orphanIDs) == 0 && len(restoreMap) == 0 {
 		return 0
 	}
 
+	// Batch update NULLs
 	for i := 0; i < len(orphanIDs); i += 100 {
 		end := i + 100
 		if end > len(orphanIDs) {
@@ -509,19 +549,26 @@ func (s *BackupService) cleanOrphanPosterRefs() int {
 		if err := s.db.Model(&model.Media{}).
 			Where("id IN ?", orphanIDs[i:end]).
 			Update("poster_url", nil).Error; err != nil {
-			log.Printf("[backup] cleanOrphanPosterRefs: batch update failed: %v", err)
+			log.Printf("[backup] cleanOrphanPosterRefs: batch update null failed: %v", err)
 		}
 	}
 
-	log.Printf("[backup] cleaned %d orphan poster references", len(orphanIDs))
-	return len(orphanIDs)
+	// Update restored original URLs
+	for id, origURL := range restoreMap {
+		if err := s.db.Model(&model.Media{}).Where("id = ?", id).Update("poster_url", origURL).Error; err != nil {
+			log.Printf("[backup] cleanOrphanPosterRefs: update original URL failed: %v", err)
+		}
+	}
+
+	log.Printf("[backup] cleaned %d orphan poster references, restored %d original URLs", len(orphanIDs), len(restoreMap))
+	return len(orphanIDs) + len(restoreMap)
 }
 
 // ---- helpers ----
 
 type backupPayload struct {
-	Version string     `json:"version"`
-	Tables  *tableSet  `json:"tables"`
+	Version string    `json:"version"`
+	Tables  *tableSet `json:"tables"`
 }
 
 // backupUser 是 User 在 backup JSON 中的序列化形态。
@@ -578,10 +625,10 @@ type tableSet struct {
 // buildBackupJSON 查 11 张表并拼成可序列化结构。
 func (s *BackupService) buildBackupJSON() (map[string]any, error) {
 	var (
-		mu     sync.Mutex
+		mu       sync.Mutex
 		firstErr error
-		data   tableSet
-		wg     sync.WaitGroup
+		data     tableSet
+		wg       sync.WaitGroup
 	)
 	saveErr := func(e error) {
 		if e == nil {
@@ -875,8 +922,8 @@ func isValidBcryptHash(h string) bool {
 	return true
 }
 
-func sanitizeCategories(in []model.Category) []model.Category   { return in }
-func sanitizeTags(in []model.Tag) []model.Tag                   { return in }
+func sanitizeCategories(in []model.Category) []model.Category { return in }
+func sanitizeTags(in []model.Tag) []model.Tag                 { return in }
 func sanitizeMedia(in []model.Media) []model.Media {
 	out := make([]model.Media, 0, len(in))
 	for _, m := range in {
@@ -888,12 +935,12 @@ func sanitizeMedia(in []model.Media) []model.Media {
 	}
 	return out
 }
-func sanitizeMediaTags(in []model.MediaTag) []model.MediaTag           { return in }
-func sanitizeFavorites(in []model.Favorite) []model.Favorite           { return in }
-func sanitizePlaylists(in []model.Playlist) []model.Playlist           { return in }
+func sanitizeMediaTags(in []model.MediaTag) []model.MediaTag             { return in }
+func sanitizeFavorites(in []model.Favorite) []model.Favorite             { return in }
+func sanitizePlaylists(in []model.Playlist) []model.Playlist             { return in }
 func sanitizePlaylistItems(in []model.PlaylistItem) []model.PlaylistItem { return in }
-func sanitizeWatchHistory(in []model.WatchHistory) []model.WatchHistory { return in }
-func sanitizeImportLogs(in []model.ImportLog) []model.ImportLog         { return in }
+func sanitizeWatchHistory(in []model.WatchHistory) []model.WatchHistory  { return in }
+func sanitizeImportLogs(in []model.ImportLog) []model.ImportLog          { return in }
 
 func maxInt(a, b int) int {
 	if a > b {
