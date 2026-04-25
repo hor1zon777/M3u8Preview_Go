@@ -4,8 +4,10 @@ package db
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -74,8 +76,27 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 }
 
 func sqliteDSN(dbPath string) string {
+	q := url.Values{}
+	for _, pragma := range []string{
+		"foreign_keys(1)",
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+	} {
+		q.Add("_pragma", pragma)
+	}
+
+	// 规范化路径：统一用正斜杠（SQLite URI 要求）
 	path := filepath.ToSlash(dbPath)
-	return path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+
+	// Windows 绝对路径（如 C:/data/db.db）已经不以 / 开头，需要补 /
+	// Unix 绝对路径（如 /data/db.db）已经以 / 开头，不需要补
+	// 相对路径（如 ./data/db.db）保持原样
+	if filepath.IsAbs(dbPath) && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	return "file:" + path + "?" + q.Encode()
 }
 
 // Close 统一关闭 *gorm.DB 底层 *sql.DB。
