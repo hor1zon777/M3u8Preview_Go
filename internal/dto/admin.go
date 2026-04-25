@@ -45,7 +45,7 @@ type AdminSettingEntry struct {
 // AdminUpdateSettingRequest PUT /admin/settings。
 type AdminUpdateSettingRequest struct {
 	Key   string `json:"key" binding:"required"`
-	Value string `json:"value" binding:"required"`
+	Value string `json:"value"` // 允许空值，用于清空配置
 }
 
 // AdminBatchDeleteRequest POST /admin/media/batch-delete。
