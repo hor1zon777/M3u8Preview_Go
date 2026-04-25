@@ -4,7 +4,6 @@ package db
 import (
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -75,23 +74,8 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 }
 
 func sqliteDSN(dbPath string) string {
-	q := url.Values{}
-	for _, pragma := range []string{
-		"foreign_keys(1)",
-		"busy_timeout(5000)",
-		"journal_mode(WAL)",
-		"synchronous(NORMAL)",
-	} {
-		q.Add("_pragma", pragma)
-	}
-
-	// 规范化路径：统一用正斜杠（跨平台兼容）
 	path := filepath.ToSlash(dbPath)
-
-	// 不使用 file: URI scheme，直接用文件路径 + 查询参数
-	// 原因：在某些网络环境（如 IPv6-only + WARP）下，file: 前缀可能导致
-	// SQLite 将路径误解析为网络路径，触发 "out of memory" 错误
-	return path + "?" + q.Encode()
+	return path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 }
 
 // Close 统一关闭 *gorm.DB 底层 *sql.DB。
