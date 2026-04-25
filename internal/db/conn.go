@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -86,17 +85,13 @@ func sqliteDSN(dbPath string) string {
 		q.Add("_pragma", pragma)
 	}
 
-	// 规范化路径：统一用正斜杠（SQLite URI 要求）
+	// 规范化路径：统一用正斜杠（跨平台兼容）
 	path := filepath.ToSlash(dbPath)
 
-	// Windows 绝对路径（如 C:/data/db.db）已经不以 / 开头，需要补 /
-	// Unix 绝对路径（如 /data/db.db）已经以 / 开头，不需要补
-	// 相对路径（如 ./data/db.db）保持原样
-	if filepath.IsAbs(dbPath) && !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-
-	return "file:" + path + "?" + q.Encode()
+	// 不使用 file: URI scheme，直接用文件路径 + 查询参数
+	// 原因：在某些网络环境（如 IPv6-only + WARP）下，file: 前缀可能导致
+	// SQLite 将路径误解析为网络路径，触发 "out of memory" 错误
+	return path + "?" + q.Encode()
 }
 
 // Close 统一关闭 *gorm.DB 底层 *sql.DB。
