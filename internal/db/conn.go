@@ -4,8 +4,10 @@ package db
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -48,8 +50,7 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 
 	// DSN 里挂 PRAGMA：glebarez/sqlite 驱动在每次建连时会执行这些 PRAGMA，
 	// 因此连接池重建连接后外键 / busy_timeout / WAL 等仍然生效，不再受 ConnMaxLifetime 影响。
-	dsn := dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
-	db, err := gorm.Open(sqlite.Open(dsn), gormCfg)
+	db, err := gorm.Open(sqlite.Open(sqliteDSN(dbPath)), gormCfg)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -68,6 +69,24 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("enable foreign_keys: %w", err)
 	}
 	return db, nil
+}
+
+func sqliteDSN(dbPath string) string {
+	q := url.Values{}
+	for _, pragma := range []string{
+		"foreign_keys(1)",
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+	} {
+		q.Add("_pragma", pragma)
+	}
+
+	path := filepath.ToSlash(dbPath)
+	if filepath.IsAbs(dbPath) && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return "file:" + path + "?" + q.Encode()
 }
 
 // Close 统一关闭 *gorm.DB 底层 *sql.DB。
