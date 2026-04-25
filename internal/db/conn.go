@@ -27,9 +27,22 @@ import (
 // 旧版只用 db.Exec("PRAGMA ...") 对当前连接生效，连接回收后这些约束静默失效。
 func Open(cfg *config.Config) (*gorm.DB, error) {
 	dbPath := cfg.SQLitePath()
+	dbDir := filepath.Dir(dbPath)
+
+	log.Printf("[db] DATABASE_URL=%s", cfg.DatabaseURL)
+	log.Printf("[db] Resolved path=%s", dbPath)
+	log.Printf("[db] Directory=%s", dbDir)
+
 	// 确保数据库文件目录存在
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir data dir: %w", err)
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir data dir %s: %w", dbDir, err)
+	}
+
+	// 验证目录权限
+	if stat, err := os.Stat(dbDir); err != nil {
+		return nil, fmt.Errorf("stat data dir %s: %w", dbDir, err)
+	} else {
+		log.Printf("[db] Directory exists, mode=%v", stat.Mode())
 	}
 
 	gormLogLevel := logger.Warn
@@ -82,10 +95,16 @@ func sqliteDSN(dbPath string) string {
 		q.Add("_pragma", pragma)
 	}
 
+	// 规范化路径：统一用正斜杠（SQLite URI 要求）
 	path := filepath.ToSlash(dbPath)
+
+	// Windows 绝对路径（如 C:/data/db.db）已经不以 / 开头，需要补 /
+	// Unix 绝对路径（如 /data/db.db）已经以 / 开头，不需要补
+	// 相对路径（如 ./data/db.db）保持原样
 	if filepath.IsAbs(dbPath) && !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
+
 	return "file:" + path + "?" + q.Encode()
 }
 

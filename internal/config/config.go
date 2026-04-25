@@ -193,6 +193,13 @@ func (c *Config) validate() error {
 func (c *Config) SQLitePath() string {
 	s := c.DatabaseURL
 	s = strings.TrimPrefix(s, "file:")
+
+	// 如果路径以 / 开头（Unix 绝对路径），直接返回
+	// 这在 Docker/Linux 环境中很常见：DATABASE_URL=file:/data/db.db
+	if strings.HasPrefix(s, "/") {
+		return s
+	}
+
 	if !filepath.IsAbs(s) {
 		// 相对路径基于 DataDir 的上级（和 Prisma 行为一致）
 		abs, err := filepath.Abs(s)
