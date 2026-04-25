@@ -29,30 +29,9 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	dbPath := cfg.SQLitePath()
 	dbDir := filepath.Dir(dbPath)
 
-	log.Printf("[db] DATABASE_URL=%s", cfg.DatabaseURL)
-	log.Printf("[db] Resolved path=%s", dbPath)
-	log.Printf("[db] Directory=%s", dbDir)
-
 	// 确保数据库文件目录存在
 	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir data dir %s: %w", dbDir, err)
-	}
-
-	// 验证目录权限
-	if stat, err := os.Stat(dbDir); err != nil {
-		return nil, fmt.Errorf("stat data dir %s: %w", dbDir, err)
-	} else {
-		log.Printf("[db] Directory exists, mode=%v", stat.Mode())
-	}
-
-	// 测试写权限：尝试创建临时文件
-	testFile := filepath.Join(dbDir, ".write-test")
-	if f, err := os.Create(testFile); err != nil {
-		log.Printf("[db] WARNING: Cannot create test file in %s: %v", dbDir, err)
-	} else {
-		f.Close()
-		os.Remove(testFile)
-		log.Printf("[db] Write permission verified")
 	}
 
 	gormLogLevel := logger.Warn
@@ -74,7 +53,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	// DSN 里挂 PRAGMA：glebarez/sqlite 驱动在每次建连时会执行这些 PRAGMA，
 	// 因此连接池重建连接后外键 / busy_timeout / WAL 等仍然生效，不再受 ConnMaxLifetime 影响。
 	dsn := sqliteDSN(dbPath)
-	log.Printf("[db] DSN=%s", dsn)
 
 	db, err := gorm.Open(sqlite.Open(dsn), gormCfg)
 	if err != nil {
