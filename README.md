@@ -384,11 +384,25 @@ m3u8-preview-go/
 
 ## FAQ / 故障排查
 
-**Q1. Docker 起来后 `/data/m3u8preview.db` 权限报错？**
-entrypoint 以 root 进入后会 `chown -R appuser:appgroup /data /app/uploads`，再用 `su-exec` 下降。
-若仍失败，通常是 bind-mount 的宿主目录 owner 与镜像内 uid 不匹配：
-- 容器内 appuser uid 由 `adduser -S` 动态分配，宿主改成 `chown -R 100:101 data uploads` 通常可解
-- 推荐生产使用 `volume` 而非 `bind-mount`
+**Q1. Docker 起来后 SQLite 报 `unable to open database file: out of memory (14)` 或权限错误？**
+
+这是 `/data` 目录权限不足导致 SQLite 无法创建或写入数据库文件。错误码 14 是 SQLite 的 `SQLITE_CANTOPEN`，`out of memory` 是其误导性的错误描述。
+
+**快速修复**：在 docker-compose.yml 所在目录执行：
+
+```bash
+chmod 777 ./data
+```
+
+**原因分析**：
+- entrypoint 以 root 进入后会 `chown` 再用 `su-exec` 降权到 `appuser`
+- 但 bind-mount 场景下，宿主目录的权限由宿主机决定，容器内的 `chown` 可能不生效
+- 不同机器即使系统相同，`./data` 目录的初始权限也可能不同（取决于创建方式、umask、文件系统等）
+
+**其他解决方式**：
+- `chown -R 100:101 data uploads`（100:101 是容器内 appuser 的 uid:gid）
+- 或在 `docker-compose.yml` 的 app service 中添加 `user: "0:0"` 以 root 身份运行（不推荐）
+- 推荐生产使用命名 volume 而非 bind-mount，命名卷首次创建时会自动继承镜像内的权限
 
 **Q2. Docker 构建 Stage 1 卡在 `npm install`？**
 多半是 `web/**/node_modules/` 没被 `.dockerignore` 正确排除导致 COPY 时体积爆炸。
