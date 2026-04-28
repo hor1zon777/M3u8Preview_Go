@@ -56,6 +56,14 @@ func NewImportService(db *gorm.DB, thumb ThumbnailEnqueuer, poster PosterMigrato
 	return &ImportService{db: db, thumb: thumb, poster: poster}
 }
 
+func (s *ImportService) shouldDownloadExternalPoster() bool {
+	var setting model.SystemSetting
+	if err := s.db.Where("key = ?", model.SettingDownloadExternalPosters).Take(&setting).Error; err != nil {
+		return false
+	}
+	return setting.Value == "true"
+}
+
 // DetectAndParseFile 从文件扩展名判定格式并解析。
 func (s *ImportService) DetectAndParseFile(filename string, content []byte) ([]dto.ImportItem, string, error) {
 	ext := strings.ToLower(extFromName(filename))
@@ -189,6 +197,7 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 		MediaID string
 		URL     string
 	}, 0)
+	downloadExternalPosters := s.shouldDownloadExternalPoster()
 
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		catMap, err := upsertCategories(tx, uniqueCategories)
@@ -213,13 +222,17 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 				continue
 			}
 			var origPoster *string
+			posterURL := it.PosterURL
 			if it.PosterURL != nil && isExternalPosterURL(*it.PosterURL) {
 				origPoster = it.PosterURL
+				if !downloadExternalPosters {
+					posterURL = nil
+				}
 			}
 			m := model.Media{
 				Title:             it.Title,
 				M3u8URL:           it.M3u8URL,
-				PosterURL:         it.PosterURL,
+				PosterURL:         posterURL,
 				OriginalPosterURL: origPoster,
 				Description:       it.Description,
 				Year:              it.Year,
@@ -260,10 +273,17 @@ func (s *ImportService) Execute(userID string, items []dto.ImportItem, format, f
 					URL     string
 				}{MediaID: m.ID, URL: m.M3u8URL})
 			case isExternalPosterURL(*m.PosterURL):
-				createdForPosterMigrate = append(createdForPosterMigrate, struct {
-					MediaID string
-					URL     string
-				}{MediaID: m.ID, URL: *m.PosterURL})
+				if downloadExternalPosters {
+					createdForPosterMigrate = append(createdForPosterMigrate, struct {
+						MediaID string
+						URL     string
+					}{MediaID: m.ID, URL: *m.PosterURL})
+				} else {
+					createdForThumbs = append(createdForThumbs, struct {
+						MediaID string
+						URL     string
+					}{MediaID: m.ID, URL: m.M3u8URL})
+				}
 			}
 			successCount++
 		}
