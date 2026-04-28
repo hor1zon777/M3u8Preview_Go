@@ -41,13 +41,14 @@ function needsProxy(url: string): boolean {
 
 /** 调用签名 API 获取带 HMAC 签名的代理 URL（需登录，通过 api 实例自动携带 token） */
 async function getSignedProxyUrl(m3u8Url: string): Promise<string> {
-  const { data } = await api.get<{ success: boolean; proxyUrl: string }>('/proxy/sign', {
+  const { data } = await api.get<{ success: boolean; proxyUrl?: string; data?: { proxyUrl?: string } }>('/proxy/sign', {
     params: { url: m3u8Url },
   });
-  if (!data.success || !data.proxyUrl) {
+  const proxyUrl = data.proxyUrl ?? data.data?.proxyUrl;
+  if (!data.success || !proxyUrl) {
     throw new Error('签名响应格式错误');
   }
-  return data.proxyUrl;
+  return proxyUrl;
 }
 
 interface VideoPlayerProps {
