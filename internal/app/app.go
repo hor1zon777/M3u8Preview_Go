@@ -299,6 +299,9 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	mediaSvc.SetPosterResolver(posterDL)
 	mediaSvc.SetThumbnailEnqueuer(thumbQueue)
 
+	// 让批量删除复用单条 Delete 的文件清理 + 生命周期钩子（封面、缩略图、字幕 VTT）
+	adminSvc.SetMediaDeleter(mediaSvc)
+
 	adminGroup := v1.Group("/admin")
 	adminGroup.Use(middleware.Authenticate(authDeps), requireAdmin)
 	adminH.Register(adminGroup)

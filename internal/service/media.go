@@ -4,6 +4,7 @@ package service
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -387,7 +388,8 @@ func (s *MediaService) Update(id string, req dto.MediaUpdateRequest) (*dto.Media
 	return s.FindByID(id)
 }
 
-// Delete 删除媒体。外键级联会自动清掉 media_tags / favorites / playlist_items / watch_history。
+// Delete 删除媒体。外键级联会自动清掉 media_tags / favorites / playlist_items / watch_history /
+// subtitle_jobs；本函数额外负责清理本地封面 / 缩略图文件，并触发 onDeleted 钩子（用于字幕 VTT）。
 func (s *MediaService) Delete(id string) error {
 	var existing model.Media
 	if err := s.db.Take(&existing, "id = ?", id).Error; err != nil {
@@ -400,10 +402,13 @@ func (s *MediaService) Delete(id string) error {
 		return middleware.WrapAppError(http.StatusInternalServerError, "删除失败", err)
 	}
 	// 删除本地封面文件：仅当 URL 是合法本地 uploads 路径，且 filepath.Rel 校验未越出 uploadsDir 时才执行。
+	// posters/ 与 thumbnails/ 都通过同一个 poster_url 字段引用，localUploadPattern 白名单已涵盖。
+	// 同步删除 + 记录失败：fire-and-forget 会让管理员误以为已清理；DB 行已删，文件即使删失败也不会回写到任何 URL。
 	if existing.PosterURL != nil && strings.HasPrefix(*existing.PosterURL, "/uploads/") {
-		abs, ok := resolveLocalUploadPath(s.uploadsDir, *existing.PosterURL)
-		if ok {
-			go func(p string) { _ = os.Remove(p) }(abs)
+		if abs, ok := resolveLocalUploadPath(s.uploadsDir, *existing.PosterURL); ok {
+			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+				log.Printf("[media] delete local poster %s failed: %v", abs, err)
+			}
 		}
 	}
 	if s.onDeleted != nil {

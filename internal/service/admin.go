@@ -19,10 +19,25 @@ import (
 // AdminService 管理员业务入口。
 type AdminService struct {
 	db *gorm.DB
+	// mediaDeleter 用于把批量删除委托回单条 Delete 流程，统一清理本地封面 / 缩略图 /
+	// 字幕 VTT（通过 MediaService.onDeleted 钩子）。SetMediaDeleter 注入；nil 时回退到纯 SQL 批删。
+	mediaDeleter MediaDeleter
+}
+
+// MediaDeleter 单条媒体删除入口（通常由 MediaService 实现）。
+// 抽出接口避免 admin → media 的硬依赖循环，并方便单测注入 mock。
+type MediaDeleter interface {
+	Delete(id string) error
 }
 
 // NewAdminService 构造。
 func NewAdminService(db *gorm.DB) *AdminService { return &AdminService{db: db} }
+
+// SetMediaDeleter 注入 MediaService 的单条 Delete 入口。
+// app 装配阶段调用，让批量删除复用文件清理与生命周期钩子。
+func (s *AdminService) SetMediaDeleter(d MediaDeleter) {
+	s.mediaDeleter = d
+}
 
 // Dashboard 6 并行查询构建主页统计。
 func (s *AdminService) Dashboard() (dto.AdminDashboardResponse, error) {
@@ -342,7 +357,37 @@ func (s *AdminService) AdminListMedia(page, limit int, search, status string) (d
 }
 
 // BatchDelete 批量删除。
+//
+// 当注入了 MediaDeleter（默认装配下都会注入）时，逐条委托给单条 Delete：
+// 这样会一并删除本地封面 / 缩略图文件，并触发 onDeleted 钩子清理字幕 VTT。
+// 单条 NotFound 会被忽略（continue），其它错误立即中断并返回当前已删数。
+//
+// 未注入 MediaDeleter 时退化为单语句 SQL 批删（仅 DB），保持向后兼容。
 func (s *AdminService) BatchDelete(ids []string) (dto.BatchOperationResponse, error) {
+	if len(ids) == 0 {
+		return dto.BatchOperationResponse{}, middleware.NewAppError(http.StatusBadRequest, "ids 不能为空")
+	}
+
+	if s.mediaDeleter != nil {
+		var affected int64
+		for _, id := range ids {
+			if err := s.mediaDeleter.Delete(id); err != nil {
+				// NotFound 不阻断剩余项；其它错误（如 DB 异常）立即返回，告知调用方部分完成。
+				var appErr *middleware.AppError
+				if errors.As(err, &appErr) && appErr.Status == http.StatusNotFound {
+					continue
+				}
+				return dto.BatchOperationResponse{AffectedCount: affected},
+					middleware.WrapAppError(http.StatusInternalServerError, "批量删除中断", err)
+			}
+			affected++
+		}
+		if affected == 0 {
+			return dto.BatchOperationResponse{}, middleware.NewAppError(http.StatusNotFound, "未找到匹配记录")
+		}
+		return dto.BatchOperationResponse{AffectedCount: affected}, nil
+	}
+
 	tx := s.db.Where("id IN ?", ids).Delete(&model.Media{})
 	if tx.Error != nil {
 		return dto.BatchOperationResponse{}, middleware.WrapAppError(http.StatusInternalServerError, "删除失败", tx.Error)
