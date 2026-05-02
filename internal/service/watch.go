@@ -25,19 +25,35 @@ func NewWatchHistoryService(db *gorm.DB) *WatchHistoryService {
 
 // UpdateProgress upsert 当前用户对某媒体的进度。
 // (user_id, media_id) 唯一约束保证每个用户对每个媒体只有一条，重复调用只更新数值。
+//
+// 服务端权威计算 percentage / completed：
+//   - 老前端只上报 {progress, duration}（不带 percentage/completed），若直接落库 percentage 永远是 0
+//   - 即使新前端上报了，恶意客户端也可能传不一致的值（例如 progress=10s 但 percentage=99%）
+//   - 统一在服务端按 progress/duration 计算，规范化所有记录条进度展示
 func (s *WatchHistoryService) UpdateProgress(userID string, req dto.WatchProgressRequest) (*dto.WatchHistoryResponse, error) {
 	var m model.Media
 	if err := s.db.Take(&m, "id = ?", req.MediaID).Error; err != nil {
 		return nil, middleware.NewAppError(http.StatusNotFound, "Media not found")
 	}
 
+	percentage := req.Percentage
+	if req.Duration > 0 {
+		percentage = req.Progress / req.Duration * 100
+		if percentage < 0 {
+			percentage = 0
+		} else if percentage > 100 {
+			percentage = 100
+		}
+	}
+	completed := req.Completed || percentage >= 95
+
 	wh := model.WatchHistory{
 		UserID:     userID,
 		MediaID:    req.MediaID,
 		Progress:   req.Progress,
 		Duration:   req.Duration,
-		Percentage: req.Percentage,
-		Completed:  req.Completed,
+		Percentage: percentage,
+		Completed:  completed,
 	}
 	// ON CONFLICT(user_id, media_id) DO UPDATE
 	err := s.db.Clauses(clause.OnConflict{

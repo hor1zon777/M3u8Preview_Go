@@ -1187,8 +1187,31 @@ func sanitizeMediaTags(in []model.MediaTag) []model.MediaTag             { retur
 func sanitizeFavorites(in []model.Favorite) []model.Favorite             { return in }
 func sanitizePlaylists(in []model.Playlist) []model.Playlist             { return in }
 func sanitizePlaylistItems(in []model.PlaylistItem) []model.PlaylistItem { return in }
-func sanitizeWatchHistory(in []model.WatchHistory) []model.WatchHistory  { return in }
-func sanitizeImportLogs(in []model.ImportLog) []model.ImportLog          { return in }
+
+// sanitizeWatchHistory 顺手修复老备份里 percentage=0 但 progress>0 的记录条进度。
+// 早期前端只上报 {progress, duration}，导致 percentage 永远写不进去；恢复后前端进度条全部 0%。
+// 这里按 progress/duration*100 回填，并在 ≥95% 时把 completed 标为 true。
+func sanitizeWatchHistory(in []model.WatchHistory) []model.WatchHistory {
+	out := make([]model.WatchHistory, 0, len(in))
+	for _, w := range in {
+		if w.Duration > 0 && w.Percentage == 0 && w.Progress > 0 {
+			pct := w.Progress / w.Duration * 100
+			if pct < 0 {
+				pct = 0
+			} else if pct > 100 {
+				pct = 100
+			}
+			w.Percentage = pct
+			if pct >= 95 {
+				w.Completed = true
+			}
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+func sanitizeImportLogs(in []model.ImportLog) []model.ImportLog { return in }
 
 // sanitizeSubtitleJobs 清洗字幕任务：
 //   - mediaId 必填（外键约束）

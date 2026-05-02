@@ -40,6 +40,25 @@ func AutoMigrate(db *gorm.DB) error {
 	if err := db.AutoMigrate(allModels()...); err != nil {
 		return fmt.Errorf("automigrate: %w", err)
 	}
+	if err := backfillWatchHistoryPercentage(db); err != nil {
+		return fmt.Errorf("backfill watch_history percentage: %w", err)
+	}
+	return nil
+}
+
+// backfillWatchHistoryPercentage 修复历史数据：早期前端只上报 {progress, duration}
+// 不上报 percentage，导致 watch_history.percentage 永远是 0，前端进度条全部显示 0%。
+// 启动时一次性按 progress/duration*100 回填，幂等：只更新当前 percentage=0 且 duration>0 的行。
+func backfillWatchHistoryPercentage(db *gorm.DB) error {
+	res := db.Exec(`
+		UPDATE watch_history
+		SET percentage = MIN(100, MAX(0, progress * 100.0 / duration)),
+		    completed = CASE WHEN progress * 100.0 / duration >= 95 THEN 1 ELSE completed END
+		WHERE duration > 0 AND percentage = 0 AND progress > 0
+	`)
+	if res.Error != nil {
+		return res.Error
+	}
 	return nil
 }
 
