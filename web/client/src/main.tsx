@@ -29,6 +29,7 @@ import { AdminCategoriesPage } from './pages/AdminCategoriesPage.js';
 import { AdminTagsPage } from './pages/AdminTagsPage.js';
 import { AdminUserDetailPage } from './pages/AdminUserDetailPage.js';
 import { AdminActivityPage } from './pages/AdminActivityPage.js';
+import { AdminSubtitlesPage } from './pages/AdminSubtitlesPage.js';
 import './index.css';
 import { clearPendingScrollRestore, getPendingScrollRestore, getSavedRouteScrollPosition, buildRouteKey } from './lib/utils.js';
 
@@ -141,6 +142,7 @@ function AppRoutes() {
         <Route path="/admin/media" element={<ProtectedRoute requireAdmin><AdminMediaPage /></ProtectedRoute>} />
         <Route path="/admin/categories" element={<ProtectedRoute requireAdmin><AdminCategoriesPage /></ProtectedRoute>} />
         <Route path="/admin/tags" element={<ProtectedRoute requireAdmin><AdminTagsPage /></ProtectedRoute>} />
+        <Route path="/admin/subtitles" element={<ProtectedRoute requireAdmin><AdminSubtitlesPage /></ProtectedRoute>} />
         <Route path="/import" element={<ProtectedRoute requireAdmin><ImportPage /></ProtectedRoute>} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -16,10 +16,15 @@ build-errors.log
 /data/*.db-shm
 # 登录加密协议 ECDH 私钥（自动生成，绝不入库）
 /data/ecdh.pem
+# whisper.cpp GGML 模型（数百 MB ~ GB 级，绝不入库）
+/data/whisper/
 /uploads/posters/*
 /uploads/thumbnails/*
+# 字幕 VTT 产物（运行期生成）
+/uploads/subtitles/*
 !/uploads/posters/.gitkeep
 !/uploads/thumbnails/.gitkeep
+!/uploads/subtitles/.gitkeep
 
 # 环境变量
 .env
@@ -42,9 +47,14 @@ web/.env
 web/.env.local
 web/.env.*.local
 web/package-lock.json
+# 项目用 npm workspaces；若开发期被 pnpm 操作过会留下 lockfile，忽略掉避免冲突
+web/**/pnpm-lock.yaml
 
 # claude配置
 .claude
 docs/AI_INTEGRATION_PROMPT.md
 docs/CODE_REVIEW_2026-04-22.md
 docs/VULNERABILITIES_2026-04-22.md
+
+# Claude Code 会话日志（自动生成的临时文件，匹配命名形如 2026-MM-DD-HHMMSS-*.txt）
+*-local-command-caveatcaveat-the-messages-below.txt

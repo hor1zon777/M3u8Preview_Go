@@ -105,6 +105,9 @@ type MediaService struct {
 	uploadsDir string
 	thumb      ThumbnailEnqueuer
 	poster     PosterResolver
+	// 媒体生命周期钩子；nil 表示无操作。app 装配时注入。
+	onCreated func(mediaID string)
+	onDeleted func(mediaID string)
 }
 
 // NewMediaService 构造。
@@ -132,6 +135,13 @@ func (s *MediaService) SetThumbnailEnqueuer(t ThumbnailEnqueuer) {
 		t = NoopThumbnailEnqueuer{}
 	}
 	s.thumb = t
+}
+
+// SetLifecycleHooks 注入创建/删除后回调。任一可为 nil。
+// app 装配时由 SubtitleService 注入用于联动字幕生成与清理。
+func (s *MediaService) SetLifecycleHooks(onCreated, onDeleted func(mediaID string)) {
+	s.onCreated = onCreated
+	s.onDeleted = onDeleted
 }
 
 // shouldDownloadExternalPoster 查 system_settings.downloadExternalPosters，
@@ -277,6 +287,9 @@ func (s *MediaService) Create(req dto.MediaCreateRequest) (*dto.MediaResponse, e
 	if m.PosterURL == nil {
 		s.thumb.Enqueue(m.ID, m.M3u8URL)
 	}
+	if s.onCreated != nil {
+		s.onCreated(m.ID)
+	}
 	return s.FindByID(m.ID)
 }
 
@@ -392,6 +405,9 @@ func (s *MediaService) Delete(id string) error {
 		if ok {
 			go func(p string) { _ = os.Remove(p) }(abs)
 		}
+	}
+	if s.onDeleted != nil {
+		s.onDeleted(id)
 	}
 	return nil
 }

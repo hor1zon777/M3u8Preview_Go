@@ -31,6 +31,25 @@ const (
 	ImportStatusFailed  = "FAILED"
 )
 
+// 字幕任务状态
+const (
+	SubtitleStatusPending  = "PENDING"  // 已入队，未开始
+	SubtitleStatusRunning  = "RUNNING"  // 正在处理（音频抽取/ASR/翻译/写文件）
+	SubtitleStatusDone     = "DONE"     // 完成，VTT 已落盘
+	SubtitleStatusFailed   = "FAILED"   // 失败，error_msg 含原因
+	SubtitleStatusDisabled = "DISABLED" // 管理员禁用此 media 的字幕生成
+)
+
+// 字幕处理阶段（progress 推送用）
+const (
+	SubtitleStageQueued     = "queued"
+	SubtitleStageExtracting = "extracting" // ffmpeg 抽音频
+	SubtitleStageASR        = "asr"        // whisper.cpp 识别
+	SubtitleStageTranslate  = "translate"  // LLM 翻译
+	SubtitleStageWriting    = "writing"    // 写 VTT
+	SubtitleStageDone       = "done"
+)
+
 // 系统设置 key（集中管理，避免拼写错误）
 const (
 	SettingSiteName               = "siteName"

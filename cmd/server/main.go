@@ -59,7 +59,7 @@ func main() {
 		log.Fatalf("db seed: %v", err)
 	}
 
-	engine, _ := app.Build(cfg, gdb)
+	engine, deps := app.Build(cfg, gdb)
 
 	addr := fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.Port)
 	srv := &http.Server{
@@ -89,6 +89,10 @@ func main() {
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Fatalf("forced shutdown: %v", err)
+		}
+		// 停止字幕 worker（取消运行中的 ffmpeg/whisper 子进程）
+		if deps != nil && deps.SubtitleSvc != nil {
+			deps.SubtitleSvc.Stop()
 		}
 		log.Println("HTTP server closed")
 	}

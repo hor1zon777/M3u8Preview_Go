@@ -48,6 +48,66 @@ type BcryptConfig struct {
 	SaltRounds int
 }
 
+// SubtitleConfig 控制字幕自动生成（日语 ASR + LLM 翻译为中文）功能。
+//
+// 部署要求（CPU 环境）：
+//   - whisper.cpp 二进制（whisper-cli）需在 PATH 或显式指定 WhisperBin
+//   - GGML 模型文件（推荐 ggml-medium-q5_0.bin / ggml-large-v3-q5_0.bin）
+//   - ffmpeg 已在 PATH（项目其它模块已要求）
+//
+// 翻译走 OpenAI 兼容 API（DeepSeek / Qwen / OpenAI / 智谱 / 自建网关）：
+//   - TranslateBaseURL 形如 https://api.deepseek.com（不含 /v1）
+//   - 实际调用 <BaseURL>/v1/chat/completions
+type SubtitleConfig struct {
+	// Enabled 关闭后所有 subtitle 端点返回 503，worker 不启动
+	Enabled bool
+	// AutoGenerate 为 true 时：启动扫描 ACTIVE media 入队 + 新建 media 钩子入队
+	AutoGenerate bool
+	// WhisperBin 默认 "whisper-cli"（whisper.cpp 官方编译产物）
+	WhisperBin string
+	// WhisperModel GGML 模型文件绝对路径（如 /opt/whisper-models/ggml-medium-q5_0.bin）
+	WhisperModel string
+	// WhisperLanguage 源语言 ISO-639-1（默认 "ja"）
+	WhisperLanguage string
+	// WhisperThreads CPU 线程数（默认 0=自动按 NumCPU）
+	WhisperThreads int
+	// TranslateBaseURL OpenAI 兼容服务 base URL（不含 /v1）
+	TranslateBaseURL string
+	// TranslateAPIKey
+	TranslateAPIKey string
+	// TranslateModel 如 "deepseek-chat" / "qwen2.5-7b-instruct" / "gpt-4o-mini"
+	TranslateModel string
+	// TargetLang 目标语言（默认 "zh"）
+	TargetLang string
+	// BatchSize 一次发给 LLM 的字幕条数（默认 8）
+	BatchSize int
+	// MaxRetries 翻译失败重试次数（默认 2）
+	MaxRetries int
+	// SubtitlesDir 字幕文件目录（默认 <UploadsDir>/subtitles）
+	SubtitlesDir string
+	// SignatureTTL 签名 VTT URL 有效期（默认 4h，复用 Proxy 风格）
+	SignatureTTL time.Duration
+
+	// LocalWorkerEnabled 控制是否启动 in-process whisper.cpp worker。
+	//   - true：进程内 ASR worker（单 CPU 串行，慢但自包含；老部署兜底）
+	//   - false（默认）：仅接受远程 GPU worker 通过 /api/v1/worker/* pull 任务
+	// 切到远程 worker 模式后，admin 重试 / 自动入队等行为不变；任务停留在 PENDING
+	// 直到远程 worker 上线 claim。
+	LocalWorkerEnabled bool
+
+	// WorkerStaleThreshold 远程 worker 心跳超时阈值。
+	// claimed_at 之后超过此时长仍无 last_heartbeat_at 更新，
+	// RecoverStaleJobs 会把 RUNNING 重置回 PENDING 让其它 worker 重新认领。
+	// 默认 10 分钟（覆盖正常 ASR + 翻译耗时；过短会误杀长视频）。
+	WorkerStaleThreshold time.Duration
+
+	// GlobalMaxConcurrency 全局正在 RUNNING 的字幕任务上限。
+	// 0 表示不限（默认）。设置正值时 ClaimNextJob 会先查全局 RUNNING 数，
+	// 已达上限则返回 nil，worker 自然 sleep 后重试。
+	// 用于在共享 ASR / 翻译 API 配额时防止 worker 集群把后端 LLM 打垮。
+	GlobalMaxConcurrency int
+}
+
 type Config struct {
 	Port         int
 	BindAddress  string
@@ -58,6 +118,7 @@ type Config struct {
 	Upload       UploadConfig
 	Proxy        ProxyConfig
 	Bcrypt       BcryptConfig
+	Subtitle     SubtitleConfig
 	TrustCDN     bool
 	CookieSecure bool
 	// CookieSecureAuto 为 true 时，handler 按 TLS 连接或可信 X-Forwarded-Proto=https 动态决定
@@ -137,6 +198,31 @@ func Load(projectRoot string) (*Config, error) {
 		DataDir:              getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
 		ThumbnailConcurrency: clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
 		PosterConcurrency:    clamp(atoiDefault(os.Getenv("POSTER_MIGRATION_CONCURRENCY"), 2), 1, 10),
+		Subtitle: SubtitleConfig{
+			Enabled:              parseBoolDefault(os.Getenv("SUBTITLE_ENABLED"), false),
+			AutoGenerate:         parseBoolDefault(os.Getenv("SUBTITLE_AUTO_GENERATE"), true),
+			WhisperBin:           getenv("SUBTITLE_WHISPER_BIN", "whisper-cli"),
+			WhisperModel:         os.Getenv("SUBTITLE_WHISPER_MODEL"),
+			WhisperLanguage:      getenv("SUBTITLE_WHISPER_LANG", "ja"),
+			WhisperThreads:       clamp(atoiDefault(os.Getenv("SUBTITLE_WHISPER_THREADS"), 0), 0, 64),
+			TranslateBaseURL:     strings.TrimRight(os.Getenv("SUBTITLE_TRANSLATE_BASE_URL"), "/"),
+			TranslateAPIKey:      os.Getenv("SUBTITLE_TRANSLATE_API_KEY"),
+			TranslateModel:       getenv("SUBTITLE_TRANSLATE_MODEL", "deepseek-chat"),
+			TargetLang:           getenv("SUBTITLE_TARGET_LANG", "zh"),
+			BatchSize:            clamp(atoiDefault(os.Getenv("SUBTITLE_BATCH_SIZE"), 8), 1, 50),
+			MaxRetries:           clamp(atoiDefault(os.Getenv("SUBTITLE_MAX_RETRIES"), 2), 0, 5),
+			SignatureTTL:         4 * time.Hour,
+			LocalWorkerEnabled:   parseBoolDefault(os.Getenv("SUBTITLE_LOCAL_WORKER_ENABLED"), false),
+			WorkerStaleThreshold: time.Duration(clamp(atoiDefault(os.Getenv("SUBTITLE_WORKER_STALE_MINUTES"), 10), 1, 120)) * time.Minute,
+			GlobalMaxConcurrency: clamp(atoiDefault(os.Getenv("SUBTITLE_GLOBAL_MAX_CONCURRENCY"), 0), 0, 1000),
+		},
+	}
+
+	// SubtitlesDir：env 优先，否则 <UploadsDir>/subtitles
+	if p := os.Getenv("SUBTITLE_DIR"); p != "" {
+		cfg.Subtitle.SubtitlesDir = p
+	} else {
+		cfg.Subtitle.SubtitlesDir = filepath.Join(cfg.UploadsDir, "subtitles")
 	}
 
 	// ECDH 私钥路径：优先 env，否则落到 DataDir/ecdh.pem

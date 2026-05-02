@@ -407,3 +407,110 @@ export interface UserActivityAggregate {
     updatedAt: string;
   }>;
 }
+
+// ========== Subtitle ==========
+export type SubtitleStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'DISABLED' | 'MISSING';
+export type SubtitleStage = 'queued' | 'extracting' | 'asr' | 'translate' | 'writing' | 'done';
+
+export interface SubtitleStatusResponse {
+  mediaId: string;
+  status: SubtitleStatus;
+  stage: SubtitleStage | '';
+  progress: number;
+  sourceLang: string;
+  targetLang: string;
+  vttUrl?: string;
+  errorMsg?: string;
+}
+
+export interface SubtitleJob {
+  id: string;
+  mediaId: string;
+  mediaTitle?: string;
+  categoryId?: string;
+  categoryName?: string;
+  status: SubtitleStatus;
+  stage: SubtitleStage;
+  progress: number;
+  sourceLang: string;
+  targetLang: string;
+  asrModel?: string;
+  mtModel?: string;
+  segmentCount: number;
+  errorMsg?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SubtitleSettings {
+  enabled: boolean;
+  autoGenerate: boolean;
+  whisperBin: string;
+  whisperModel: string;
+  whisperLanguage: string;
+  whisperThreads: number;
+  translateBaseUrl: string;
+  translateModel: string;
+  translateApiKey: string;
+  targetLang: string;
+  batchSize: number;
+}
+
+export interface SubtitleQueueStatus {
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+  disabled: number;
+  /** 全局并发上限：0=不限 */
+  globalMaxConcurrency: number;
+}
+
+export interface SubtitleBatchRegenerateRequest {
+  mediaIds?: string[];
+  all?: boolean;
+  onlyFailed?: boolean;
+  /** 按分类批量重新生成；"_none" 表示未分类媒体 */
+  categoryId?: string;
+}
+
+export interface SubtitleBatchRegenerateResponse {
+  enqueued: number;
+  skipped: number;
+}
+
+// 远程 GPU worker 在线列表项
+export interface SubtitleWorker {
+  id: string;
+  name: string;
+  version?: string;
+  gpu?: string;
+  currentJobId?: string;
+  lastSeenAt: string;
+  registeredAt: string;
+  completedJobs: number;
+  failedJobs: number;
+  online: boolean;
+}
+
+// admin 面板生成的 worker 凭证（不含明文）
+export interface SubtitleWorkerToken {
+  id: string;
+  name: string;
+  tokenPrefix: string;
+  /** 该 token 名下 worker 集合允许同时持有的 RUNNING 任务上限 */
+  maxConcurrency: number;
+  /** 该 token 当前正在运行的任务数（实时） */
+  currentRunning: number;
+  createdAt: string;
+  lastUsedAt?: string | null;
+  revokedAt?: string | null;
+}
+
+// 创建 token 时的一次性返回（含明文）
+export interface SubtitleWorkerTokenCreateResponse {
+  token: string;
+  record: SubtitleWorkerToken;
+}

@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect, type ChangeEvent, type RefObj
 import { Play, Pause, Maximize, Minimize, Loader2, Volume1, Volume2, VolumeX, RotateCw } from 'lucide-react';
 import { usePlayerStore } from '../../stores/playerStore.js';
 import { formatDuration } from '../../lib/utils.js';
+import { SubtitleSettingsPanel } from './SubtitleSettingsPanel.js';
 
 const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
@@ -11,9 +12,11 @@ interface PlayerControlsProps {
   onDragStateChange?: (dragging: boolean) => void;
   rotation?: 0 | 90 | 180 | 270;
   onRotate?: () => void;
+  /** 当前媒体是否已生成可用字幕；面板内会据此显示提示 */
+  subtitleAvailable?: boolean;
 }
 
-export function PlayerControls({ videoRef, containerRef, onDragStateChange, rotation = 0, onRotate }: PlayerControlsProps) {
+export function PlayerControls({ videoRef, containerRef, onDragStateChange, rotation = 0, onRotate, subtitleAvailable = false }: PlayerControlsProps) {
   const {
     isPlaying,
     isBuffering,
@@ -362,6 +365,9 @@ export function PlayerControls({ videoRef, containerRef, onDragStateChange, rota
             {volumePercent}%
           </span>
         </div>
+
+        {/* 字幕设置 */}
+        <SubtitleSettingsPanel available={subtitleAvailable} />
 
         {/* 倍速选择器 */}
         <div className="relative" ref={rateMenuRef}>

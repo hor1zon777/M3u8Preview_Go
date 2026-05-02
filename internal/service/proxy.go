@@ -149,6 +149,41 @@ func IsSurritHostname(host string) bool {
 	return host == "surrit.com" || strings.HasSuffix(host, ".surrit.com")
 }
 
+// HeadersForM3u8URL 根据 m3u8 URL 的域名返回下载时应携带的 HTTP 头。
+// 与代理端点 (ProxyHandler.m3u8) 注入的逻辑保持一致，确保 worker 直连源站
+// 也能拿到与服务端代理一样的鉴权效果。
+//
+// 当前规则：
+//   - User-Agent: 模拟桌面浏览器（绕过最简单的 UA 校验）
+//   - Referer:    surrit.* 域名要求 https://missav.ws；其它域名留给上游/代理或将来扩展
+func HeadersForM3u8URL(rawURL string) map[string]string {
+	headers := map[string]string{
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Accept":     "*/*",
+	}
+	if rawURL == "" {
+		return headers
+	}
+	// 只取 host，URL 解析失败也不报错（headers 至少包含 UA）
+	if idx := strings.Index(rawURL, "://"); idx > 0 {
+		rest := rawURL[idx+3:]
+		host := rest
+		if slash := strings.Index(rest, "/"); slash > 0 {
+			host = rest[:slash]
+		}
+		if at := strings.Index(host, "@"); at >= 0 {
+			host = host[at+1:]
+		}
+		if colon := strings.Index(host, ":"); colon > 0 {
+			host = host[:colon]
+		}
+		if IsSurritHostname(host) {
+			headers["Referer"] = "https://missav.ws"
+		}
+	}
+	return headers
+}
+
 // IsM3u8ContentType 判断 content-type 是否属于 m3u8 族。
 func IsM3u8ContentType(ct string) bool {
 	low := strings.ToLower(ct)

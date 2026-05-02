@@ -1,8 +1,14 @@
 import { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
 import Hls from 'hls.js';
 import { usePlayerStore } from '../../stores/playerStore.js';
+import {
+  useSubtitleSettingsStore,
+  colorWithOpacity,
+  edgeStyleToTextShadow,
+} from '../../stores/subtitleSettingsStore.js';
 import api, { getAccessToken } from '../../services/api.js';
-import type { Media } from '@m3u8-preview/shared';
+import { subtitleApi } from '../../services/subtitleApi.js';
+import type { Media, SubtitleStatusResponse } from '@m3u8-preview/shared';
 
 const MAX_NETWORK_RETRY = 5;
 const MAX_MEDIA_RETRY = 3;
@@ -60,18 +66,29 @@ interface VideoPlayerProps {
   controls?: boolean;
   /** 视频旋转角度（度），仅支持 0 / 90 / 180 / 270；在 fillContainer 模式下生效 */
   rotation?: 0 | 90 | 180 | 270;
+  /** 字幕状态变化时回调（用于父组件展示字幕设置入口的可用提示） */
+  onSubtitleStatusChange?: (status: SubtitleStatusResponse | null) => void;
 }
 
 export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(
-  function VideoPlayer({ media, startTime = 0, onTimeUpdate, autoPlay = false, fillContainer = false, controls = true, rotation = 0 }, ref) {
+  function VideoPlayer({ media, startTime = 0, onTimeUpdate, autoPlay = false, fillContainer = false, controls = true, rotation = 0, onSubtitleStatusChange }, ref) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const hlsRef = useRef<Hls | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
+    const trackRef = useRef<HTMLTrackElement>(null);
     const networkRetryRef = useRef(0);
     const mediaRetryRef = useRef(0);
     const proxyAttemptedRef = useRef(false);
     const mountedRef = useRef(true);
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+    const [subtitleStatus, setSubtitleStatus] = useState<SubtitleStatusResponse | null>(null);
+    /**
+     * 当前激活的字幕行（可能多 cue 同时显示）。
+     * 与后端 VTT 写入约定对齐：每个 cue payload 第 1 行为译文，第 2 行（可选）为原文。
+     */
+    const [activeCues, setActiveCues] = useState<Array<{ translated: string; source: string }>>([]);
+    // 字幕外观设置（来自持久化的 zustand store）
+    const subtitleSettings = useSubtitleSettingsStore();
     const {
       setPlaying,
       setCurrentTime,
@@ -364,6 +381,82 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(
       return () => observer.disconnect();
     }, [fillContainer]);
 
+    // 字幕状态轮询：进入页面立即拉一次，未完成时每 5s 重试，DONE 后停止
+    useEffect(() => {
+      let cancelled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      async function fetchStatus() {
+        try {
+          const status = await subtitleApi.getStatus(media.id);
+          if (cancelled) return;
+          setSubtitleStatus(status);
+          onSubtitleStatusChange?.(status);
+          // PENDING / RUNNING 状态继续轮询
+          if (status.status === 'PENDING' || status.status === 'RUNNING') {
+            timer = setTimeout(fetchStatus, 5000);
+          }
+        } catch {
+          // 字幕功能未启用或网络错误：静默
+          if (!cancelled) onSubtitleStatusChange?.(null);
+        }
+      }
+
+      fetchStatus();
+      return () => {
+        cancelled = true;
+        if (timer) clearTimeout(timer);
+      };
+    }, [media.id, onSubtitleStatusChange]);
+
+    // 接管字幕渲染：把原生 track 设为 hidden 模式（关闭浏览器默认渲染），
+    // 自己监听 cuechange 把当前 cue 文本拼起来交给自定义渲染层
+    useEffect(() => {
+      const trackEl = trackRef.current;
+      if (!trackEl) {
+        setActiveCues([]);
+        return;
+      }
+      const textTrack = trackEl.track;
+      if (!textTrack) return;
+
+      // hidden：仍触发 cuechange 但不渲染默认字幕；disabled 不会触发事件
+      textTrack.mode = subtitleSettings.enabled ? 'hidden' : 'disabled';
+
+      if (!subtitleSettings.enabled) {
+        setActiveCues([]);
+        return;
+      }
+
+      const handleCueChange = () => {
+        const cues = textTrack.activeCues;
+        if (!cues || cues.length === 0) {
+          setActiveCues([]);
+          return;
+        }
+        const items: Array<{ translated: string; source: string }> = [];
+        for (let i = 0; i < cues.length; i++) {
+          const cue = cues[i] as VTTCue;
+          if (!cue.text) continue;
+          // 后端 writeVTT 约定：第 1 行 = 译文，第 2 行 = 原文（如有且与译文不同）。
+          // 旧字幕（仅译文）天然兼容 —— split 后 source 为 ''。
+          const lines = cue.text.split('\n').map((s) => s.trim()).filter(Boolean);
+          const translated = lines[0] ?? '';
+          const source = lines.slice(1).join(' ');
+          if (translated) items.push({ translated, source });
+        }
+        setActiveCues(items);
+      };
+
+      textTrack.addEventListener('cuechange', handleCueChange);
+      // 立即同步一次，避免在切换 enabled 时漏掉当前正在显示的字幕
+      handleCueChange();
+
+      return () => {
+        textTrack.removeEventListener('cuechange', handleCueChange);
+      };
+    }, [subtitleSettings.enabled, subtitleStatus?.vttUrl]);
+
     const isRotatedQuarter = rotation === 90 || rotation === 270;
     const rotatedStyle: React.CSSProperties | undefined = fillContainer && rotation !== 0
       ? {
@@ -377,6 +470,41 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(
         }
       : undefined;
 
+    const showSubtitleOverlay =
+      subtitleSettings.enabled &&
+      subtitleStatus?.status === 'DONE' &&
+      !!subtitleStatus.vttUrl &&
+      activeCues.length > 0;
+
+    // 字幕样式：1rem 作为基准（容器 vw 计算后），fontSize 是百分比缩放
+    const subtitleTextStyle: React.CSSProperties = {
+      color: colorWithOpacity(subtitleSettings.textColor, subtitleSettings.textOpacity),
+      fontSize: `calc(min(4vw, 28px) * ${subtitleSettings.fontSize / 100})`,
+      fontWeight: subtitleSettings.fontWeight,
+      textShadow: edgeStyleToTextShadow(subtitleSettings.edgeStyle),
+      lineHeight: 1.3,
+      whiteSpace: 'pre-line',
+      wordBreak: 'break-word',
+    };
+
+    // 原文行：字号略小、颜色稍暗、字重还原为 normal，避免抢主字幕视线
+    const subtitleSourceStyle: React.CSSProperties = {
+      ...subtitleTextStyle,
+      fontSize: `calc(min(4vw, 28px) * ${subtitleSettings.fontSize / 100} * 0.82)`,
+      fontWeight: 'normal',
+      opacity: 0.85,
+      marginTop: '0.15em',
+    };
+
+    // 背景仅在有不透明度时渲染，避免空 padding 影响视觉
+    const subtitleBgStyle: React.CSSProperties = subtitleSettings.bgOpacity > 0
+      ? {
+          backgroundColor: colorWithOpacity(subtitleSettings.bgColor, subtitleSettings.bgOpacity),
+          padding: '0.15em 0.6em',
+          borderRadius: '4px',
+        }
+      : {};
+
     return (
       <div ref={containerRef} className={fillContainer ? "relative bg-black w-full h-full overflow-hidden" : "relative bg-black rounded-lg overflow-hidden"}>
         <video
@@ -385,7 +513,42 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(
           style={rotatedStyle}
           controls={controls}
           playsInline
-        />
+        >
+          {/* 字幕 VTT 走同源签名 URL，无需 crossOrigin；不会影响 HLS 播放
+              注意：不再使用 default，由副作用根据用户开关切换 mode=hidden/disabled，
+              改用自定义渲染层显示字幕文本，方便用户自定义大小/颜色/背景透明度等。 */}
+          {subtitleStatus?.status === 'DONE' && subtitleStatus.vttUrl && (
+            <track
+              ref={trackRef}
+              key={subtitleStatus.vttUrl}
+              kind="subtitles"
+              src={subtitleStatus.vttUrl}
+              srcLang={subtitleStatus.targetLang || 'zh'}
+              label="中文（机翻）"
+            />
+          )}
+        </video>
+
+        {/* 自定义字幕渲染层；与原生 controls 互不干扰：
+            - controls=true 时浏览器原生控制条会盖在最上方，自定义字幕也在 video 上方
+            - controls=false 时由 PlayerControls 渲染，bottomOffset 由用户控制以避开按钮 */}
+        {showSubtitleOverlay && (
+          <div
+            className="absolute left-0 right-0 z-[8] flex flex-col items-center pointer-events-none px-4 text-center gap-1"
+            style={{ bottom: `${subtitleSettings.bottomOffset}%` }}
+          >
+            {activeCues.map((item, idx) => (
+              <div key={idx} className="flex flex-col items-center max-w-full">
+                {/* 主字幕（译文，或回退后的原文） */}
+                <div style={{ ...subtitleTextStyle, ...subtitleBgStyle }}>{item.translated}</div>
+                {/* 原文行：仅当用户开启 showOriginal 且该 cue 含独立原文时才渲染 */}
+                {subtitleSettings.showOriginal && item.source && (
+                  <div style={{ ...subtitleSourceStyle, ...subtitleBgStyle }}>{item.source}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   }

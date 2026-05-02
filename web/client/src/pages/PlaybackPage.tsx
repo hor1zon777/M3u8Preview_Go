@@ -9,6 +9,7 @@ import { PlayerControls } from '../components/player/PlayerControls.js';
 import { QualitySelector } from '../components/media/QualitySelector.js';
 import { useWatchProgress } from '../hooks/useWatchProgress.js';
 import { setPendingScrollRestore } from '../lib/utils.js';
+import type { SubtitleStatusResponse } from '@m3u8-preview/shared';
 
 const OVERLAY_TIMEOUT = 3000;
 
@@ -19,6 +20,7 @@ export function PlaybackPage() {
   const queryClient = useQueryClient();
   const [overlayVisible, setOverlayVisible] = useState(true);
   const [rotation, setRotation] = useState<0 | 90 | 180 | 270>(0);
+  const [subtitleStatus, setSubtitleStatus] = useState<SubtitleStatusResponse | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const lastPointerTypeRef = useRef<'mouse' | 'touch' | 'pen'>('mouse');
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -223,6 +225,7 @@ export function PlaybackPage() {
           fillContainer
           controls={false}
           rotation={rotation}
+          onSubtitleStatusChange={setSubtitleStatus}
         />
       ) : (
         <div className="w-full h-full flex items-center justify-center">
@@ -272,6 +275,7 @@ export function PlaybackPage() {
           onDragStateChange={handleDragStateChange}
           rotation={rotation}
           onRotate={() => setRotation((r) => ((r + 90) % 360) as 0 | 90 | 180 | 270)}
+          subtitleAvailable={subtitleStatus?.status === 'DONE' && !!subtitleStatus.vttUrl}
         />
       </div>
     </div>

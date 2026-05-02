@@ -48,6 +48,9 @@ type Deps struct {
 
 	// 阶段 H 后注入
 	ProxySvc *service.ProxyService
+
+	// 字幕模块（可选；cfg.Subtitle.Enabled=false 时为 nil）
+	SubtitleSvc *service.SubtitleService
 }
 
 // NewDeps 构造跨请求 singleton。
@@ -314,6 +317,53 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	backupSSE := v1.Group("/admin/backup")
 	backupSSE.Use(middleware.AuthenticateSSE(authDeps), requireAdmin)
 	backupH.RegisterSSE(backupSSE)
+
+	// ---- 字幕模块（可选）----
+	// 仅在 cfg.Subtitle.Enabled=true 时启动 worker。
+	// 即使禁用，路由也注册（返回 disabled 占位响应），方便前端做 UI 一致性。
+	asrClient := service.NewWhisperCppASR(
+		cfg.Subtitle.WhisperBin,
+		cfg.Subtitle.WhisperModel,
+		cfg.Subtitle.WhisperLanguage,
+		cfg.Subtitle.WhisperThreads,
+	)
+	translator := service.NewOpenAICompatibleTranslator(
+		cfg.Subtitle.TranslateBaseURL,
+		cfg.Subtitle.TranslateAPIKey,
+		cfg.Subtitle.TranslateModel,
+		cfg.Subtitle.MaxRetries,
+	)
+	subtitleSvc := service.NewSubtitleService(db, &cfg.Subtitle, asrClient, translator, deps.Proxy)
+	if err := subtitleSvc.Start(); err != nil {
+		// 启动失败不阻断整个 server；handler 仍会返回 disabled
+		log.Printf("[subtitle] start failed: %v (feature disabled)", err)
+	}
+	deps.SubtitleSvc = subtitleSvc
+
+	// 把字幕生命周期钩子注入 MediaService（创建/删除媒体时联动）
+	mediaSvc.SetLifecycleHooks(subtitleSvc.HookOnMediaCreated, subtitleSvc.HookOnMediaDeleted)
+
+	subtitleH := handler.NewSubtitleHandler(subtitleSvc)
+
+	// 公开 VTT 端点：不挂 Authenticate（<track> 请求不携带 Bearer），仅靠 HMAC 签名鉴权
+	subtitleVTT := v1.Group("/subtitle")
+	subtitleH.RegisterPublic(subtitleVTT)
+
+	// 状态查询端点：需登录
+	subtitlePublic := v1.Group("/subtitle")
+	subtitlePublic.Use(middleware.Authenticate(authDeps))
+	subtitleH.RegisterAuthed(subtitlePublic)
+
+	// admin 端点
+	subtitleAdmin := v1.Group("/admin/subtitle")
+	subtitleAdmin.Use(middleware.Authenticate(authDeps), requireAdmin)
+	subtitleH.RegisterAdmin(subtitleAdmin)
+
+	// 远程字幕 worker 端点：独立鉴权（mwt_xxx Bearer token），与 user JWT 解耦
+	subtitleWorkerH := handler.NewSubtitleWorkerHandler(subtitleSvc)
+	workerGroup := v1.Group("/worker")
+	workerGroup.Use(middleware.RequireWorkerAuth(db))
+	subtitleWorkerH.Register(workerGroup)
 
 	r.NoRoute(spaFallback(cfg))
 
