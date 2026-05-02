@@ -91,7 +91,6 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 
 	r.Use(gin.Logger())
 	r.Use(middleware.Recovery())
-	r.Use(middleware.ErrorHandler(cfg.NodeEnv == "production"))
 
 	captchaSvc := service.NewCaptchaService(db, extractHostnames(cfg.CORS.Origins))
 	r.Use(secureHeaders(captchaSvc))
@@ -110,6 +109,14 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
+
+	// ErrorHandler 必须放在 gzip 之后注册：post-Next 顺序与注册顺序相反，
+	// 这样 ErrorHandler 的"读 c.Errors → 写 429 JSON"在 gzip 的 defer 之前执行。
+	// 否则 gzip@v1.2.6 的 defer 会在 buffer 为空时调用
+	// gw.ResponseWriter.Write(empty) → 触发 WriteHeaderNow 把默认 200 状态码刷出去，
+	// ErrorHandler 再检查 c.Writer.Written() 时已是 true，被迫跳过写响应，
+	// 导致限流 / 业务错误最终被吞成 200 空 body（前端解析失败显示"无法获取登录挑战"等）。
+	r.Use(middleware.ErrorHandler(cfg.NodeEnv == "production"))
 
 	// /uploads 静态文件服务
 	r.GET("/uploads/*filepath", func(c *gin.Context) {
