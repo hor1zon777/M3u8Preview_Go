@@ -92,7 +92,7 @@ func (s *SubtitleService) RegisterWorker(tokenID string, req dto.WorkerRegisterR
 	return &dto.WorkerRegisterResponse{
 		WorkerID:             req.WorkerID,
 		ServerTime:           now.UnixMilli(),
-		WorkerStaleThreshold: int64(s.cfg.WorkerStaleThreshold.Seconds()),
+		WorkerStaleThreshold: int64(s.snap().WorkerStaleThreshold.Seconds()),
 	}, nil
 }
 
@@ -196,8 +196,9 @@ func (s *SubtitleService) ClaimNextJob(workerID string) (*dto.WorkerClaimedJob, 
 // 任一超额或查询失败都返回 false，让 worker 自然 sleep 重试。
 // 失败时记录日志但不阻塞业务（保守策略：宁可让任务停一会儿也不打垮上游）。
 func (s *SubtitleService) checkClaimLimits(workerID string) bool {
+	cur := s.snap()
 	// 1) 全局上限
-	if s.cfg.GlobalMaxConcurrency > 0 {
+	if cur.GlobalMaxConcurrency > 0 {
 		var running int64
 		if err := s.db.Model(&model.SubtitleJob{}).
 			Where("status = ?", model.SubtitleStatusRunning).
@@ -205,7 +206,7 @@ func (s *SubtitleService) checkClaimLimits(workerID string) bool {
 			log.Printf("[subtitle/worker] count global running failed: %v", err)
 			return false
 		}
-		if running >= int64(s.cfg.GlobalMaxConcurrency) {
+		if running >= int64(cur.GlobalMaxConcurrency) {
 			return false
 		}
 	}
@@ -306,7 +307,7 @@ func (s *SubtitleService) WorkerComplete(jobID string, meta dto.WorkerCompleteMe
 
 	// 写 VTT 文件（先 .tmp 后 rename，原子落盘）
 	relPath := job.MediaID + ".vtt"
-	absPath := filepath.Join(s.cfg.SubtitlesDir, relPath)
+	absPath := filepath.Join(s.snap().SubtitlesDir, relPath)
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir subtitles: %w", err)
 	}
@@ -408,7 +409,8 @@ func (s *SubtitleService) runStaleRecoveryLoop() {
 
 // recoverStaleJobsOnce 单次扫描 + 重置。
 func (s *SubtitleService) recoverStaleJobsOnce() {
-	threshold := time.Now().Add(-s.cfg.WorkerStaleThreshold)
+	staleThreshold := s.snap().WorkerStaleThreshold
+	threshold := time.Now().Add(-staleThreshold)
 
 	var stale []model.SubtitleJob
 	// 两类需要回收的：
@@ -440,13 +442,13 @@ func (s *SubtitleService) recoverStaleJobsOnce() {
 			"claimed_by":        "",
 			"claimed_at":        nil,
 			"last_heartbeat_at": nil,
-			"error_msg":         fmt.Sprintf("worker stale (no heartbeat in %s), reset to PENDING", s.cfg.WorkerStaleThreshold),
+			"error_msg":         fmt.Sprintf("worker stale (no heartbeat in %s), reset to PENDING", staleThreshold),
 		})
 	if res.Error != nil {
 		log.Printf("[subtitle/worker] stale reset failed: %v", res.Error)
 		return
 	}
-	log.Printf("[subtitle/worker] reset %d stale RUNNING jobs (threshold=%s)", res.RowsAffected, s.cfg.WorkerStaleThreshold)
+	log.Printf("[subtitle/worker] reset %d stale RUNNING jobs (threshold=%s)", res.RowsAffected, staleThreshold)
 }
 
 // === Admin 用 ===
@@ -461,7 +463,7 @@ func (s *SubtitleService) ListOnlineWorkers() ([]dto.SubtitleWorkerItem, error) 
 		return nil, fmt.Errorf("list workers: %w", err)
 	}
 
-	onlineCutoff := time.Now().Add(-s.cfg.WorkerStaleThreshold)
+	onlineCutoff := time.Now().Add(-s.snap().WorkerStaleThreshold)
 	out := make([]dto.SubtitleWorkerItem, 0, len(workers))
 	for _, w := range workers {
 		out = append(out, dto.SubtitleWorkerItem{

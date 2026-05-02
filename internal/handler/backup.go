@@ -49,6 +49,8 @@ func (h *BackupHandler) RegisterSSE(rg *gin.RouterGroup) {
 // exportDirect 同步打包 ZIP 到临时文件再返回，确保出错时不返回损坏数据。
 func (h *BackupHandler) exportDirect(c *gin.Context) {
 	includePosters := c.Query("includePosters") != "false"
+	// 默认不含字幕：VTT 体积可观且大多数恢复场景不需要旧字幕（重新跑 ASR 即可）。
+	includeSubtitles := c.Query("includeSubtitles") == "true"
 	timestamp := nowISO()
 	filename := "backup-" + timestamp + ".zip"
 
@@ -59,7 +61,7 @@ func (h *BackupHandler) exportDirect(c *gin.Context) {
 	}
 	defer func() { _ = os.Remove(tmp.Name()) }()
 
-	if err := h.svc.ExportToStream(tmp, includePosters); err != nil {
+	if err := h.svc.ExportToStream(tmp, includePosters, includeSubtitles); err != nil {
 		_ = tmp.Close()
 		_ = c.Error(err)
 		return
@@ -74,6 +76,7 @@ func (h *BackupHandler) exportDirect(c *gin.Context) {
 // 客户端断开时 (c.Request.Context().Done()) 立即中止，避免白跑完整 DB 扫描 + ZIP 打包。
 func (h *BackupHandler) exportStream(c *gin.Context) {
 	includePosters := c.Query("includePosters") != "false"
+	includeSubtitles := c.Query("includeSubtitles") == "true"
 	setupSSEHeaders(c)
 	ctx := c.Request.Context()
 
@@ -104,7 +107,7 @@ func (h *BackupHandler) exportStream(c *gin.Context) {
 		c.Writer.Flush()
 	}
 
-	_, _, err := h.svc.ExportToFile(includePosters, func(p service.ExportProgress) {
+	_, _, err := h.svc.ExportToFile(includePosters, includeSubtitles, func(p service.ExportProgress) {
 		send(p)
 	})
 	if cancelled {

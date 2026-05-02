@@ -5,6 +5,7 @@ import type {
   SubtitleStatusResponse,
   SubtitleJob,
   SubtitleSettings,
+  SubtitleSettingsUpdate,
   SubtitleQueueStatus,
   SubtitleBatchRegenerateRequest,
   SubtitleBatchRegenerateResponse,
@@ -73,6 +74,19 @@ export const subtitleApi = {
 
   async settings(): Promise<SubtitleSettings> {
     const { data } = await api.get<ApiResponse<SubtitleSettings>>('/admin/subtitle/settings');
+    return data.data!;
+  },
+
+  /**
+   * 更新字幕配置（管理员网页端编辑）。
+   * 服务端会校验线程数 / 批大小范围与翻译 baseURL 格式，校验失败抛 400。
+   * 翻译 API Key 若是脱敏占位（含 "***"）会被服务端忽略，不会覆盖真实值。
+   */
+  async updateSettings(payload: SubtitleSettingsUpdate): Promise<SubtitleSettings> {
+    const { data } = await api.put<ApiResponse<SubtitleSettings>>(
+      '/admin/subtitle/settings',
+      payload,
+    );
     return data.data!;
   },
 

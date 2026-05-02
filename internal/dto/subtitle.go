@@ -90,6 +90,30 @@ type SubtitleSettingsResponse struct {
 	BatchSize        int    `json:"batchSize"`
 }
 
+// SubtitleSettingsUpdateRequest admin 面板提交的字幕配置 patch。
+//
+// 全部字段使用指针：
+//   - nil 表示 "不修改"
+//   - 字符串字段允许传空串表示"清除/恢复默认"
+//   - 翻译 API Key 字段若包含 "***"（脱敏占位）会被 service 忽略，
+//     避免前端展示脱敏值后误覆盖真实 key
+//
+// 持久化到 system_settings 后立即对后续 ASR / 翻译调用生效；
+// LocalWorkerEnabled / WorkerStaleThreshold 等部署相关字段不在此处修改。
+type SubtitleSettingsUpdateRequest struct {
+	Enabled          *bool   `json:"enabled,omitempty"`
+	AutoGenerate     *bool   `json:"autoGenerate,omitempty"`
+	WhisperBin       *string `json:"whisperBin,omitempty"`
+	WhisperModel     *string `json:"whisperModel,omitempty"`
+	WhisperLanguage  *string `json:"whisperLanguage,omitempty"`
+	WhisperThreads   *int    `json:"whisperThreads,omitempty"`
+	TranslateBaseURL *string `json:"translateBaseUrl,omitempty"`
+	TranslateModel   *string `json:"translateModel,omitempty"`
+	TranslateAPIKey  *string `json:"translateApiKey,omitempty"`
+	TargetLang       *string `json:"targetLang,omitempty"`
+	BatchSize        *int    `json:"batchSize,omitempty"`
+}
+
 // SubtitleQueueStatus 队列概况，admin 顶部 dashboard 用。
 type SubtitleQueueStatus struct {
 	Pending  int64 `json:"pending"`

@@ -458,6 +458,32 @@ export interface SubtitleSettings {
   batchSize: number;
 }
 
+/**
+ * SubtitleSettingsUpdate admin 字幕配置 patch。
+ *
+ * 全部字段可选：
+ *   - undefined / 缺失 = 不修改
+ *   - 字符串字段允许传空串表示"清除/恢复默认"
+ *   - translateApiKey 若包含 "***"（脱敏占位）会被服务端忽略，
+ *     避免前端展示脱敏值后误覆盖真实 key
+ *
+ * LocalWorkerEnabled / WorkerStaleThreshold / GlobalMaxConcurrency 等
+ * 部署相关字段不在此处修改，仍由 .env 控制。
+ */
+export interface SubtitleSettingsUpdate {
+  enabled?: boolean;
+  autoGenerate?: boolean;
+  whisperBin?: string;
+  whisperModel?: string;
+  whisperLanguage?: string;
+  whisperThreads?: number;
+  translateBaseUrl?: string;
+  translateModel?: string;
+  translateApiKey?: string;
+  targetLang?: string;
+  batchSize?: number;
+}
+
 export interface SubtitleQueueStatus {
   pending: number;
   running: number;

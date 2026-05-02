@@ -56,6 +56,7 @@ func (h *SubtitleHandler) RegisterAdmin(rg *gin.RouterGroup) {
 	rg.GET("/jobs", h.listJobs)
 	rg.GET("/queue", h.queueStatus)
 	rg.GET("/settings", h.settings)
+	rg.PUT("/settings", h.updateSettings)
 	rg.POST("/jobs/batch-regenerate", h.batchRegenerate)
 	rg.GET("/jobs/:mediaId", h.getJob)
 	rg.POST("/jobs/:mediaId/retry", h.retry)
@@ -148,6 +149,23 @@ func (h *SubtitleHandler) queueStatus(c *gin.Context) {
 
 func (h *SubtitleHandler) settings(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.OK(h.svc.CurrentSettings()))
+}
+
+// updateSettings 接受 admin 提交的字幕配置 patch；
+// 校验失败返回 400，写库失败返回 500，成功回显新配置（脱敏 api key）。
+func (h *SubtitleHandler) updateSettings(c *gin.Context) {
+	var req dto.SubtitleSettingsUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请求格式错误"))
+		return
+	}
+	resp, err := h.svc.UpdateSettings(req)
+	if err != nil {
+		// applySubtitlePatch 的校验错误是 user-facing，直接 400 回显
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, dto.OK(resp))
 }
 
 func (h *SubtitleHandler) getJob(c *gin.Context) {

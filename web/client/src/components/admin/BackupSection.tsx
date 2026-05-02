@@ -88,6 +88,8 @@ export function BackupSection() {
   const [showConfirm, setShowConfirm] = useState(false);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [includePosters, setIncludePosters] = useState(true);
+  // 默认不含字幕：VTT 体积可观且很多用户希望恢复后重新跑 ASR；勾选才打包 subtitle_jobs + .vtt 文件
+  const [includeSubtitles, setIncludeSubtitles] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState<string | null>(null);
@@ -140,13 +142,13 @@ export function BackupSection() {
     exportSmooth.push({ phase: 'db', message: '准备中...', current: 0, total: 0, percentage: 0 });
 
     const { abort } = adminApi.exportBackupWithProgress(
-      { includePosters },
+      { includePosters, includeSubtitles },
       (progress) => {
         exportSmooth.push(progress);
       },
     );
     abortRef.current = abort;
-  }, [includePosters, exportSmooth]);
+  }, [includePosters, includeSubtitles, exportSmooth]);
 
   const cancelExport = useCallback(() => {
     abortRef.current?.();
@@ -226,6 +228,18 @@ export function BackupSection() {
           />
           <span className="text-emby-text-secondary text-sm">包含封面图片</span>
           <span className="text-emby-text-muted text-xs">（不勾选可显著减小备份体积）</span>
+        </label>
+
+        <label className="mt-2 flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={includeSubtitles}
+            onChange={(e) => setIncludeSubtitles(e.target.checked)}
+            disabled={isExporting}
+            className="w-4 h-4 rounded border-emby-border-subtle bg-emby-bg-input text-emby-green focus:ring-emby-green focus:ring-offset-0"
+          />
+          <span className="text-emby-text-secondary text-sm">包含字幕（VTT）</span>
+          <span className="text-emby-text-muted text-xs">（含字幕任务记录与已生成的 .vtt 文件）</span>
         </label>
 
         <div className="mt-3 flex items-center gap-2">

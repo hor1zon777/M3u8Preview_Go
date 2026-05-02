@@ -37,10 +37,13 @@ export const adminApi = {
     await api.put('/admin/settings', { key, value });
   },
 
-  async exportBackup(options?: { includePosters?: boolean }) {
+  async exportBackup(options?: { includePosters?: boolean; includeSubtitles?: boolean }) {
     const params = new URLSearchParams();
     if (options?.includePosters === false) {
       params.set('includePosters', 'false');
+    }
+    if (options?.includeSubtitles === true) {
+      params.set('includeSubtitles', 'true');
     }
     const query = params.toString();
     const url = `/admin/backup/export${query ? `?${query}` : ''}`;
@@ -66,12 +69,15 @@ export const adminApi = {
   },
 
   exportBackupWithProgress(
-    options: { includePosters?: boolean },
+    options: { includePosters?: boolean; includeSubtitles?: boolean },
     onProgress: (progress: ExportProgress) => void,
   ): { abort: () => void } {
     const params = new URLSearchParams();
     if (options.includePosters === false) {
       params.set('includePosters', 'false');
+    }
+    if (options.includeSubtitles === true) {
+      params.set('includeSubtitles', 'true');
     }
 
     let eventSource: EventSource | null = null;

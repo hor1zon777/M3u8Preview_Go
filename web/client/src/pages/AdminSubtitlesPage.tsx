@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Subtitles,
@@ -14,10 +15,12 @@ import {
   PauseCircle,
   Play,
   X,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { subtitleApi } from '../services/subtitleApi.js';
 import { categoryApi } from '../services/categoryApi.js';
-import type { SubtitleJob, SubtitleStatus } from '@m3u8-preview/shared';
+import type { SubtitleJob, SubtitleStatus, SubtitleSettings, SubtitleSettingsUpdate } from '@m3u8-preview/shared';
 import { SubtitleWorkersPanel } from '../components/admin/SubtitleWorkersPanel.js';
 
 const STATUS_FILTERS: Array<{ value: string; label: string }> = [
@@ -213,7 +216,7 @@ export function AdminSubtitlesPage() {
       {settings && !settings.enabled && (
         <div className="mb-6 px-4 py-3 rounded-md bg-yellow-900/30 border border-yellow-700/50 text-sm text-yellow-300 flex items-center gap-2">
           <AlertCircle className="w-4 h-4" />
-          字幕功能未启用，请设置 <code className="px-1 rounded bg-black/40">SUBTITLE_ENABLED=true</code> 并提供 whisper.cpp 二进制 / 模型 / 翻译 API 配置后重启服务。
+          字幕功能未启用，点击右上角"配置"打开设置面板，开启"启用"开关并填写 whisper.cpp / 翻译 API 配置后保存即可生效。
         </div>
       )}
 
@@ -547,34 +550,17 @@ export function AdminSubtitlesPage() {
         </Modal>
       )}
 
-      {/* 配置弹窗 */}
+      {/* 配置弹窗：可编辑表单 */}
       {showSettings && settings && (
-        <Modal onClose={() => setShowSettings(false)} title="字幕配置（环境变量回显）">
-          <div className="grid grid-cols-2 gap-3 text-sm">
-            <SettingsRow label="启用" value={settings.enabled ? '是' : '否'} />
-            <SettingsRow label="自动生成" value={settings.autoGenerate ? '是' : '否'} />
-            <SettingsRow label="Whisper 二进制" value={settings.whisperBin || '(未设置)'} mono />
-            <SettingsRow label="Whisper 模型" value={settings.whisperModel || '(未设置)'} mono />
-            <SettingsRow label="源语言" value={settings.whisperLanguage} />
-            <SettingsRow label="目标语言" value={settings.targetLang} />
-            <SettingsRow label="CPU 线程" value={settings.whisperThreads === 0 ? '自动' : String(settings.whisperThreads)} />
-            <SettingsRow label="批大小" value={String(settings.batchSize)} />
-            <SettingsRow label="翻译 baseURL" value={settings.translateBaseUrl || '(未设置)'} mono />
-            <SettingsRow label="翻译模型" value={settings.translateModel || '(未设置)'} mono />
-            <SettingsRow label="翻译 API Key" value={settings.translateApiKey || '(未设置)'} mono />
-          </div>
-          <p className="text-xs text-emby-text-muted mt-4">
-            修改配置需要在 <code className="px-1 rounded bg-black/40">.env</code> 中调整后重启服务。
-          </p>
-          <div className="flex justify-end pt-3">
-            <button
-              onClick={() => setShowSettings(false)}
-              className="px-3 py-1.5 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated text-sm"
-            >
-              关闭
-            </button>
-          </div>
-        </Modal>
+        <SubtitleSettingsModal
+          settings={settings}
+          onClose={() => setShowSettings(false)}
+          onSaved={(next) => {
+            // 用新配置主动更新缓存，避免等下一次 5s 轮询
+            queryClient.setQueryData(['admin', 'subtitle', 'settings'], next);
+            queryClient.invalidateQueries({ queryKey: ['admin', 'subtitle'] });
+          }}
+        />
       )}
     </div>
   );
@@ -627,29 +613,327 @@ function ProgressBar({ value, status }: { value: number; status: SubtitleStatus 
 }
 
 function Modal({ children, onClose, title }: { children: React.ReactNode; onClose: () => void; title: string }) {
-  return (
+  // 弹窗本身负责滚动：
+  //   - 外层遮罩 fixed inset-0 + flex 居中，确保弹窗永远在视口内
+  //   - 弹窗最大高度 calc(100vh-2rem)，flex 列布局
+  //   - 标题栏 flex-shrink-0：始终钉在弹窗顶部，不随内容滚动
+  //   - 内容区 flex-1 overflow-y-auto min-h-0：撑满剩余高度，超出时
+  //     在弹窗内部出现滚动条（不污染浏览器主滚动条，也不再"漏到黑框上"）
+  //
+  // min-h-0 必不可少：flex 子元素默认 min-height: auto，
+  // 不显式覆盖会让 overflow-y-auto 失效（容器被内容撑高 → 永不滚动）。
+  //
+  // 用 createPortal 挂到 body：避开父级的 positioning / transform / overflow context，
+  // 防止弹窗在某些页面下被截断或定位偏移。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center px-4"
+      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4"
       onClick={onClose}
     >
       <div
-        className="bg-emby-bg-dialog border border-emby-border rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] overflow-y-auto"
+        className="bg-emby-bg-dialog border border-emby-border rounded-lg shadow-xl w-full max-w-2xl max-h-[calc(100vh-2rem)] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="px-5 py-3 border-b border-emby-border">
+        <div className="px-5 py-3 border-b border-emby-border flex-shrink-0">
           <h3 className="text-white font-medium">{title}</h3>
         </div>
-        <div className="px-5 py-4">{children}</div>
+        <div className="px-5 py-4 overflow-y-auto flex-1 min-h-0">
+          {children}
+        </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
-function SettingsRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+function SubtitleSettingsModal({
+  settings,
+  onClose,
+  onSaved,
+}: {
+  settings: SubtitleSettings;
+  onClose: () => void;
+  onSaved: (next: SubtitleSettings) => void;
+}) {
+  // 受控表单。初始值用服务端最新配置；翻译 API Key 字段保留服务端脱敏占位，
+  // 用户没改时不会回传，避免覆盖真实值（service 端也对 "***" 做了忽略保护）。
+  const [enabled, setEnabled] = useState(settings.enabled);
+  const [autoGenerate, setAutoGenerate] = useState(settings.autoGenerate);
+  const [whisperBin, setWhisperBin] = useState(settings.whisperBin);
+  const [whisperModel, setWhisperModel] = useState(settings.whisperModel);
+  const [whisperLanguage, setWhisperLanguage] = useState(settings.whisperLanguage);
+  const [whisperThreadsRaw, setWhisperThreadsRaw] = useState(String(settings.whisperThreads ?? 0));
+  const [translateBaseUrl, setTranslateBaseUrl] = useState(settings.translateBaseUrl);
+  const [translateModel, setTranslateModel] = useState(settings.translateModel);
+  const [translateApiKey, setTranslateApiKey] = useState(settings.translateApiKey);
+  const [targetLang, setTargetLang] = useState(settings.targetLang);
+  const [batchSizeRaw, setBatchSizeRaw] = useState(String(settings.batchSize ?? 8));
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [apiKeyTouched, setApiKeyTouched] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const saveMutation = useMutation({
+    mutationFn: (payload: SubtitleSettingsUpdate) => subtitleApi.updateSettings(payload),
+    onSuccess: (next) => {
+      onSaved(next);
+      onClose();
+    },
+    onError: (err: unknown) => {
+      // axios error 默认带 response.data.error 字段；做一次温和取值
+      const e = err as { response?: { data?: { error?: string } }; message?: string };
+      setError(e?.response?.data?.error ?? e?.message ?? '保存失败');
+    },
+  });
+
+  function buildPatch(): SubtitleSettingsUpdate | null {
+    const patch: SubtitleSettingsUpdate = {};
+
+    // 仅在和服务端值不同的字段加入 patch，减少误覆盖
+    if (enabled !== settings.enabled) patch.enabled = enabled;
+    if (autoGenerate !== settings.autoGenerate) patch.autoGenerate = autoGenerate;
+    if (whisperBin !== settings.whisperBin) patch.whisperBin = whisperBin;
+    if (whisperModel !== settings.whisperModel) patch.whisperModel = whisperModel;
+    if (whisperLanguage !== settings.whisperLanguage) patch.whisperLanguage = whisperLanguage;
+    if (translateBaseUrl !== settings.translateBaseUrl) patch.translateBaseUrl = translateBaseUrl;
+    if (translateModel !== settings.translateModel) patch.translateModel = translateModel;
+    if (targetLang !== settings.targetLang) patch.targetLang = targetLang;
+
+    const threads = Number.parseInt(whisperThreadsRaw, 10);
+    if (Number.isFinite(threads)) {
+      if (threads < 0 || threads > 64) {
+        setError('CPU 线程数应在 0-64 之间');
+        return null;
+      }
+      if (threads !== settings.whisperThreads) patch.whisperThreads = threads;
+    }
+    const batch = Number.parseInt(batchSizeRaw, 10);
+    if (Number.isFinite(batch)) {
+      if (batch < 1 || batch > 50) {
+        setError('批大小应在 1-50 之间');
+        return null;
+      }
+      if (batch !== settings.batchSize) patch.batchSize = batch;
+    }
+
+    // 仅在用户主动改过 API Key 输入框时才发送（避免脱敏占位被回传）
+    if (apiKeyTouched) {
+      patch.translateApiKey = translateApiKey;
+    }
+    return patch;
+  }
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    const patch = buildPatch();
+    if (!patch) return;
+    if (Object.keys(patch).length === 0) {
+      onClose();
+      return;
+    }
+    saveMutation.mutate(patch);
+  }
+
   return (
-    <>
-      <div className="text-emby-text-secondary">{label}</div>
-      <div className={`text-white break-all ${mono ? 'font-mono text-xs' : ''}`}>{value}</div>
-    </>
+    <Modal onClose={onClose} title="字幕配置（网页编辑）">
+      <form onSubmit={handleSubmit} className="space-y-4 text-sm">
+        {/* 开关组 */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <ToggleRow label="启用字幕生成" hint="关闭后所有字幕端点返回 503，worker 不消费任务" checked={enabled} onChange={setEnabled} />
+          <ToggleRow label="自动为新媒体生成" hint="新建媒体时自动入队；启用本开关也会立即扫描存量 ACTIVE 媒体" checked={autoGenerate} onChange={setAutoGenerate} />
+        </div>
+
+        {/* Whisper.cpp */}
+        <fieldset className="border border-emby-border rounded-md p-3 space-y-3">
+          <legend className="px-2 text-xs text-emby-text-secondary">whisper.cpp（本地 ASR）</legend>
+          <FieldRow label="二进制路径" hint="留空恢复默认 whisper-cli">
+            <input
+              type="text"
+              value={whisperBin}
+              onChange={(e) => setWhisperBin(e.target.value)}
+              placeholder="whisper-cli"
+              className={inputCls}
+            />
+          </FieldRow>
+          <FieldRow label="GGML 模型路径" hint="例如 /opt/whisper-models/ggml-medium-q5_0.bin">
+            <input
+              type="text"
+              value={whisperModel}
+              onChange={(e) => setWhisperModel(e.target.value)}
+              placeholder="/path/to/ggml-medium-q5_0.bin"
+              className={inputCls}
+            />
+          </FieldRow>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <FieldRow label="源语言" hint="ISO-639-1，例如 ja / en / zh">
+              <input
+                type="text"
+                value={whisperLanguage}
+                onChange={(e) => setWhisperLanguage(e.target.value)}
+                placeholder="ja"
+                className={inputCls}
+                maxLength={16}
+              />
+            </FieldRow>
+            <FieldRow label="CPU 线程" hint="0=自动按 NumCPU；最大 64">
+              <input
+                type="number"
+                min={0}
+                max={64}
+                value={whisperThreadsRaw}
+                onChange={(e) => setWhisperThreadsRaw(e.target.value)}
+                className={inputCls}
+              />
+            </FieldRow>
+          </div>
+        </fieldset>
+
+        {/* 翻译 */}
+        <fieldset className="border border-emby-border rounded-md p-3 space-y-3">
+          <legend className="px-2 text-xs text-emby-text-secondary">翻译（OpenAI 兼容 API）</legend>
+          <FieldRow label="baseURL" hint="不含 /v1，如 https://api.deepseek.com">
+            <input
+              type="url"
+              value={translateBaseUrl}
+              onChange={(e) => setTranslateBaseUrl(e.target.value)}
+              placeholder="https://api.deepseek.com"
+              className={inputCls}
+            />
+          </FieldRow>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <FieldRow label="模型名" hint="例如 deepseek-chat / qwen2.5-7b-instruct / gpt-4o-mini">
+              <input
+                type="text"
+                value={translateModel}
+                onChange={(e) => setTranslateModel(e.target.value)}
+                placeholder="deepseek-chat"
+                className={inputCls}
+              />
+            </FieldRow>
+            <FieldRow label="目标语言" hint="ISO-639-1，例如 zh / en">
+              <input
+                type="text"
+                value={targetLang}
+                onChange={(e) => setTargetLang(e.target.value)}
+                placeholder="zh"
+                className={inputCls}
+                maxLength={16}
+              />
+            </FieldRow>
+          </div>
+          <FieldRow label="API Key" hint="留空时保留旧值；未修改的脱敏占位会被自动忽略">
+            <div className="relative">
+              <input
+                type={showApiKey ? 'text' : 'password'}
+                value={translateApiKey}
+                onChange={(e) => {
+                  setTranslateApiKey(e.target.value);
+                  setApiKeyTouched(true);
+                }}
+                placeholder="sk-..."
+                autoComplete="new-password"
+                className={`${inputCls} pr-9`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowApiKey((v) => !v)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-emby-text-muted hover:text-emby-text-primary"
+                title={showApiKey ? '隐藏' : '显示'}
+              >
+                {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </FieldRow>
+          <FieldRow label="批大小" hint="一次请求翻译的字幕条数；1-50">
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={batchSizeRaw}
+              onChange={(e) => setBatchSizeRaw(e.target.value)}
+              className={inputCls}
+            />
+          </FieldRow>
+        </fieldset>
+
+        {error && (
+          <div className="px-3 py-2 rounded bg-red-900/30 border border-red-700/40 text-red-300 text-xs flex items-center gap-2">
+            <XCircle className="w-4 h-4 flex-shrink-0" />
+            {error}
+          </div>
+        )}
+
+        <p className="text-xs text-emby-text-muted">
+          配置即时生效，下一条字幕任务即应用新值；不会中断正在运行的任务。
+          部署相关字段（如本地 worker 开关、心跳超时）仍由 .env 控制。
+        </p>
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3 py-1.5 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated text-sm"
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            disabled={saveMutation.isPending}
+            className="px-3 py-1.5 rounded bg-emby-green text-white hover:bg-emby-green-dark disabled:opacity-40 disabled:cursor-not-allowed text-sm flex items-center gap-2"
+          >
+            {saveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+            保存
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+const inputCls =
+  'w-full px-3 py-1.5 bg-emby-bg-input border border-emby-border rounded text-white placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green text-sm';
+
+function FieldRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <div className="text-emby-text-secondary text-xs mb-1">{label}</div>
+      {children}
+      {hint && <div className="text-[11px] text-emby-text-muted mt-1">{hint}</div>}
+    </label>
+  );
+}
+
+function ToggleRow({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-3 px-3 py-2 rounded-md bg-emby-bg-input border border-emby-border cursor-pointer">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 w-4 h-4 accent-emby-green cursor-pointer"
+      />
+      <div className="flex-1">
+        <div className="text-white text-sm">{label}</div>
+        {hint && <div className="text-[11px] text-emby-text-muted mt-0.5">{hint}</div>}
+      </div>
+    </label>
   );
 }

@@ -304,7 +304,8 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	adminH.Register(adminGroup)
 
 	// ---- Backup 模块（阶段 I-2）----
-	backupSvc := service.NewBackupService(db, cfg.UploadsDir)
+	// 传入 SubtitlesDir 让 backup 服务能定位 VTT 文件（用户可能配置 SUBTITLE_DIR 指向 uploadsDir 外部）。
+	backupSvc := service.NewBackupService(db, cfg.UploadsDir, cfg.Subtitle.SubtitlesDir)
 	backupSvc.RegisterInvalidator(deps.RateLimitCache.Invalidate)
 	backupSvc.RegisterInvalidator(proxySvc.InvalidateExtensionsCache)
 	backupH := handler.NewBackupHandler(backupSvc)
@@ -321,19 +322,24 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	// ---- 字幕模块（可选）----
 	// 仅在 cfg.Subtitle.Enabled=true 时启动 worker。
 	// 即使禁用，路由也注册（返回 disabled 占位响应），方便前端做 UI 一致性。
-	asrClient := service.NewWhisperCppASR(
-		cfg.Subtitle.WhisperBin,
-		cfg.Subtitle.WhisperModel,
-		cfg.Subtitle.WhisperLanguage,
-		cfg.Subtitle.WhisperThreads,
-	)
-	translator := service.NewOpenAICompatibleTranslator(
-		cfg.Subtitle.TranslateBaseURL,
-		cfg.Subtitle.TranslateAPIKey,
-		cfg.Subtitle.TranslateModel,
-		cfg.Subtitle.MaxRetries,
-	)
-	subtitleSvc := service.NewSubtitleService(db, &cfg.Subtitle, asrClient, translator, deps.Proxy)
+	//
+	// 配置加载顺序：
+	//   1. .env 提供基线（兼容旧部署）
+	//   2. system_settings 中以 "subtitle.*" 前缀存储的覆盖值（admin 网页修改的运行时配置）
+	//   3. admin 后续通过 PUT /admin/subtitle/settings 修改时再次落 DB 并同步 in-memory
+	if err := service.LoadSubtitleOverrides(db, &cfg.Subtitle); err != nil {
+		log.Fatalf("[subtitle] load overrides: %v", err)
+	}
+
+	// asrFactory / translatorFactory 接受当前 cfg 快照按需构造客户端，让 admin 修改的
+	// whisper bin / model / 翻译 baseURL / API Key 立即对下一个 job 生效，无需重启服务。
+	asrFactory := func(snap config.SubtitleConfig) service.ASRClient {
+		return service.NewWhisperCppASR(snap.WhisperBin, snap.WhisperModel, snap.WhisperLanguage, snap.WhisperThreads)
+	}
+	translatorFactory := func(snap config.SubtitleConfig) service.Translator {
+		return service.NewOpenAICompatibleTranslator(snap.TranslateBaseURL, snap.TranslateAPIKey, snap.TranslateModel, snap.MaxRetries)
+	}
+	subtitleSvc := service.NewSubtitleService(db, &cfg.Subtitle, asrFactory, translatorFactory, deps.Proxy)
 	if err := subtitleSvc.Start(); err != nil {
 		// 启动失败不阻断整个 server；handler 仍会返回 disabled
 		log.Printf("[subtitle] start failed: %v (feature disabled)", err)

@@ -34,11 +34,15 @@ import (
 
 // SubtitleService 编排字幕生成。
 type SubtitleService struct {
-	db         *gorm.DB
-	cfg        *config.SubtitleConfig
-	asr        ASRClient
-	translator Translator
-	signer     *util.ProxySigner
+	db *gorm.DB
+	// cfgMu 保护 *cfg 的并发读写。所有读取请走 s.snap()；admin 写入必须持锁。
+	cfgMu sync.RWMutex
+	cfg   *config.SubtitleConfig
+	// asrFactory / translatorFactory 接受当前 cfg 快照构造客户端。
+	// 持久化配置改了后无需重启服务，processOne 每次跑都会从最新 cfg 实例化客户端。
+	asrFactory        func(cfg config.SubtitleConfig) ASRClient
+	translatorFactory func(cfg config.SubtitleConfig) Translator
+	signer            *util.ProxySigner
 
 	jobs        chan string // mediaID
 	stop        chan struct{}
@@ -48,23 +52,43 @@ type SubtitleService struct {
 	enqueuedIDs sync.Map // mediaID -> struct{} 防重复入队
 	ctx         context.Context
 	cancel      context.CancelFunc
+
+	// scanRunning 防止 admin 反复打开"启用"时多次并发扫描存量 media。
+	scanRunning atomic.Bool
 }
 
 // NewSubtitleService 构造。
 // 当 cfg.Enabled=false 时仍可构造但 worker 不启动，调用方法返回 ErrSubtitleDisabled。
-func NewSubtitleService(db *gorm.DB, cfg *config.SubtitleConfig, asr ASRClient, translator Translator, signer *util.ProxySigner) *SubtitleService {
+func NewSubtitleService(
+	db *gorm.DB,
+	cfg *config.SubtitleConfig,
+	asrFactory func(cfg config.SubtitleConfig) ASRClient,
+	translatorFactory func(cfg config.SubtitleConfig) Translator,
+	signer *util.ProxySigner,
+) *SubtitleService {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SubtitleService{
-		db:         db,
-		cfg:        cfg,
-		asr:        asr,
-		translator: translator,
-		signer:     signer,
-		jobs:       make(chan string, 4096),
-		stop:       make(chan struct{}),
-		ctx:        ctx,
-		cancel:     cancel,
+		db:                db,
+		cfg:               cfg,
+		asrFactory:        asrFactory,
+		translatorFactory: translatorFactory,
+		signer:            signer,
+		jobs:              make(chan string, 4096),
+		stop:              make(chan struct{}),
+		ctx:               ctx,
+		cancel:            cancel,
 	}
+}
+
+// snap 返回 cfg 的拷贝，调用方对返回值的修改不会影响内部状态。
+// 所有读取 cfg 字段的代码都应走这里以避免与 UpdateSettings 的写竞争。
+func (s *SubtitleService) snap() config.SubtitleConfig {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	if s.cfg == nil {
+		return config.SubtitleConfig{}
+	}
+	return *s.cfg
 }
 
 // ErrSubtitleDisabled 字幕功能未启用。
@@ -87,34 +111,44 @@ var ErrSubtitleDisabled = errors.New("subtitle feature disabled")
 //
 // 不论哪种模式，cfg.Enabled=false 都直接 return（端点回 disabled）。
 func (s *SubtitleService) Start() error {
-	if !s.cfg.Enabled {
+	cur := s.snap()
+	if !cur.Enabled {
 		log.Printf("[subtitle] feature disabled, worker not started")
 		return nil
 	}
 
-	if s.cfg.LocalWorkerEnabled {
-		// preflight：检查 whisper bin / model / translator 配置
-		if pa, ok := s.asr.(interface{ PreflightCheck() error }); ok {
+	if cur.LocalWorkerEnabled {
+		// preflight：基于当前 cfg 临时构造一份客户端做校验，processOne 会按需重建
+		asr := s.buildASR(cur)
+		tr := s.buildTranslator(cur)
+		if pa, ok := asr.(interface{ PreflightCheck() error }); ok {
 			if err := pa.PreflightCheck(); err != nil {
 				return fmt.Errorf("asr preflight: %w", err)
 			}
 		}
-		if pt, ok := s.translator.(interface{ PreflightCheck() error }); ok {
+		if pt, ok := tr.(interface{ PreflightCheck() error }); ok {
 			if err := pt.PreflightCheck(); err != nil {
 				return fmt.Errorf("translator preflight: %w", err)
 			}
 		}
 	}
 
-	if err := os.MkdirAll(s.cfg.SubtitlesDir, 0o755); err != nil {
+	if err := os.MkdirAll(cur.SubtitlesDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir subtitles dir: %w", err)
 	}
 
-	if s.cfg.LocalWorkerEnabled {
+	if cur.LocalWorkerEnabled {
 		// 本地 worker：单 worker，纯 CPU whisper 不能多开
 		s.wg.Add(1)
 		go s.worker()
-		log.Printf("[subtitle] local in-process worker started (asr=%s, mt=%s)", s.asr.ModelName(), s.translator.ModelName())
+		asrName, mtName := "(unset)", "(unset)"
+		if asr := s.buildASR(cur); asr != nil {
+			asrName = asr.ModelName()
+		}
+		if tr := s.buildTranslator(cur); tr != nil {
+			mtName = tr.ModelName()
+		}
+		log.Printf("[subtitle] local in-process worker started (asr=%s, mt=%s)", asrName, mtName)
 	} else {
 		log.Printf("[subtitle] remote worker mode (LocalWorkerEnabled=false), waiting for /api/v1/worker/* clients")
 	}
@@ -127,13 +161,29 @@ func (s *SubtitleService) Start() error {
 	}()
 
 	// 扫描存量 ACTIVE media（异步，不阻塞启动）
-	if s.cfg.AutoGenerate {
+	if cur.AutoGenerate {
 		go s.scanExisting()
 	}
 
 	log.Printf("[subtitle] started (lang=%s→%s, autoGenerate=%v, localWorker=%v)",
-		s.cfg.WhisperLanguage, s.cfg.TargetLang, s.cfg.AutoGenerate, s.cfg.LocalWorkerEnabled)
+		cur.WhisperLanguage, cur.TargetLang, cur.AutoGenerate, cur.LocalWorkerEnabled)
 	return nil
+}
+
+// buildASR 用当前 cfg 快照构造 ASR 客户端；factory 未设置时返回 nil。
+func (s *SubtitleService) buildASR(cur config.SubtitleConfig) ASRClient {
+	if s.asrFactory == nil {
+		return nil
+	}
+	return s.asrFactory(cur)
+}
+
+// buildTranslator 用当前 cfg 快照构造翻译客户端；factory 未设置时返回 nil。
+func (s *SubtitleService) buildTranslator(cur config.SubtitleConfig) Translator {
+	if s.translatorFactory == nil {
+		return nil
+	}
+	return s.translatorFactory(cur)
 }
 
 // Stop 优雅关停（取消运行中的 ffmpeg/whisper，等待 worker 退出）。
@@ -147,7 +197,7 @@ func (s *SubtitleService) Stop() {
 }
 
 // Enabled 字幕功能是否启用。
-func (s *SubtitleService) Enabled() bool { return s.cfg.Enabled }
+func (s *SubtitleService) Enabled() bool { return s.snap().Enabled }
 
 // EnsureJob 幂等入队：
 //   - 已存在 DONE：不动
@@ -155,7 +205,8 @@ func (s *SubtitleService) Enabled() bool { return s.cfg.Enabled }
 //   - 已存在 FAILED：重置为 PENDING 重试
 //   - 不存在：创建 PENDING 行并投递到 worker
 func (s *SubtitleService) EnsureJob(mediaID string) error {
-	if !s.cfg.Enabled {
+	cur := s.snap()
+	if !cur.Enabled {
 		return ErrSubtitleDisabled
 	}
 	if mediaID == "" {
@@ -193,8 +244,8 @@ func (s *SubtitleService) EnsureJob(mediaID string) error {
 		MediaID:    mediaID,
 		Status:     model.SubtitleStatusPending,
 		Stage:      model.SubtitleStageQueued,
-		SourceLang: s.cfg.WhisperLanguage,
-		TargetLang: s.cfg.TargetLang,
+		SourceLang: cur.WhisperLanguage,
+		TargetLang: cur.TargetLang,
 	}
 	if err := s.db.Create(&job).Error; err != nil {
 		// 唯一索引冲突视为竞态，已有其它请求建好了
@@ -210,7 +261,8 @@ func (s *SubtitleService) EnsureJob(mediaID string) error {
 // HookOnMediaCreated 给 MediaService 注册的钩子。
 // 不返回 error；任何失败只打日志，不影响 media 创建主流程。
 func (s *SubtitleService) HookOnMediaCreated(mediaID string) {
-	if !s.cfg.Enabled || !s.cfg.AutoGenerate {
+	cur := s.snap()
+	if !cur.Enabled || !cur.AutoGenerate {
 		return
 	}
 	if err := s.EnsureJob(mediaID); err != nil {
@@ -305,6 +357,15 @@ func (s *SubtitleService) processOne(mediaID string) {
 		return
 	}
 
+	// 进入 pipeline 时取一次 cfg 快照，整个 job 期间使用同一份配置避免中途切换造成文件名/语言串台
+	cur := s.snap()
+	asr := s.buildASR(cur)
+	tr := s.buildTranslator(cur)
+	if asr == nil || tr == nil {
+		s.markFailed(mediaID, fmt.Errorf("asr/translator factory not configured"))
+		return
+	}
+
 	now := time.Now()
 	if err := s.db.Model(&model.SubtitleJob{}).Where("media_id = ?", mediaID).Updates(map[string]any{
 		"status":     model.SubtitleStatusRunning,
@@ -312,8 +373,8 @@ func (s *SubtitleService) processOne(mediaID string) {
 		"progress":   5,
 		"started_at": &now,
 		"error_msg":  "",
-		"asr_model":  s.asr.ModelName(),
-		"mt_model":   s.translator.ModelName(),
+		"asr_model":  asr.ModelName(),
+		"mt_model":   tr.ModelName(),
 	}).Error; err != nil {
 		log.Printf("[subtitle] mark running media=%s: %v", mediaID, err)
 		return
@@ -335,7 +396,7 @@ func (s *SubtitleService) processOne(mediaID string) {
 	s.updateProgress(mediaID, model.SubtitleStageASR, 25)
 
 	// 2) ASR
-	asrResult, err := s.asr.Transcribe(s.ctx, audioPath)
+	asrResult, err := asr.Transcribe(s.ctx, audioPath)
 	if err != nil {
 		s.markFailed(mediaID, fmt.Errorf("asr: %w", err))
 		return
@@ -347,7 +408,7 @@ func (s *SubtitleService) processOne(mediaID string) {
 	s.updateProgress(mediaID, model.SubtitleStageTranslate, 50)
 
 	// 3) 翻译（按 BatchSize 分批）
-	translated, err := s.translateAll(asrResult.Segments)
+	translated, err := s.translateAll(cur, tr, asrResult.Segments)
 	if err != nil {
 		s.markFailed(mediaID, fmt.Errorf("translate: %w", err))
 		return
@@ -356,7 +417,7 @@ func (s *SubtitleService) processOne(mediaID string) {
 
 	// 4) 写 VTT
 	relPath := mediaID + ".vtt"
-	absPath := filepath.Join(s.cfg.SubtitlesDir, relPath)
+	absPath := filepath.Join(cur.SubtitlesDir, relPath)
 	if err := writeVTT(absPath, asrResult.Segments, translated); err != nil {
 		s.markFailed(mediaID, fmt.Errorf("write vtt: %w", err))
 		return
@@ -379,9 +440,10 @@ func (s *SubtitleService) processOne(mediaID string) {
 }
 
 // translateAll 按 BatchSize 切片翻译；任何子批失败回退到原文（保证字幕完整性）。
-func (s *SubtitleService) translateAll(segs []ASRSegment) ([]string, error) {
+// cur 提供本次 job 期间稳定的 BatchSize / 源/目标语言，避免运行中切配置导致行为不一致。
+func (s *SubtitleService) translateAll(cur config.SubtitleConfig, tr Translator, segs []ASRSegment) ([]string, error) {
 	out := make([]string, len(segs))
-	batch := s.cfg.BatchSize
+	batch := cur.BatchSize
 	if batch <= 0 {
 		batch = 8
 	}
@@ -391,7 +453,7 @@ func (s *SubtitleService) translateAll(segs []ASRSegment) ([]string, error) {
 		for _, seg := range segs[i:j] {
 			texts = append(texts, seg.Text)
 		}
-		zh, err := s.translator.Translate(s.ctx, texts, s.cfg.WhisperLanguage, s.cfg.TargetLang)
+		zh, err := tr.Translate(s.ctx, texts, cur.WhisperLanguage, cur.TargetLang)
 		if err != nil {
 			log.Printf("[subtitle] translate batch fallback to source: %v", err)
 			// 回退原文
@@ -428,6 +490,7 @@ func (s *SubtitleService) markFailed(mediaID string, cause error) {
 
 // GetStatus 返回 status payload；当 status=DONE 时附带签名 VTT URL。
 func (s *SubtitleService) GetStatus(mediaID, userID string) (*dto.SubtitleStatusResponse, error) {
+	cur := s.snap()
 	var job model.SubtitleJob
 	if err := s.db.Where("media_id = ?", mediaID).Take(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -437,8 +500,8 @@ func (s *SubtitleService) GetStatus(mediaID, userID string) (*dto.SubtitleStatus
 				Status:     "MISSING",
 				Stage:      "",
 				Progress:   0,
-				SourceLang: s.cfg.WhisperLanguage,
-				TargetLang: s.cfg.TargetLang,
+				SourceLang: cur.WhisperLanguage,
+				TargetLang: cur.TargetLang,
 			}, nil
 		}
 		return nil, err
@@ -483,7 +546,7 @@ func (s *SubtitleService) ServeVTT(mediaID, userID, expires, sig string, w io.Wr
 	if job.Status != model.SubtitleStatusDone || job.VttPath == "" {
 		return 404, fmt.Errorf("vtt not ready")
 	}
-	abs := filepath.Join(s.cfg.SubtitlesDir, job.VttPath)
+	abs := filepath.Join(s.snap().SubtitlesDir, job.VttPath)
 	f, err := os.Open(abs)
 	if err != nil {
 		return 404, fmt.Errorf("open vtt: %w", err)
@@ -612,7 +675,7 @@ func (s *SubtitleService) GetJob(mediaID string) (*dto.SubtitleJobDetail, error)
 
 // Retry 强制把指定 mediaID 任务重置为 PENDING 并入队。
 func (s *SubtitleService) Retry(mediaID string) error {
-	if !s.cfg.Enabled {
+	if !s.snap().Enabled {
 		return ErrSubtitleDisabled
 	}
 	var job model.SubtitleJob
@@ -647,6 +710,7 @@ func (s *SubtitleService) Delete(mediaID string) error {
 
 // SetDisabled 切换禁用状态（DISABLED 状态不会被 worker 消费）。
 func (s *SubtitleService) SetDisabled(mediaID string, disabled bool) error {
+	cur := s.snap()
 	var job model.SubtitleJob
 	if err := s.db.Where("media_id = ?", mediaID).Take(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -658,8 +722,8 @@ func (s *SubtitleService) SetDisabled(mediaID string, disabled bool) error {
 				MediaID:    mediaID,
 				Status:     model.SubtitleStatusDisabled,
 				Stage:      model.SubtitleStageQueued,
-				SourceLang: s.cfg.WhisperLanguage,
-				TargetLang: s.cfg.TargetLang,
+				SourceLang: cur.WhisperLanguage,
+				TargetLang: cur.TargetLang,
 			}).Error
 		}
 		return err
@@ -685,7 +749,7 @@ func (s *SubtitleService) SetDisabled(mediaID string, disabled bool) error {
 //   - CategoryID：指定分类下所有 ACTIVE 媒体；CategoryID="_none" 表示未分类媒体
 //   - All：全部 ACTIVE 媒体
 func (s *SubtitleService) BatchRegenerate(req dto.SubtitleBatchRegenerateRequest) (dto.SubtitleBatchRegenerateResponse, error) {
-	if !s.cfg.Enabled {
+	if !s.snap().Enabled {
 		return dto.SubtitleBatchRegenerateResponse{}, ErrSubtitleDisabled
 	}
 
@@ -744,7 +808,7 @@ func (s *SubtitleService) QueueStatus() (dto.SubtitleQueueStatus, error) {
 		return dto.SubtitleQueueStatus{}, err
 	}
 	out := dto.SubtitleQueueStatus{
-		GlobalMaxConcurrency: s.cfg.GlobalMaxConcurrency,
+		GlobalMaxConcurrency: s.snap().GlobalMaxConcurrency,
 	}
 	for _, r := range rows {
 		switch r.Status {
@@ -765,25 +829,62 @@ func (s *SubtitleService) QueueStatus() (dto.SubtitleQueueStatus, error) {
 
 // CurrentSettings 返回当前生效的字幕配置（脱敏 api key）。
 func (s *SubtitleService) CurrentSettings() dto.SubtitleSettingsResponse {
-	apiKey := s.cfg.TranslateAPIKey
+	cur := s.snap()
+	apiKey := cur.TranslateAPIKey
 	if len(apiKey) > 8 {
 		apiKey = apiKey[:4] + strings.Repeat("*", len(apiKey)-8) + apiKey[len(apiKey)-4:]
 	} else if apiKey != "" {
 		apiKey = strings.Repeat("*", len(apiKey))
 	}
 	return dto.SubtitleSettingsResponse{
-		Enabled:          s.cfg.Enabled,
-		AutoGenerate:     s.cfg.AutoGenerate,
-		WhisperBin:       s.cfg.WhisperBin,
-		WhisperModel:     s.cfg.WhisperModel,
-		WhisperLanguage:  s.cfg.WhisperLanguage,
-		WhisperThreads:   s.cfg.WhisperThreads,
-		TranslateBaseURL: s.cfg.TranslateBaseURL,
-		TranslateModel:   s.cfg.TranslateModel,
+		Enabled:          cur.Enabled,
+		AutoGenerate:     cur.AutoGenerate,
+		WhisperBin:       cur.WhisperBin,
+		WhisperModel:     cur.WhisperModel,
+		WhisperLanguage:  cur.WhisperLanguage,
+		WhisperThreads:   cur.WhisperThreads,
+		TranslateBaseURL: cur.TranslateBaseURL,
+		TranslateModel:   cur.TranslateModel,
 		TranslateAPIKey:  apiKey,
-		TargetLang:       s.cfg.TargetLang,
-		BatchSize:        s.cfg.BatchSize,
+		TargetLang:       cur.TargetLang,
+		BatchSize:        cur.BatchSize,
 	}
+}
+
+// UpdateSettings 应用 admin 提交的字幕配置 patch：写 DB + 更新 in-memory cfg。
+//
+// 行为：
+//   - 校验 patch 字段（线程数、批大小范围、URL 格式等）
+//   - 持锁写 DB（system_settings upsert）+ 同步更新 *s.cfg 字段
+//   - 启用开关从 false 翻到 true 时（且 AutoGenerate 也是 true）异步扫描存量 ACTIVE media
+//     入队，让"新启用"立即对历史媒体生效
+//   - 不重启 worker / 不变 LocalWorkerEnabled / WorkerStaleThreshold 等部署相关字段
+//
+// 返回更新后的脱敏 settings 响应，便于 handler 直接回显前端。
+func (s *SubtitleService) UpdateSettings(req dto.SubtitleSettingsUpdateRequest) (dto.SubtitleSettingsResponse, error) {
+	s.cfgMu.Lock()
+	prevEnabled := s.cfg.Enabled
+	prevAutoGen := s.cfg.AutoGenerate
+	if err := applySubtitlePatch(s.db, s.cfg, &req); err != nil {
+		s.cfgMu.Unlock()
+		return dto.SubtitleSettingsResponse{}, err
+	}
+	newEnabled := s.cfg.Enabled
+	newAutoGen := s.cfg.AutoGenerate
+	s.cfgMu.Unlock()
+
+	// 启用开关 false→true 且自动生成为 on：异步扫描存量 ACTIVE media 入队。
+	// 已经启用的状态下打开 AutoGenerate 也触发扫描，让历史 media 补字幕。
+	turnedOn := !prevEnabled && newEnabled
+	autoGenTurnedOn := !prevAutoGen && newAutoGen && newEnabled
+	if (turnedOn || autoGenTurnedOn) && !s.scanRunning.Swap(true) {
+		go func() {
+			defer s.scanRunning.Store(false)
+			s.scanExisting()
+		}()
+	}
+
+	return s.CurrentSettings(), nil
 }
 
 // deleteVTTFile 物理删除 VTT 文件（如存在）。
@@ -791,7 +892,7 @@ func (s *SubtitleService) deleteVTTFile(job *model.SubtitleJob) {
 	if job.VttPath == "" {
 		return
 	}
-	abs := filepath.Join(s.cfg.SubtitlesDir, job.VttPath)
+	abs := filepath.Join(s.snap().SubtitlesDir, job.VttPath)
 	if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
 		log.Printf("[subtitle] delete vtt %s failed: %v", abs, err)
 	}

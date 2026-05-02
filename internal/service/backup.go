@@ -68,9 +68,10 @@ type PendingItem struct {
 
 // BackupService 管理导出导入状态。
 type BackupService struct {
-	db          *gorm.DB
-	uploadsDir  string
-	downloadTTL time.Duration
+	db           *gorm.DB
+	uploadsDir   string
+	subtitlesDir string // 字幕目录绝对/相对路径；可能位于 uploadsDir 外部
+	downloadTTL  time.Duration
 
 	mu              sync.Mutex
 	pendingDownload map[string]PendingItem
@@ -80,15 +81,48 @@ type BackupService struct {
 	invalidators []func()
 }
 
-// NewBackupService 构造。
-func NewBackupService(db *gorm.DB, uploadsDir string) *BackupService {
+// NewBackupService 构造。subtitlesDir 传字幕文件根目录（默认 <UploadsDir>/subtitles）。
+// 当用户配置自定义 SUBTITLE_DIR 指向 uploadsDir 外部时，导出 / 恢复仍能命中正确路径。
+func NewBackupService(db *gorm.DB, uploadsDir, subtitlesDir string) *BackupService {
 	return &BackupService{
 		db:              db,
 		uploadsDir:      uploadsDir,
+		subtitlesDir:    subtitlesDir,
 		downloadTTL:     10 * time.Minute,
 		pendingDownload: map[string]PendingItem{},
 		pendingRestore:  map[string]PendingItem{},
 	}
+}
+
+// subtitlesInsideUploads 判断 SubtitlesDir 是否位于 UploadsDir 子树内（绝对路径比较）。
+// 用于决定 writeUploadsDir 走 walk 时是否会自然涵盖 VTT 文件，
+// 以及是否需要额外 walk 一次外部目录把 VTT 一并打包到 uploads/subtitles/ 前缀。
+func (s *BackupService) subtitlesInsideUploads() bool {
+	if s.subtitlesDir == "" {
+		return true
+	}
+	uAbs, uErr := filepath.Abs(s.uploadsDir)
+	tAbs, tErr := filepath.Abs(s.subtitlesDir)
+	if uErr != nil || tErr != nil {
+		return true
+	}
+	rel, rerr := filepath.Rel(uAbs, tAbs)
+	if rerr != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return !strings.HasPrefix(rel, "..")
+}
+
+// resolveSubtitleRestoreDir 返回恢复阶段 VTT 应落到的目录。
+// 默认走 subtitlesDir；空时退回 <uploadsDir>/subtitles。
+func (s *BackupService) resolveSubtitleRestoreDir() string {
+	if s.subtitlesDir != "" {
+		return s.subtitlesDir
+	}
+	return filepath.Join(s.uploadsDir, "subtitles")
 }
 
 // RegisterInvalidator 注册一个在 import 完成时调用的缓存失效函数。
@@ -102,8 +136,8 @@ func (s *BackupService) RegisterInvalidator(fn func()) {
 // ---- export ----
 
 // ExportToStream 直接打包 ZIP 到给定 Writer（对齐 /backup/export）。
-func (s *BackupService) ExportToStream(w io.Writer, includePosters bool) error {
-	data, err := s.buildBackupJSON()
+func (s *BackupService) ExportToStream(w io.Writer, includePosters, includeSubtitles bool) error {
+	data, err := s.buildBackupJSON(includeSubtitles)
 	if err != nil {
 		return err
 	}
@@ -113,23 +147,30 @@ func (s *BackupService) ExportToStream(w io.Writer, includePosters bool) error {
 	if err := s.writeBackupJSON(zw, data); err != nil {
 		return err
 	}
-	return s.writeUploadsDir(zw, includePosters)
+	if err := s.writeUploadsDir(zw, includePosters, includeSubtitles); err != nil {
+		return err
+	}
+	return s.writeExternalSubtitlesDir(zw, includeSubtitles)
 }
 
 // ExportToFile 打包到临时文件，返回 (downloadId, filename)。
 // onProgress 可能为 nil。
-func (s *BackupService) ExportToFile(includePosters bool, onProgress func(ExportProgress)) (string, string, error) {
+func (s *BackupService) ExportToFile(includePosters, includeSubtitles bool, onProgress func(ExportProgress)) (string, string, error) {
 	emit := func(p ExportProgress) {
 		if onProgress != nil {
 			onProgress(p)
 		}
 	}
-	emit(ExportProgress{Phase: "db", Message: "正在查询数据库...", Current: 0, Total: 11, Percentage: 0})
-	data, err := s.buildBackupJSON()
+	totalTables := 11
+	if includeSubtitles {
+		totalTables = 12
+	}
+	emit(ExportProgress{Phase: "db", Message: "正在查询数据库...", Current: 0, Total: totalTables, Percentage: 0})
+	data, err := s.buildBackupJSON(includeSubtitles)
 	if err != nil {
 		return "", "", err
 	}
-	emit(ExportProgress{Phase: "db", Message: "查询完成", Current: 11, Total: 11, Percentage: 30})
+	emit(ExportProgress{Phase: "db", Message: "查询完成", Current: totalTables, Total: totalTables, Percentage: 30})
 
 	// 统一用 UTC 时间戳，避免文件名与 exportedAt (UTC) 时区不一致
 	timestamp := time.Now().UTC().Format("2006-01-02T15-04-05Z")
@@ -148,7 +189,13 @@ func (s *BackupService) ExportToFile(includePosters bool, onProgress func(Export
 		return "", "", werr
 	}
 	emit(ExportProgress{Phase: "files", Message: "正在打包文件...", Current: 0, Total: 0, Percentage: 60})
-	if werr := s.writeUploadsDir(zw, includePosters); werr != nil {
+	if werr := s.writeUploadsDir(zw, includePosters, includeSubtitles); werr != nil {
+		_ = zw.Close()
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return "", "", werr
+	}
+	if werr := s.writeExternalSubtitlesDir(zw, includeSubtitles); werr != nil {
 		_ = zw.Close()
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpFile.Name())
@@ -311,12 +358,23 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 
 	emit(BackupProgress{Phase: "parse", Message: "数据校验完成", Percentage: 5})
 
+	// 检测备份是否携带字幕。老备份没有 subtitleJobs 字段且 ZIP 内无 uploads/subtitles/。
+	hasSubtitleJobs := len(data.Tables.SubtitleJobs) > 0
+	hasSubtitleFiles := s.zipHasSubtitlesDir(&zr.Reader)
+	hasSubtitles := hasSubtitleJobs || hasSubtitleFiles
+
 	totalRecords := 0
 	tablesRestored := 0
-	emit(BackupProgress{Phase: "delete", Message: "正在清空现有数据...", Current: 0, Total: 12, Percentage: 5})
+	deleteSteps := 12
+	writeSteps := 11
+	if hasSubtitles {
+		deleteSteps = 13
+		writeSteps = 12
+	}
+	emit(BackupProgress{Phase: "delete", Message: "正在清空现有数据...", Current: 0, Total: deleteSteps, Percentage: 5})
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
-		// 依外键拓扑删除
+		// 依外键拓扑删除（subtitle_jobs 引用 media，故先于 media 删除）
 		order := []any{
 			&model.PlaylistItem{},
 			&model.WatchHistory{},
@@ -324,29 +382,34 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			&model.MediaTag{},
 			&model.Playlist{},
 			&model.ImportLog{},
+		}
+		if hasSubtitles {
+			order = append(order, &model.SubtitleJob{})
+		}
+		order = append(order,
 			&model.Media{},
 			&model.Tag{},
 			&model.Category{},
 			&model.SystemSetting{},
 			&model.RefreshToken{},
 			&model.User{},
-		}
+		)
 		for i, m := range order {
 			if err := tx.Where("1 = 1").Delete(m).Error; err != nil {
 				return err
 			}
-			emit(BackupProgress{Phase: "delete", Message: "已清空", Current: i + 1, Total: 12,
-				Percentage: 5 + int(float64(i+1)/12*15),
+			emit(BackupProgress{Phase: "delete", Message: "已清空", Current: i + 1, Total: deleteSteps,
+				Percentage: 5 + int(float64(i+1)/float64(deleteSteps)*15),
 			})
 		}
 
 		// 写入阶段
-		emit(BackupProgress{Phase: "write", Message: "正在写入数据...", Current: 0, Total: 11, Percentage: 20})
+		emit(BackupProgress{Phase: "write", Message: "正在写入数据...", Current: 0, Total: writeSteps, Percentage: 20})
 
 		writeTable := func(idx int, name string, rows any, count int) error {
 			if count == 0 {
 				emit(BackupProgress{Phase: "write", Message: "跳过 " + name + "（无数据）",
-					Current: idx + 1, Total: 11, Percentage: 20 + int(float64(idx+1)/11*55)})
+					Current: idx + 1, Total: writeSteps, Percentage: 20 + int(float64(idx+1)/float64(writeSteps)*55)})
 				return nil
 			}
 			if err := tx.CreateInBatches(rows, 100).Error; err != nil {
@@ -355,7 +418,7 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 			totalRecords += count
 			tablesRestored++
 			emit(BackupProgress{Phase: "write", Message: fmt.Sprintf("已写入 %s (%d 条)", name, count),
-				Current: idx + 1, Total: 11, Percentage: 20 + int(float64(idx+1)/11*55)})
+				Current: idx + 1, Total: writeSteps, Percentage: 20 + int(float64(idx+1)/float64(writeSteps)*55)})
 			return nil
 		}
 
@@ -419,8 +482,18 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 		if settingsWritten > 0 {
 			tablesRestored++
 		}
+		settingsIdx := 10
 		emit(BackupProgress{Phase: "write", Message: "已写入 systemSettings",
-			Current: 11, Total: 11, Percentage: 75})
+			Current: settingsIdx + 1, Total: writeSteps,
+			Percentage: 20 + int(float64(settingsIdx+1)/float64(writeSteps)*55)})
+
+		// subtitleJobs：仅当备份内含字幕字段时写入；其引用 media.id 必须在 media 写入之后
+		if hasSubtitles {
+			jobs := sanitizeSubtitleJobs(data.Tables.SubtitleJobs)
+			if err := writeTable(11, "subtitleJobs", &jobs, len(jobs)); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -484,6 +557,16 @@ func (s *BackupService) ImportFromFile(zipPath string, onProgress func(BackupPro
 func (s *BackupService) zipHasPostersDir(zr *zip.Reader) bool {
 	for _, f := range zr.File {
 		if strings.HasPrefix(f.Name, "uploads/posters/") {
+			return true
+		}
+	}
+	return false
+}
+
+// zipHasSubtitlesDir 检测 ZIP 中是否包含 uploads/subtitles/ 目录。
+func (s *BackupService) zipHasSubtitlesDir(zr *zip.Reader) bool {
+	for _, f := range zr.File {
+		if strings.HasPrefix(f.Name, "uploads/subtitles/") {
 			return true
 		}
 	}
@@ -620,10 +703,14 @@ type tableSet struct {
 	WatchHistory   []model.WatchHistory  `json:"watchHistory"`
 	ImportLogs     []model.ImportLog     `json:"importLogs"`
 	SystemSettings []model.SystemSetting `json:"systemSettings"`
+	// SubtitleJobs 仅在导出时勾选了"包含字幕"才会被写入；老备份没有这个字段，
+	// json.Unmarshal 会留空 nil 由 sanitizeSubtitleJobs 兜底。
+	SubtitleJobs []model.SubtitleJob `json:"subtitleJobs,omitempty"`
 }
 
 // buildBackupJSON 查 11 张表并拼成可序列化结构。
-func (s *BackupService) buildBackupJSON() (map[string]any, error) {
+// includeSubtitles=true 时额外查询 subtitle_jobs 表（共 12 张）。
+func (s *BackupService) buildBackupJSON(includeSubtitles bool) (map[string]any, error) {
 	var (
 		mu       sync.Mutex
 		firstErr error
@@ -640,7 +727,11 @@ func (s *BackupService) buildBackupJSON() (map[string]any, error) {
 		}
 		mu.Unlock()
 	}
-	wg.Add(11)
+	tableCount := 11
+	if includeSubtitles {
+		tableCount = 12
+	}
+	wg.Add(tableCount)
 	go func() {
 		defer wg.Done()
 		var users []model.User
@@ -659,6 +750,9 @@ func (s *BackupService) buildBackupJSON() (map[string]any, error) {
 	go func() { defer wg.Done(); saveErr(s.db.Find(&data.WatchHistory).Error) }()
 	go func() { defer wg.Done(); saveErr(s.db.Find(&data.ImportLogs).Error) }()
 	go func() { defer wg.Done(); saveErr(s.db.Find(&data.SystemSettings).Error) }()
+	if includeSubtitles {
+		go func() { defer wg.Done(); saveErr(s.db.Find(&data.SubtitleJobs).Error) }()
+	}
 	wg.Wait()
 	if firstErr != nil {
 		return nil, middleware.WrapAppError(http.StatusInternalServerError, "导出查询失败", firstErr)
@@ -682,12 +776,18 @@ func (s *BackupService) writeBackupJSON(zw *zip.Writer, data map[string]any) err
 	return enc.Encode(data)
 }
 
-// writeUploadsDir 把 uploadsDir 打包进 zip；includePosters=false 时跳过 posters 子目录。
-func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters bool) error {
+// writeUploadsDir 把 uploadsDir 打包进 zip。
+//   - includePosters=false 时跳过 <UploadsDir>/posters/ 子目录
+//   - includeSubtitles=false 时跳过 <UploadsDir>/subtitles/ 子目录
+//
+// 注意：当 SubtitlesDir 配置在 uploadsDir 外部时，这里不会触及那些 VTT 文件，
+// 由 writeExternalSubtitlesDir 单独打包到 uploads/subtitles/ 前缀，统一恢复语义。
+func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters, includeSubtitles bool) error {
 	if _, err := os.Stat(s.uploadsDir); os.IsNotExist(err) {
 		return nil
 	}
 	postersDir := filepath.Join(s.uploadsDir, "posters")
+	subtitlesDir := filepath.Join(s.uploadsDir, "subtitles")
 	return filepath.Walk(s.uploadsDir, func(path string, info os.FileInfo, werr error) error {
 		if werr != nil {
 			return werr
@@ -699,9 +799,15 @@ func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters bool) err
 			if !includePosters && path == postersDir {
 				return filepath.SkipDir
 			}
+			if !includeSubtitles && path == subtitlesDir {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !includePosters && strings.HasPrefix(path+string(os.PathSeparator), postersDir+string(os.PathSeparator)) {
+			return nil
+		}
+		if !includeSubtitles && strings.HasPrefix(path+string(os.PathSeparator), subtitlesDir+string(os.PathSeparator)) {
 			return nil
 		}
 		rel, rerr := filepath.Rel(s.uploadsDir, path)
@@ -723,6 +829,54 @@ func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters bool) err
 	})
 }
 
+// writeExternalSubtitlesDir 当 SubtitlesDir 不在 UploadsDir 内部时，
+// 单独 walk 该目录并把全部 VTT 写到 ZIP 的 uploads/subtitles/ 前缀下，
+// 让 restoreUploads 走统一路径还原（落到 SubtitlesDir 实际路径）。
+//
+// 当 includeSubtitles=false 或 SubtitlesDir 在 uploadsDir 内（已被 writeUploadsDir 覆盖）时直接返回。
+func (s *BackupService) writeExternalSubtitlesDir(zw *zip.Writer, includeSubtitles bool) error {
+	if !includeSubtitles {
+		return nil
+	}
+	if s.subtitlesInsideUploads() {
+		return nil
+	}
+	root := s.subtitlesDir
+	if root == "" {
+		return nil
+	}
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return nil
+	}
+	return filepath.Walk(root, func(p string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if p == root {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		archiveName := "uploads/subtitles/" + filepath.ToSlash(rel)
+		w, cerr := zw.Create(archiveName)
+		if cerr != nil {
+			return cerr
+		}
+		f, ferr := os.Open(p)
+		if ferr != nil {
+			return ferr
+		}
+		defer func() { _ = f.Close() }()
+		_, copyErr := io.Copy(w, f)
+		return copyErr
+	})
+}
+
 // restoreUploads 将 ZIP 里的 uploads/* 还原到磁盘。
 // 采用"两阶段子目录原子切换"设计防止数据永久丢失：
 //  1. 先把所有文件解压到 <uploadsDir>/.staging-new-<ts> （staging 置于 uploadsDir 内部，
@@ -735,15 +889,24 @@ func (s *BackupService) writeUploadsDir(zw *zip.Writer, includePosters bool) err
 //  4. 成功后异步清理 .staging-old-<ts>
 //
 // 返回 (成功文件数, error)。原先忽略 io.Copy 错误 + 先删后写的做法已废弃。
+//
+// 当 SubtitlesDir 配置在 uploadsDir 外部时，uploads/subtitles/* 的条目会从主流程剔除，
+// 由 restoreExternalSubtitles 单独还原到真正的 SubtitlesDir。
 func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, total int)) (int, error) {
+	external := !s.subtitlesInsideUploads()
 	entries := make([]*zip.File, 0)
+	subtitleEntries := make([]*zip.File, 0)
 	for _, f := range zr.File {
 		if !strings.HasPrefix(f.Name, "uploads/") || f.FileInfo().IsDir() {
 			continue
 		}
+		if external && strings.HasPrefix(f.Name, "uploads/subtitles/") {
+			subtitleEntries = append(subtitleEntries, f)
+			continue
+		}
 		entries = append(entries, f)
 	}
-	total := len(entries)
+	total := len(entries) + len(subtitleEntries)
 	if total == 0 {
 		return 0, nil
 	}
@@ -881,7 +1044,92 @@ func (s *BackupService) restoreUploads(zr *zip.ReadCloser, progress func(done, t
 		renamed = append(renamed, name)
 	}
 	staged = true
+
+	// 外部 SubtitlesDir：把剔除出来的 uploads/subtitles/* 单独还原。
+	// 失败时不回滚 uploads（已 staged），但向上冒泡 error 让调用方记录。
+	if len(subtitleEntries) > 0 {
+		extDone, extErr := s.restoreExternalSubtitles(subtitleEntries, done, total, progress)
+		if extErr != nil {
+			return done + extDone, extErr
+		}
+		done += extDone
+	}
 	return done, nil
+}
+
+// restoreExternalSubtitles 把 ZIP 中 uploads/subtitles/* 还原到外部 SubtitlesDir。
+// 不使用 staging 原子切换：VTT 文件粒度小、独立、且外部目录可能跨 FS（不能与 uploadsDir 共享 staging）。
+// 采用 tmp+rename：写到同目录的临时文件，关闭后 rename 替换原文件，单文件原子。
+func (s *BackupService) restoreExternalSubtitles(entries []*zip.File, doneSoFar, total int, progress func(done, total int)) (int, error) {
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	root := s.subtitlesDir
+	if root == "" {
+		return 0, nil
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return 0, fmt.Errorf("resolve subtitles dir: %w", err)
+	}
+	if err := os.MkdirAll(absRoot, 0o755); err != nil {
+		return 0, fmt.Errorf("ensure subtitles dir: %w", err)
+	}
+	_ = os.Chmod(absRoot, 0o777)
+
+	written := 0
+	for _, f := range entries {
+		rel := strings.TrimPrefix(f.Name, "uploads/subtitles/")
+		if rel == "" {
+			continue
+		}
+		if filepath.IsAbs(rel) || strings.ContainsAny(rel, "\x00") {
+			continue
+		}
+		dst := filepath.Clean(filepath.Join(absRoot, filepath.FromSlash(rel)))
+		inside, relErr := filepath.Rel(absRoot, dst)
+		if relErr != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return written, fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+		}
+		_ = os.Chmod(filepath.Dir(dst), 0o777)
+		rc, err := f.Open()
+		if err != nil {
+			return written, fmt.Errorf("open zip entry %s: %w", f.Name, err)
+		}
+		tmpFile, err := os.CreateTemp(filepath.Dir(dst), ".vtt-tmp-*")
+		if err != nil {
+			_ = rc.Close()
+			return written, fmt.Errorf("tmp file %s: %w", dst, err)
+		}
+		if _, copyErr := io.Copy(tmpFile, rc); copyErr != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			_ = rc.Close()
+			return written, fmt.Errorf("copy %s: %w", dst, copyErr)
+		}
+		if err := tmpFile.Close(); err != nil {
+			_ = os.Remove(tmpFile.Name())
+			_ = rc.Close()
+			return written, fmt.Errorf("close tmp %s: %w", dst, err)
+		}
+		_ = rc.Close()
+		_ = os.Chmod(tmpFile.Name(), 0o666)
+		if err := os.Rename(tmpFile.Name(), dst); err != nil {
+			_ = os.Remove(tmpFile.Name())
+			return written, fmt.Errorf("promote %s: %w", dst, err)
+		}
+		written++
+		if progress != nil && (written%20 == 0 || written == len(entries)) {
+			progress(doneSoFar+written, total)
+		}
+	}
+	if progress != nil {
+		progress(doneSoFar+written, total)
+	}
+	return written, nil
 }
 
 // ---- 白名单字段清洗 ----
@@ -941,6 +1189,35 @@ func sanitizePlaylists(in []model.Playlist) []model.Playlist             { retur
 func sanitizePlaylistItems(in []model.PlaylistItem) []model.PlaylistItem { return in }
 func sanitizeWatchHistory(in []model.WatchHistory) []model.WatchHistory  { return in }
 func sanitizeImportLogs(in []model.ImportLog) []model.ImportLog          { return in }
+
+// sanitizeSubtitleJobs 清洗字幕任务：
+//   - mediaId 必填（外键约束）
+//   - status 限定枚举内
+//   - 远程 worker 协作字段（claimedBy / claimedAt / lastHeartbeatAt）一律清空，
+//     恢复后由对应 worker 重新认领，避免引入旧集群的僵尸状态
+func sanitizeSubtitleJobs(in []model.SubtitleJob) []model.SubtitleJob {
+	allowedStatus := map[string]bool{
+		model.SubtitleStatusPending:  true,
+		model.SubtitleStatusRunning:  true,
+		model.SubtitleStatusDone:     true,
+		model.SubtitleStatusFailed:   true,
+		model.SubtitleStatusDisabled: true,
+	}
+	out := make([]model.SubtitleJob, 0, len(in))
+	for _, j := range in {
+		if j.MediaID == "" {
+			continue
+		}
+		if j.Status != "" && !allowedStatus[j.Status] {
+			continue
+		}
+		j.ClaimedBy = ""
+		j.ClaimedAt = nil
+		j.LastHeartbeatAt = nil
+		out = append(out, j)
+	}
+	return out
+}
 
 func maxInt(a, b int) int {
 	if a > b {
