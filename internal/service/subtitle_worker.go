@@ -582,6 +582,31 @@ func (s *SubtitleService) WorkerHeartbeat(jobID, workerID, stage string, progres
 
 // === v3 分布式 audio broker：audio worker 注册元数据 + 直拉直传 ===
 
+// audioReadyAllowedStages 是 WorkerAudioReady 接受的 source stage 集合。
+//
+// 背景（v3.1）：v3 早期实现要求 stage 必须严格 == encoding_intermediate；但实际部署中
+// audio worker 心跳间隔默认 30s，而 set_phase("encoding_intermediate") → FLAC 编码完成
+// → audio_ready 整个区间通常 < 30s，心跳极易在两次 stage 切换之间被读到旧值（如
+// "extracting"），导致服务端 stage 滞后于 worker 真实进度，最终 audio_ready 被 409 拒绝。
+//
+// 放宽到整个 audio 阶段集合（downloading / extracting / encoding_intermediate）后，
+// audio_ready 端点本身成为最终裁决：worker 携带 size/sha256/duration 等元数据已经
+// 充分证明 FLAC 已就绪，stage 仅用作进度展示，CAS 推进交由本端点完成。
+var audioReadyAllowedStages = []string{
+	model.SubtitleStageDownloading,
+	model.SubtitleStageExtracting,
+	model.SubtitleStageEncodingIntermediate,
+}
+
+func isAudioReadyStageAllowed(stage string) bool {
+	for _, s := range audioReadyAllowedStages {
+		if stage == s {
+			return true
+		}
+	}
+	return false
+}
+
 // WorkerAudioReady 是 v3 audio worker 完成本地 FLAC 编码后调用的端点处理。
 //
 // 与 v2 (audio-complete) 的差别：
@@ -589,9 +614,11 @@ func (s *SubtitleService) WorkerHeartbeat(jobID, workerID, stage string, progres
 //   - audio worker 把 FLAC 留在本地，subtitle worker 拉取时通过 broker 实时桥接
 //
 // 行为：
-//  1. 校验 ownership：claimed_by == meta.WorkerID 且 stage == encoding_intermediate
-//  2. CAS UPDATE 任务：stage=audio_uploaded，写入 size / sha256 / format / duration_ms 元数据
-//  3. claimed_by 清空，让 subtitle worker 可以抢占；audio_worker_id 保留作为 owner
+//  1. 校验 ownership：claimed_by == meta.WorkerID
+//  2. 校验 stage ∈ {downloading, extracting, encoding_intermediate}（v3.1 放宽，
+//     避免心跳异步同步滞后于 worker 实际进度造成 409）
+//  3. CAS UPDATE 任务：stage=audio_uploaded，写入 size / sha256 / format / duration_ms 元数据
+//  4. claimed_by 清空，让 subtitle worker 可以抢占；audio_worker_id 保留作为 owner
 //
 // 注意：audio_artifact_path 字段不再使用（保留 schema 兼容旧 worker 的 v2 上传路径），
 // owner 关系完全通过 audio_worker_id 表达。
@@ -606,7 +633,7 @@ func (s *SubtitleService) WorkerAudioReady(jobID string, meta dto.WorkerAudioRea
 	if job.ClaimedBy != meta.WorkerID {
 		return middleware.NewAppErrorWithCode(http.StatusGone, WorkerErrCodeJobNotOwned, "job not owned by this worker")
 	}
-	if job.Stage != model.SubtitleStageEncodingIntermediate {
+	if !isAudioReadyStageAllowed(job.Stage) {
 		return middleware.NewAppErrorWithCode(http.StatusConflict, WorkerErrCodeAudioNotReady,
 			fmt.Sprintf("job stage %s does not allow audio-ready", job.Stage))
 	}
@@ -619,7 +646,7 @@ func (s *SubtitleService) WorkerAudioReady(jobID string, meta dto.WorkerAudioRea
 
 	now := time.Now()
 	res := s.db.Model(&model.SubtitleJob{}).
-		Where("id = ? AND claimed_by = ? AND stage = ?", jobID, meta.WorkerID, model.SubtitleStageEncodingIntermediate).
+		Where("id = ? AND claimed_by = ? AND stage IN ?", jobID, meta.WorkerID, audioReadyAllowedStages).
 		Updates(map[string]any{
 			"stage":                      model.SubtitleStageAudioUploaded,
 			"progress":                   35,

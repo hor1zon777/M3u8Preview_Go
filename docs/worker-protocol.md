@@ -248,7 +248,14 @@ Worker 启动时调用，把自身信息 upsert 到服务器。同一 `workerId`
 
 **audio worker 完成本地 FLAC 编码后调用**。仅注册元数据，不上传文件 body。
 
-服务端校验：`claimed_by == workerId AND stage == encoding_intermediate`，校验通过后切到 `stage=audio_uploaded`。
+服务端校验：`claimed_by == workerId AND stage ∈ {downloading, extracting, encoding_intermediate}`，校验通过后切到 `stage=audio_uploaded`。
+
+> **v3.1 放宽**：之前要求 `stage == encoding_intermediate`，但 audio worker 心跳间隔默认 30s，
+> 流水线从 `extracting` → `encoding_intermediate` → FLAC 编码 → `audio_ready` 整段通常 < 30s，
+> 心跳容易在 stage 切换之间被读到旧值，导致 `audio_ready` 被 409 拒绝。
+> v3.1 起 stage 仅作进度展示，audio_ready 接受任意 audio 阶段子状态作为来源。
+> Worker 仍建议在调用 `audio_ready` 前同步发一次 `heartbeat(stage=encoding_intermediate)`
+> 让心跳与最终状态对齐。
 
 **请求体**：
 
@@ -409,7 +416,7 @@ worker token 是高权限凭据，允许触发重试（与 admin Retry 等价）
 | Code | HTTP | 含义 |
 |------|------|------|
 | `WORKER_JOB_NOT_OWNED` | 403/410 | claimed_by / audio_worker_id 不匹配请求方 |
-| `WORKER_AUDIO_NOT_READY` | 409 | audio-ready 时 stage 不允许（只能在 encoding_intermediate）|
+| `WORKER_AUDIO_NOT_READY` | 409 | audio-ready 时 stage 不允许（v3.1 起允许 downloading / extracting / encoding_intermediate）|
 | `WORKER_AUDIO_GONE` | 410 | audio_worker_id 为空 / 没人在等 fetch |
 | `WORKER_AUDIO_SHA256_MISMATCH` | 412 | 保留（v3 不再校验，但常量保留） |
 | `WORKER_AUDIO_OWNER_OFFLINE` | 503 | broker 30s 内未收到 audio worker 上传 |
