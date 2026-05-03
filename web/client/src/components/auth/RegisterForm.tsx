@@ -79,10 +79,11 @@ export function RegisterForm() {
       await register(username, password, captchaToken ?? undefined);
       navigate('/');
     } catch (err: any) {
-      const msg =
-        err?.response?.data?.error ||
-        err?.message ||
-        '注册失败，请重试';
+      // 与 LoginForm 同策略：只展示服务端约定文案，避免 JS 运行时错误栈痕泄露到 UI。
+      const serverMsg = err?.response?.data?.error;
+      const isAxiosError = !!err?.isAxiosError || err?.name === 'AxiosError';
+      const networkMsg = isAxiosError && !err?.response ? '网络异常，请检查连接' : '';
+      const msg = serverMsg || networkMsg || '注册失败，请重试';
       console.error('[register] 注册失败', err);
       setError(msg);
       setCaptchaToken(null);

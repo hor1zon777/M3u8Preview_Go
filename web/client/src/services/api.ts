@@ -48,7 +48,24 @@ const AUTH_ENDPOINTS = ['/auth/login', '/auth/register', '/auth/refresh'];
 
 // Response interceptor - auto refresh token on 401
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // 服务端约定的统一信封：HTTP 200 + {success: false, error: "..."} 也算业务失败。
+    // 如果不在这里转成 reject，调用方会拿到一个看似成功但 data 为 undefined 的响应，
+    // 接着 `result.xxx` 直接抛 "Cannot read properties of undefined" 之类的运行时错误，
+    // 错误信息泄露到 UI 上极不友好。
+    const body = response.data as ApiResponse<unknown> | undefined;
+    if (body && typeof body === 'object' && 'success' in body && body.success === false) {
+      const synthetic = new axios.AxiosError(
+        body.error || 'Request failed',
+        'ERR_BUSINESS',
+        response.config,
+        response.request,
+        response,
+      );
+      return Promise.reject(synthetic);
+    }
+    return response;
+  },
   async (error) => {
     const originalRequest = error.config;
 

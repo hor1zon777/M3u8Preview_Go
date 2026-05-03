@@ -42,11 +42,13 @@ export function LoginForm() {
       await login(username, password, captchaToken ?? undefined);
       navigate(from, { replace: true });
     } catch (err: any) {
-      // 优先显示 axios 响应里的服务端错误；其次 Error.message（前端本地抛错，如 WASM/指纹/加密失败）；兜底才是通用文案
-      const msg =
-        err?.response?.data?.error ||
-        err?.message ||
-        '登录失败，请重试';
+      // 只展示服务端约定的错误文案；前端 JS 运行时错误（如 TypeError、undefined.xxx）
+      // 一律退化为通用文案，避免 "Cannot read properties of undefined" 这种栈痕泄露到 UI。
+      // err.message 仅在 axios 网络层错误（网络不通 / CORS / 超时）时使用。
+      const serverMsg = err?.response?.data?.error;
+      const isAxiosError = !!err?.isAxiosError || err?.name === 'AxiosError';
+      const networkMsg = isAxiosError && !err?.response ? '网络异常，请检查连接' : '';
+      const msg = serverMsg || networkMsg || '登录失败，请重试';
       console.error('[login] 登录失败', err);
       setError(msg);
       setCaptchaToken(null);
