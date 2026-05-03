@@ -43,6 +43,16 @@ type SubtitleService struct {
 	asrFactory        func(cfg config.SubtitleConfig) ASRClient
 	translatorFactory func(cfg config.SubtitleConfig) Translator
 	signer            *util.ProxySigner
+	// uploadsDir 是 cfg.UploadsDir 的快照（启动时一次性传入，运行期不变）。
+	// v2（已废弃）用它定位 <uploadsDir>/intermediate/<jobId>.flac 中转池；
+	// v3 broker 模式下保留字段但不再写文件，仅 SubtitlesDir 仍要用。
+	uploadsDir string
+	// publicBaseURL 用于在 ClaimNextJob 时拼出 audioArtifactUrl 给 subtitle worker。
+	// 取自 cfg.PublicBaseURL（启动时传入）；为空时回落到相对路径，前提是 worker 与服务端能共享同一 host。
+	publicBaseURL string
+	// audioBroker 是 v3 分布式音频"零落盘"中转的核心；NewSubtitleService 时初始化。
+	// audio worker / subtitle worker 通过 broker 协调 FLAC 流转，服务端不持久化文件。
+	audioBroker *AudioBroker
 
 	jobs        chan string // mediaID
 	stop        chan struct{}
@@ -56,12 +66,19 @@ type SubtitleService struct {
 
 // NewSubtitleService 构造。
 // 当 cfg.Enabled=false 时仍可构造但 worker 不启动，调用方法返回 ErrSubtitleDisabled。
+//
+// uploadsDir / publicBaseURL 用于分布式 audio worker 协议：
+//   - uploadsDir：v2 历史用途（中转池路径）；v3 不再使用，但保留参数兼容旧调用方
+//   - publicBaseURL：服务端对外可见的 base URL（如 "https://media.example.com"），
+//     用于在 ClaimedJob.audioArtifactUrl 里拼绝对地址；空串时回落到相对路径
 func NewSubtitleService(
 	db *gorm.DB,
 	cfg *config.SubtitleConfig,
 	asrFactory func(cfg config.SubtitleConfig) ASRClient,
 	translatorFactory func(cfg config.SubtitleConfig) Translator,
 	signer *util.ProxySigner,
+	uploadsDir string,
+	publicBaseURL string,
 ) *SubtitleService {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SubtitleService{
@@ -70,11 +87,19 @@ func NewSubtitleService(
 		asrFactory:        asrFactory,
 		translatorFactory: translatorFactory,
 		signer:            signer,
+		uploadsDir:        uploadsDir,
+		publicBaseURL:     publicBaseURL,
+		audioBroker:       NewAudioBroker(),
 		jobs:              make(chan string, 4096),
 		stop:              make(chan struct{}),
 		ctx:               ctx,
 		cancel:            cancel,
 	}
+}
+
+// AudioBroker 让 handler 层能拿到 broker 实例（audio-fetch-poll / audio-stream / GET audio）。
+func (s *SubtitleService) AudioBroker() *AudioBroker {
+	return s.audioBroker
 }
 
 // snap 返回 cfg 的拷贝，调用方对返回值的修改不会影响内部状态。
@@ -567,7 +592,20 @@ func (s *SubtitleService) ServeVTT(mediaID, userID, expires, sig string, w io.Wr
 }
 
 // ListJobs 列表查询（admin）。
-// categoryId 非空时按 media.category_id 过滤；空字符串特殊语义 "_none" 用于筛"未分类"。
+//
+// 视图语义：以 media 表为主、subtitle_jobs 表为辅 LEFT JOIN，
+// 因此即使新建媒体尚未手动入队（无 subtitle_jobs 行），列表里也会出现一条
+// MISSING 状态行——管理员勾选后点"重新生成所选"即可触发首次入队。
+//
+// 状态过滤：
+//   - 空字符串：返回全部 media（含 MISSING 行）
+//   - "MISSING"：只返回尚未生成 subtitle_jobs 的 media
+//   - 其它合法 status：限定 sj.status = ? 并自动排除 MISSING 行
+//
+// categoryId 非空时按 media.category_id 过滤；"_none" 用于筛"未分类"。
+//
+// 排序优先 sj.updated_at（已生成 job 的按最近更新优先），无 job 的 media
+// 退而按 media.created_at DESC，确保新建媒体永远在列表顶部可见。
 func (s *SubtitleService) ListJobs(page, limit int, statusFilter, search, categoryID string) ([]dto.SubtitleJobItem, int64, error) {
 	if page < 1 {
 		page = 1
@@ -576,17 +614,40 @@ func (s *SubtitleService) ListJobs(page, limit int, statusFilter, search, catego
 		limit = 20
 	}
 
-	q := s.db.Table("subtitle_jobs AS sj").
-		Select("sj.*, m.title AS media_title, m.category_id AS media_category_id, c.name AS media_category_name").
-		Joins("LEFT JOIN media AS m ON m.id = sj.media_id").
-		Joins("LEFT JOIN categories AS c ON c.id = m.category_id")
+	q := s.db.Table("media AS m").
+		Select(`
+			m.id AS m_id, m.title AS media_title, m.category_id AS media_category_id,
+			c.name AS media_category_name,
+			m.created_at AS media_created_at, m.updated_at AS media_updated_at,
+			sj.id AS sj_id, sj.status AS sj_status, sj.stage AS sj_stage,
+			sj.progress AS sj_progress, sj.source_lang AS sj_source_lang, sj.target_lang AS sj_target_lang,
+			sj.asr_model AS sj_asr_model, sj.mt_model AS sj_mt_model,
+			sj.segment_count AS sj_segment_count, sj.error_msg AS sj_error_msg,
+			sj.started_at AS sj_started_at, sj.finished_at AS sj_finished_at,
+			sj.created_at AS sj_created_at, sj.updated_at AS sj_updated_at,
+			sj.audio_worker_id AS sj_audio_worker_id, sj.subtitle_worker_id AS sj_subtitle_worker_id,
+			sj.audio_artifact_size AS sj_audio_artifact_size,
+			sj.audio_artifact_format AS sj_audio_artifact_format,
+			sj.audio_artifact_duration_ms AS sj_audio_artifact_duration_ms,
+			sj.audio_uploaded_at AS sj_audio_uploaded_at
+		`).
+		Joins("LEFT JOIN subtitle_jobs AS sj ON sj.media_id = m.id").
+		Joins("LEFT JOIN categories AS c ON c.id = m.category_id").
+		// 限定为 ACTIVE media，避免显示已下架 / 错误状态的媒体；
+		// 与 BatchRegenerate({all:true}) 的口径保持一致。
+		Where("m.status = ?", model.MediaStatusActive)
 
-	if statusFilter != "" {
+	switch statusFilter {
+	case "":
+		// 全部：不加 status 条件
+	case model.SubtitleStatusMissing:
+		q = q.Where("sj.id IS NULL")
+	default:
 		q = q.Where("sj.status = ?", statusFilter)
 	}
 	if search != "" {
 		like := "%" + search + "%"
-		q = q.Where("m.title LIKE ? OR sj.media_id LIKE ?", like, like)
+		q = q.Where("m.title LIKE ? OR m.id LIKE ?", like, like)
 	}
 	switch categoryID {
 	case "":
@@ -603,13 +664,37 @@ func (s *SubtitleService) ListJobs(page, limit int, statusFilter, search, catego
 	}
 
 	type row struct {
-		model.SubtitleJob
-		MediaTitle        string `gorm:"column:media_title"`
-		MediaCategoryID   string `gorm:"column:media_category_id"`
-		MediaCategoryName string `gorm:"column:media_category_name"`
+		MID               string     `gorm:"column:m_id"`
+		MediaTitle        string     `gorm:"column:media_title"`
+		MediaCategoryID   string     `gorm:"column:media_category_id"`
+		MediaCategoryName string     `gorm:"column:media_category_name"`
+		MediaCreatedAt    time.Time  `gorm:"column:media_created_at"`
+		MediaUpdatedAt    time.Time  `gorm:"column:media_updated_at"`
+		SjID              string     `gorm:"column:sj_id"`
+		SjStatus          string     `gorm:"column:sj_status"`
+		SjStage           string     `gorm:"column:sj_stage"`
+		SjProgress        int        `gorm:"column:sj_progress"`
+		SjSourceLang      string     `gorm:"column:sj_source_lang"`
+		SjTargetLang      string     `gorm:"column:sj_target_lang"`
+		SjASRModel        string     `gorm:"column:sj_asr_model"`
+		SjMTModel         string     `gorm:"column:sj_mt_model"`
+		SjSegmentCount    int        `gorm:"column:sj_segment_count"`
+		SjErrorMsg        string     `gorm:"column:sj_error_msg"`
+		SjStartedAt       *time.Time `gorm:"column:sj_started_at"`
+		SjFinishedAt      *time.Time `gorm:"column:sj_finished_at"`
+		SjCreatedAt       *time.Time `gorm:"column:sj_created_at"`
+		SjUpdatedAt       *time.Time `gorm:"column:sj_updated_at"`
+		SjAudioWorkerID   string     `gorm:"column:sj_audio_worker_id"`
+		SjSubtitleWorker  string     `gorm:"column:sj_subtitle_worker_id"`
+		SjAudioSize       int64      `gorm:"column:sj_audio_artifact_size"`
+		SjAudioFormat     string     `gorm:"column:sj_audio_artifact_format"`
+		SjAudioDurationMs int64      `gorm:"column:sj_audio_artifact_duration_ms"`
+		SjAudioUploadedAt *time.Time `gorm:"column:sj_audio_uploaded_at"`
 	}
 	var rows []row
-	if err := q.Order("sj.updated_at DESC").
+	// 排序：先按已 join 到 sj 的更新时间（NULL 落到最后），再按 media 创建时间 DESC，
+	// 让"还没生成 subtitle_jobs 的新媒体"也能排在 DONE 任务前面。
+	if err := q.Order("COALESCE(sj.updated_at, m.created_at) DESC").
 		Limit(limit).Offset((page - 1) * limit).
 		Scan(&rows).Error; err != nil {
 		return nil, 0, err
@@ -617,25 +702,57 @@ func (s *SubtitleService) ListJobs(page, limit int, statusFilter, search, catego
 
 	items := make([]dto.SubtitleJobItem, 0, len(rows))
 	for _, r := range rows {
+		// 没有 subtitle_jobs 行时合成 MISSING 视图：mediaId 用 media.id，
+		// timeline 字段维持零值；前端 StatusBadge 已按 MISSING 渲染。
+		if r.SjID == "" {
+			items = append(items, dto.SubtitleJobItem{
+				ID:           "",
+				MediaID:      r.MID,
+				MediaTitle:   r.MediaTitle,
+				CategoryID:   r.MediaCategoryID,
+				CategoryName: r.MediaCategoryName,
+				Status:       model.SubtitleStatusMissing,
+				Stage:        "",
+				Progress:     0,
+				CreatedAt:    r.MediaCreatedAt,
+				UpdatedAt:    r.MediaUpdatedAt,
+			})
+			continue
+		}
+		// 有 subtitle_jobs 行：把 sj.* 投到 DTO，时间字段做 NULL 兜底
+		var createdAt, updatedAt time.Time
+		if r.SjCreatedAt != nil {
+			createdAt = *r.SjCreatedAt
+		}
+		if r.SjUpdatedAt != nil {
+			updatedAt = *r.SjUpdatedAt
+		}
 		items = append(items, dto.SubtitleJobItem{
-			ID:           r.ID,
-			MediaID:      r.MediaID,
+			ID:           r.SjID,
+			MediaID:      r.MID,
 			MediaTitle:   r.MediaTitle,
 			CategoryID:   r.MediaCategoryID,
 			CategoryName: r.MediaCategoryName,
-			Status:       r.Status,
-			Stage:        r.Stage,
-			Progress:     r.Progress,
-			SourceLang:   r.SourceLang,
-			TargetLang:   r.TargetLang,
-			ASRModel:     r.ASRModel,
-			MTModel:      r.MTModel,
-			SegmentCount: r.SegmentCount,
-			ErrorMsg:     r.ErrorMsg,
-			StartedAt:    r.StartedAt,
-			FinishedAt:   r.FinishedAt,
-			CreatedAt:    r.CreatedAt,
-			UpdatedAt:    r.UpdatedAt,
+			Status:       r.SjStatus,
+			Stage:        r.SjStage,
+			Progress:     r.SjProgress,
+			SourceLang:   r.SjSourceLang,
+			TargetLang:   r.SjTargetLang,
+			ASRModel:     r.SjASRModel,
+			MTModel:      r.SjMTModel,
+			SegmentCount: r.SjSegmentCount,
+			ErrorMsg:     r.SjErrorMsg,
+			StartedAt:    r.SjStartedAt,
+			FinishedAt:   r.SjFinishedAt,
+			CreatedAt:    createdAt,
+			UpdatedAt:    updatedAt,
+			// v2 双 worker timeline 字段
+			AudioWorkerID:           r.SjAudioWorkerID,
+			SubtitleWorkerID:        r.SjSubtitleWorker,
+			AudioArtifactSize:       r.SjAudioSize,
+			AudioArtifactFormat:     r.SjAudioFormat,
+			AudioArtifactDurationMs: r.SjAudioDurationMs,
+			AudioUploadedAt:         r.SjAudioUploadedAt,
 		})
 	}
 	return items, total, nil
@@ -677,6 +794,13 @@ func (s *SubtitleService) GetJob(mediaID string) (*dto.SubtitleJobDetail, error)
 		FinishedAt:   r.FinishedAt,
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
+		// v2 双 worker timeline 字段
+		AudioWorkerID:           r.AudioWorkerID,
+		SubtitleWorkerID:        r.SubtitleWorkerID,
+		AudioArtifactSize:       r.AudioArtifactSize,
+		AudioArtifactFormat:     r.AudioArtifactFormat,
+		AudioArtifactDurationMs: r.AudioArtifactDurationMs,
+		AudioUploadedAt:         r.AudioUploadedAt,
 	}
 	return &d, nil
 }

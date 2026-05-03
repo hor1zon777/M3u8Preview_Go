@@ -124,9 +124,13 @@ type Config struct {
 	CookieSecureAuto bool
 	UploadsDir       string
 	DataDir          string
+	// PublicBaseURL 是服务端对外可见的绝对 URL（如 "https://media.example.com"，无尾斜杠）。
+	// 用于在分布式 worker 协议中拼出 audioArtifactUrl 等绝对地址。
+	// 留空时 ClaimedJob 仅返回相对路径，要求 worker 与服务端能共享同一 host。
+	PublicBaseURL string
 	// ECDHPrivateKeyPath 登录加密协议用的长寿 ECDH P-256 私钥存放路径。
 	// 默认 <DataDir>/ecdh.pem；首次启动自动生成（0600）。
-	ECDHPrivateKeyPath string
+	ECDHPrivateKeyPath   string
 	ThumbnailConcurrency int
 	PosterConcurrency    int
 }
@@ -194,6 +198,7 @@ func Load(projectRoot string) (*Config, error) {
 		CookieSecureAuto:     os.Getenv("COOKIE_SECURE") == "",
 		UploadsDir:           getenv("UPLOADS_DIR", filepath.Join(projectRoot, "uploads")),
 		DataDir:              getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
+		PublicBaseURL:        strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
 		ThumbnailConcurrency: clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
 		PosterConcurrency:    clamp(atoiDefault(os.Getenv("POSTER_MIGRATION_CONCURRENCY"), 2), 1, 10),
 		Subtitle: SubtitleConfig{

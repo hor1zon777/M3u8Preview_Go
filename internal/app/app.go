@@ -349,7 +349,7 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	translatorFactory := func(snap config.SubtitleConfig) service.Translator {
 		return service.NewOpenAICompatibleTranslator(snap.TranslateBaseURL, snap.TranslateAPIKey, snap.TranslateModel, snap.MaxRetries)
 	}
-	subtitleSvc := service.NewSubtitleService(db, &cfg.Subtitle, asrFactory, translatorFactory, deps.Proxy)
+	subtitleSvc := service.NewSubtitleService(db, &cfg.Subtitle, asrFactory, translatorFactory, deps.Proxy, cfg.UploadsDir, cfg.PublicBaseURL)
 	if err := subtitleSvc.Start(); err != nil {
 		// 启动失败不阻断整个 server；handler 仍会返回 disabled
 		log.Printf("[subtitle] start failed: %v (feature disabled)", err)

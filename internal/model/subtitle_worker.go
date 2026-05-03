@@ -35,14 +35,20 @@ import (
 //     ClaimNextJob 抢占前会校验"该 token 当前 RUNNING 数 < MaxConcurrency"。
 //     默认 1，admin 可在面板调整。0 表示不限。
 type SubtitleWorkerToken struct {
-	ID             string     `gorm:"primaryKey;type:text" json:"id"`
-	Name           string     `gorm:"type:text;not null" json:"name"`
-	TokenHash      string     `gorm:"column:token_hash;type:text;not null" json:"-"`
-	TokenPrefix    string     `gorm:"column:token_prefix;type:text;not null;index:idx_worker_token_prefix" json:"tokenPrefix"`
-	MaxConcurrency int        `gorm:"column:max_concurrency;type:integer;not null;default:1" json:"maxConcurrency"`
-	CreatedAt      time.Time  `gorm:"autoCreateTime" json:"createdAt"`
-	LastUsedAt     *time.Time `gorm:"column:last_used_at" json:"lastUsedAt,omitempty"`
-	RevokedAt      *time.Time `gorm:"column:revoked_at" json:"revokedAt,omitempty"`
+	ID          string `gorm:"primaryKey;type:text" json:"id"`
+	Name        string `gorm:"type:text;not null" json:"name"`
+	TokenHash   string `gorm:"column:token_hash;type:text;not null" json:"-"`
+	TokenPrefix string `gorm:"column:token_prefix;type:text;not null;index:idx_worker_token_prefix" json:"tokenPrefix"`
+	// MaxConcurrency 旧字段：不区分 capability 时的总并发上限兜底；0 表示不限。
+	MaxConcurrency int `gorm:"column:max_concurrency;type:integer;not null;default:1" json:"maxConcurrency"`
+	// MaxAudioConcurrency / MaxSubtitleConcurrency 是 v2 分布式拆分后按 capability 维度的并发上限。
+	// 默认 audio=2（带宽密集，机 A 可同时拉多个 m3u8）/ subtitle=1（GPU 密集，单卡一次跑一条）。
+	// 0 表示该维度不限（仍受 MaxConcurrency 与 cfg.GlobalMaxConcurrency 兜底）。
+	MaxAudioConcurrency    int        `gorm:"column:max_audio_concurrency;type:integer;not null;default:2" json:"maxAudioConcurrency"`
+	MaxSubtitleConcurrency int        `gorm:"column:max_subtitle_concurrency;type:integer;not null;default:1" json:"maxSubtitleConcurrency"`
+	CreatedAt              time.Time  `gorm:"autoCreateTime" json:"createdAt"`
+	LastUsedAt             *time.Time `gorm:"column:last_used_at" json:"lastUsedAt,omitempty"`
+	RevokedAt              *time.Time `gorm:"column:revoked_at" json:"revokedAt,omitempty"`
 }
 
 // TableName 显式指定。
@@ -76,6 +82,10 @@ type SubtitleWorker struct {
 	RegisteredAt  time.Time `gorm:"column:registered_at;not null" json:"registeredAt"`
 	CompletedJobs int64     `gorm:"column:completed_jobs;type:integer;default:0" json:"completedJobs"`
 	FailedJobs    int64     `gorm:"column:failed_jobs;type:integer;default:0" json:"failedJobs"`
+	// Capabilities 是 worker 自报的能力 JSON 数组字符串，
+	// 形如 `["audio_extract"]` / `["asr_subtitle"]` / `["audio_extract","asr_subtitle"]`。
+	// 旧 client（不带 capabilities 字段）默认 `["audio_extract","asr_subtitle"]`，向后兼容单机部署。
+	Capabilities string `gorm:"column:capabilities;type:text;not null;default:'[\"audio_extract\",\"asr_subtitle\"]'" json:"capabilities"`
 
 	Token *SubtitleWorkerToken `gorm:"foreignKey:TokenID;references:ID;constraint:OnDelete:CASCADE" json:"-"`
 }

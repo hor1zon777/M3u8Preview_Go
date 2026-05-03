@@ -410,7 +410,29 @@ export interface UserActivityAggregate {
 
 // ========== Subtitle ==========
 export type SubtitleStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'DISABLED' | 'MISSING';
-export type SubtitleStage = 'queued' | 'extracting' | 'asr' | 'translate' | 'writing' | 'done';
+
+/**
+ * v2 分布式 worker 拆分后 stage 集合：
+ *   - queued                 → 待 audio_extract worker 抢占
+ *   - downloading            → audio worker 在拉 m3u8
+ *   - extracting             → audio worker 在抽音（旧值兼容：单机模式仍然用此值表示整段抽音过程）
+ *   - encoding_intermediate  → audio worker 在编 FLAC
+ *   - audio_uploaded         → FLAC 已上传到中转池，等 asr_subtitle worker 抢占
+ *   - asr / translate / writing / done 与 v1 一致
+ */
+export type SubtitleStage =
+  | 'queued'
+  | 'downloading'
+  | 'extracting'
+  | 'encoding_intermediate'
+  | 'audio_uploaded'
+  | 'asr'
+  | 'translate'
+  | 'writing'
+  | 'done';
+
+/** v2 worker 自报的 capability 字符串。 */
+export type WorkerCapability = 'audio_extract' | 'asr_subtitle';
 
 export interface SubtitleStatusResponse {
   mediaId: string;
@@ -442,6 +464,13 @@ export interface SubtitleJob {
   finishedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+  // v2 分布式 worker 协作字段（仅在拆分流水线下有值；单机模式留空）
+  audioWorkerId?: string;
+  subtitleWorkerId?: string;
+  audioArtifactSize?: number;
+  audioArtifactFormat?: string;
+  audioArtifactDurationMs?: number;
+  audioUploadedAt?: string | null;
 }
 
 export interface SubtitleSettings {
@@ -534,6 +563,8 @@ export interface SubtitleWorker {
   completedJobs: number;
   failedJobs: number;
   online: boolean;
+  /** v2 worker 自报的能力集合（旧 client 兜底为 ["audio_extract","asr_subtitle"]） */
+  capabilities: WorkerCapability[];
 }
 
 // admin 面板生成的 worker 凭证（不含明文）
@@ -541,10 +572,18 @@ export interface SubtitleWorkerToken {
   id: string;
   name: string;
   tokenPrefix: string;
-  /** 该 token 名下 worker 集合允许同时持有的 RUNNING 任务上限 */
+  /** 该 token 名下 worker 集合允许同时持有的 RUNNING 任务上限（不分能力的兜底）*/
   maxConcurrency: number;
+  /** v2：audio_extract 维度并发上限（默认 2，0 = 不限） */
+  maxAudioConcurrency: number;
+  /** v2：asr_subtitle 维度并发上限（默认 1，0 = 不限） */
+  maxSubtitleConcurrency: number;
   /** 该 token 当前正在运行的任务数（实时） */
   currentRunning: number;
+  /** v2：当前 audio 阶段（downloading/extracting/encoding_intermediate）任务数 */
+  currentAudioRunning: number;
+  /** v2：当前 subtitle 阶段（asr/translate/writing）任务数 */
+  currentSubtitleRunning: number;
   createdAt: string;
   lastUsedAt?: string | null;
   revokedAt?: string | null;
@@ -554,4 +593,29 @@ export interface SubtitleWorkerToken {
 export interface SubtitleWorkerTokenCreateResponse {
   token: string;
   record: SubtitleWorkerToken;
+}
+
+/** 创建 worker token 的请求体。 */
+export interface SubtitleWorkerTokenCreateRequest {
+  name: string;
+  /** 0 / undefined → 走服务端默认 1 */
+  maxConcurrency?: number;
+  /** 0 / undefined → 服务端默认 2 */
+  maxAudioConcurrency?: number;
+  /** 0 / undefined → 服务端默认 1 */
+  maxSubtitleConcurrency?: number;
+}
+
+/** v2 admin 中转池监控统计。 */
+export interface IntermediateAudioStats {
+  fileCount: number;
+  totalBytes: number;
+  oldestUploadedAt?: string | null;
+  quotaBytes: number;
+}
+
+/** v2 admin 顶部告警条 item。 */
+export interface AdminAlert {
+  level: 'info' | 'warn' | 'error';
+  message: string;
 }

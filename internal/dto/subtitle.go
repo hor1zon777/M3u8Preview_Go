@@ -47,6 +47,14 @@ type SubtitleJobItem struct {
 	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
 	CreatedAt    time.Time  `json:"createdAt"`
 	UpdatedAt    time.Time  `json:"updatedAt"`
+
+	// v2 分布式拆分相关字段（M8.2 双阶段 timeline 用）：
+	AudioWorkerID           string     `json:"audioWorkerId,omitempty"`
+	SubtitleWorkerID        string     `json:"subtitleWorkerId,omitempty"`
+	AudioArtifactSize       int64      `json:"audioArtifactSize,omitempty"`
+	AudioArtifactFormat     string     `json:"audioArtifactFormat,omitempty"`
+	AudioArtifactDurationMs int64      `json:"audioArtifactDurationMs,omitempty"`
+	AudioUploadedAt         *time.Time `json:"audioUploadedAt,omitempty"`
 }
 
 // SubtitleJobDetail 详情接口返回。等同列表项，预留扩展字段。
@@ -152,18 +160,29 @@ type SubtitleQueueStatus struct {
 
 // WorkerRegisterRequest worker 启动时上报基本信息。
 // WorkerID 由客户端持久化生成（首次启动时本地 UUID v4），后续重启复用。
+//
+// Capabilities 字段（v2，分布式拆分）：
+//   - 缺省（旧 client）→ 服务端按 ["audio_extract","asr_subtitle"] 兼容（向后兼容单机部署）
+//   - 仅 ["audio_extract"]  → 机 A 角色：下载 + 抽音 + FLAC 编码
+//   - 仅 ["asr_subtitle"]   → 机 B 角色：ASR + 翻译 + 写 VTT
+//   - 两者都有              → 单机模式
 type WorkerRegisterRequest struct {
-	WorkerID string `json:"workerId" binding:"required"`
-	Name     string `json:"name" binding:"required"`
-	Version  string `json:"version,omitempty"`
-	GPU      string `json:"gpu,omitempty"`
+	WorkerID     string   `json:"workerId" binding:"required"`
+	Name         string   `json:"name" binding:"required"`
+	Version      string   `json:"version,omitempty"`
+	GPU          string   `json:"gpu,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // WorkerRegisterResponse 注册成功返回值。
+//
+// AcceptedCapabilities 是服务端实际接受的能力集（默认 = 客户端提交；token 限制时会缩减）。
+// 客户端可据此在 UI 上 sanity check（例如收到的不包含自己声明的能力时给出告警）。
 type WorkerRegisterResponse struct {
-	WorkerID             string `json:"workerId"`
-	ServerTime           int64  `json:"serverTime"`            // unix ms，便于 worker 校时
-	WorkerStaleThreshold int64  `json:"workerStaleThreshold"`  // 服务端容忍的心跳间隔（秒），worker 应 < 此值上报心跳
+	WorkerID             string   `json:"workerId"`
+	ServerTime           int64    `json:"serverTime"`           // unix ms，便于 worker 校时
+	WorkerStaleThreshold int64    `json:"workerStaleThreshold"` // 服务端容忍的心跳间隔（秒），worker 应 < 此值上报心跳
+	AcceptedCapabilities []string `json:"acceptedCapabilities"`
 }
 
 // WorkerClaimRequest 认领任务请求。
@@ -172,18 +191,36 @@ type WorkerClaimRequest struct {
 }
 
 // WorkerClaimedJob 服务端原子认领后返回给 worker 的任务信息。
-// 仅在有 PENDING 时返回；无任务时 handler 返回 204 No Content。
+// 仅在有合适任务时返回；无任务时 handler 返回 204 No Content。
+//
+// Stage 字段（v2 新增）：
+//   - "audio_extract"  → audio worker 派活，需要 M3u8URL + Headers 自行下载
+//   - "asr_subtitle"   → subtitle worker 派活，需要 AudioArtifactURL 拉 FLAC
+//
+// 字段使用约定：
+//   - Stage="audio_extract"  时：M3u8URL/Headers 必填；AudioArtifact* 全空
+//   - Stage="asr_subtitle"   时：AudioArtifactURL/Size/SHA256/Format/DurationMs 必填；M3u8URL 留空
+//
+// 旧 worker（不识别 Stage 字段）仍能从 M3u8URL 推断单机一条龙流程，向后兼容。
 type WorkerClaimedJob struct {
 	JobID      string `json:"jobId"`
 	MediaID    string `json:"mediaId"`
 	MediaTitle string `json:"mediaTitle,omitempty"` // worker UI 显示用
-	M3u8URL    string `json:"m3u8Url"`
+	Stage      string `json:"stage"`                // "audio_extract" / "asr_subtitle"
+
+	// audio_extract 阶段使用：
+	M3u8URL string            `json:"m3u8Url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+
+	// asr_subtitle 阶段使用：
+	AudioArtifactURL        string `json:"audioArtifactUrl,omitempty"`
+	AudioArtifactSize       int64  `json:"audioArtifactSize,omitempty"`
+	AudioArtifactSHA256     string `json:"audioArtifactSha256,omitempty"`
+	AudioArtifactFormat     string `json:"audioArtifactFormat,omitempty"`
+	AudioArtifactDurationMs int64  `json:"audioArtifactDurationMs,omitempty"`
+
 	SourceLang string `json:"sourceLang"`
 	TargetLang string `json:"targetLang"`
-	// Headers 是下载 m3u8 / 分片时应携带的 HTTP 头（域名相关的 Referer / User-Agent 等）。
-	// worker 端把这些转成下载器（N_m3u8DL-RE）的 --header 参数。
-	// 服务端代理播放时也是同样的注入逻辑，避免 worker 直连源站 403。
-	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // WorkerHeartbeatRequest worker 上报阶段 + 进度。
@@ -202,6 +239,44 @@ type WorkerCompleteMeta struct {
 	MTModel      string `json:"mtModel,omitempty"`
 }
 
+// WorkerAudioReadyMeta 是 v3 audio_extract worker 完成 FLAC 编码后调用 audio-ready
+// 端点的请求体。
+//
+// v3 broker 模式下，FLAC 文件留在 audio worker 本地，服务端只接收元数据：
+//
+// Format 取值：
+//   - "flac"     → 16 kHz mono FLAC（默认，无损）
+//   - "opus_24k" → Opus 24 kbps（小带宽场景，未来扩展）
+//   - "wav"      → 16 kHz mono PCM WAV（极简兜底）
+//
+// Size / SHA256 / DurationMs 用于：
+//   - 服务端持久化到 DB，subtitle worker claim 时透传
+//   - subtitle worker 收到流后自己校验完整性（broker 不再做 SHA256 校验）
+type WorkerAudioReadyMeta struct {
+	WorkerID   string `json:"workerId" binding:"required"`
+	Size       int64  `json:"size" binding:"required,gt=0"`
+	SHA256     string `json:"sha256" binding:"required"`
+	Format     string `json:"format" binding:"required"` // "flac" / "opus_24k" / "wav"
+	DurationMs int64  `json:"durationMs" binding:"required,gt=0"`
+}
+
+// WorkerAudioFetchPollRequest audio worker 长轮询请求体。
+type WorkerAudioFetchPollRequest struct {
+	WorkerID string `json:"workerId" binding:"required"`
+	// TimeoutSec 客户端可接受的最长 hold 时间（默认 25s）；服务端会 clamp 到 [5, 60]。
+	TimeoutSec int `json:"timeoutSec,omitempty"`
+}
+
+// WorkerAudioFetchTask audio worker long-poll 拿到的指令。
+//
+// Action 取值：
+//   - "fetch"  ：subtitle worker 在等 jobId 的 FLAC，请上传
+//   - "cleanup"：任务已完成 / 已被 stale 回收，请删除本地 jobId.flac + 索引项
+type WorkerAudioFetchTask struct {
+	Action string `json:"action"`
+	JobID  string `json:"jobId"`
+}
+
 // WorkerFailRequest 失败上报。
 type WorkerFailRequest struct {
 	WorkerID string `json:"workerId" binding:"required"`
@@ -212,26 +287,38 @@ type WorkerFailRequest struct {
 
 // SubtitleWorkerTokenItem 列表 / 详情用（不含明文 token）。
 type SubtitleWorkerTokenItem struct {
-	ID             string     `json:"id"`
-	Name           string     `json:"name"`
-	TokenPrefix    string     `json:"tokenPrefix"`
-	MaxConcurrency int        `json:"maxConcurrency"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	TokenPrefix string `json:"tokenPrefix"`
+	// 旧字段：不区分能力时的总并发上限兜底（前端可继续显示）
+	MaxConcurrency int `json:"maxConcurrency"`
+	// v2 新增：分能力维度的并发上限（admin 面板可分别调）
+	MaxAudioConcurrency    int `json:"maxAudioConcurrency"`
+	MaxSubtitleConcurrency int `json:"maxSubtitleConcurrency"`
 	// CurrentRunning 该 token 名下所有 worker 当前持有的 RUNNING 任务数（admin 列表实时统计）
-	CurrentRunning int        `json:"currentRunning"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	LastUsedAt     *time.Time `json:"lastUsedAt,omitempty"`
-	RevokedAt      *time.Time `json:"revokedAt,omitempty"`
+	CurrentRunning int `json:"currentRunning"`
+	// CurrentAudioRunning / CurrentSubtitleRunning 分维度统计，便于 admin 看出限流来自哪一侧
+	CurrentAudioRunning    int        `json:"currentAudioRunning"`
+	CurrentSubtitleRunning int        `json:"currentSubtitleRunning"`
+	CreatedAt              time.Time  `json:"createdAt"`
+	LastUsedAt             *time.Time `json:"lastUsedAt,omitempty"`
+	RevokedAt              *time.Time `json:"revokedAt,omitempty"`
 }
 
 // SubtitleWorkerTokenCreateRequest admin 生成 token。
 type SubtitleWorkerTokenCreateRequest struct {
 	Name           string `json:"name" binding:"required,min=1,max=64"`
 	MaxConcurrency int    `json:"maxConcurrency,omitempty"` // 0 时按服务端默认 1
+	// 缺省时按服务端默认（audio=2 / subtitle=1）
+	MaxAudioConcurrency    int `json:"maxAudioConcurrency,omitempty"`
+	MaxSubtitleConcurrency int `json:"maxSubtitleConcurrency,omitempty"`
 }
 
-// SubtitleWorkerTokenUpdateRequest admin 编辑 token（目前仅支持改并发上限）。
+// SubtitleWorkerTokenUpdateRequest admin 编辑 token。所有字段都用指针，nil 表示不修改。
 type SubtitleWorkerTokenUpdateRequest struct {
-	MaxConcurrency *int `json:"maxConcurrency,omitempty"`
+	MaxConcurrency         *int `json:"maxConcurrency,omitempty"`
+	MaxAudioConcurrency    *int `json:"maxAudioConcurrency,omitempty"`
+	MaxSubtitleConcurrency *int `json:"maxSubtitleConcurrency,omitempty"`
 }
 
 // SubtitleWorkerTokenCreateResponse 仅本次返回明文 token。
@@ -252,4 +339,23 @@ type SubtitleWorkerItem struct {
 	CompletedJobs int64     `json:"completedJobs"`
 	FailedJobs    int64     `json:"failedJobs"`
 	Online        bool      `json:"online"` // last_seen_at 在 staleThreshold 内
+	// v2 新增：worker 自报的 capability 字符串数组（admin UI 渲染 badge）
+	Capabilities []string `json:"capabilities"`
+}
+
+// IntermediateAudioStats 服务端中转池监控用（admin 面板）。
+//
+// FileCount / TotalBytes 来自实际扫盘；OldestUploadedAt 取 audio_uploaded 任务里
+// audio_uploaded_at 最早的一条；QuotaBytes 来自 cfg（默认 50 GiB）。
+type IntermediateAudioStats struct {
+	FileCount        int        `json:"fileCount"`
+	TotalBytes       int64      `json:"totalBytes"`
+	OldestUploadedAt *time.Time `json:"oldestUploadedAt,omitempty"`
+	QuotaBytes       int64      `json:"quotaBytes"`
+}
+
+// AdminAlert admin 顶部告警条用。
+type AdminAlert struct {
+	Level   string `json:"level"` // "info" / "warn" / "error"
+	Message string `json:"message"`
 }

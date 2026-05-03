@@ -25,6 +25,7 @@ import { SubtitleWorkersPanel } from '../components/admin/SubtitleWorkersPanel.j
 
 const STATUS_FILTERS: Array<{ value: string; label: string }> = [
   { value: '', label: '全部' },
+  { value: 'MISSING', label: '尚未生成' },
   { value: 'PENDING', label: '排队中' },
   { value: 'RUNNING', label: '处理中' },
   { value: 'DONE', label: '已完成' },
@@ -34,7 +35,10 @@ const STATUS_FILTERS: Array<{ value: string; label: string }> = [
 
 const STAGE_LABELS: Record<string, string> = {
   queued: '排队',
+  downloading: '下载切片',
   extracting: '抽取音频',
+  encoding_intermediate: 'FLAC 编码',
+  audio_uploaded: '已上传 FLAC',
   asr: '语音识别',
   translate: '翻译',
   writing: '写入字幕',
@@ -58,6 +62,7 @@ export function AdminSubtitlesPage() {
   const [categoryFilter, setCategoryFilter] = useState(''); // ''=全部, '_none'=未分类, 其它=具体 categoryId
   const [search, setSearch] = useState('');
   const [errorDetail, setErrorDetail] = useState<SubtitleJob | null>(null);
+  const [detailJob, setDetailJob] = useState<SubtitleJob | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   // 跨页保留的选中 mediaId 集合
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -447,7 +452,8 @@ export function AdminSubtitlesPage() {
                   const checked = selectedIds.has(job.mediaId);
                   return (
                   <tr
-                    key={job.id}
+                    // MISSING 行的 job.id 为空，用 mediaId 作 key 兜底避免 React 重复 key 警告
+                    key={job.id || `media-${job.mediaId}`}
                     className={`border-t border-emby-border hover:bg-emby-bg-elevated/50 ${checked ? 'bg-emby-green/5' : ''}`}
                   >
                     <td className="pl-4 pr-2 py-3">
@@ -496,6 +502,13 @@ export function AdminSubtitlesPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
+                        <button
+                          onClick={() => setDetailJob(job)}
+                          title="任务详情"
+                          className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary transition-colors"
+                        >
+                          <Eye className="w-4 h-4" />
+                        </button>
                         {job.status === 'FAILED' && (
                           <button
                             onClick={() => setErrorDetail(job)}
@@ -623,6 +636,11 @@ export function AdminSubtitlesPage() {
             </div>
           </div>
         </Modal>
+      )}
+
+      {/* 任务详情弹窗（双阶段 timeline，M8.2） */}
+      {detailJob && (
+        <JobDetailModal job={detailJob} onClose={() => setDetailJob(null)} />
       )}
 
       {/* 配置弹窗：可编辑表单 */}
@@ -1013,4 +1031,252 @@ function ToggleRow({
       </div>
     </label>
   );
+}
+
+// ---- M8.2 任务详情双阶段 timeline ----
+
+/**
+ * JobDetailModal：展示一个任务的完整 timeline + 元数据。
+ *
+ * 双阶段拆分（v2 分布式）：
+ *   - audio worker 段：queued → downloading → extracting → encoding_intermediate → audio_uploaded
+ *   - subtitle worker 段：asr → translate → writing → done
+ *
+ * 由于服务端目前只持久化 createdAt / startedAt / audioUploadedAt / finishedAt 四个时间戳
+ * （阶段细分时间未单独落库），timeline 用这 4 个锚点 + stage 字段推断出当前进度。
+ */
+function JobDetailModal({ job, onClose }: { job: SubtitleJob; onClose: () => void }) {
+  const stage = job.stage || 'queued';
+  const audioStages: SubtitleJob['stage'][] = [
+    'queued',
+    'downloading',
+    'extracting',
+    'encoding_intermediate',
+    'audio_uploaded',
+  ];
+  const subtitleStages: SubtitleJob['stage'][] = ['asr', 'translate', 'writing', 'done'];
+  const stageLabels: Record<string, string> = {
+    queued: '排队',
+    downloading: '下载切片',
+    extracting: '抽取音频',
+    encoding_intermediate: 'FLAC 编码',
+    audio_uploaded: '已上传 FLAC',
+    asr: 'ASR 识别',
+    translate: '翻译',
+    writing: '写 VTT',
+    done: '完成',
+  };
+
+  // 当前 stage 在两段中的位置（用于高亮 + 已完成判定）
+  const audioIdx = audioStages.indexOf(stage);
+  const subIdx = subtitleStages.indexOf(stage);
+  const audioPhaseDone = audioIdx === -1 || subIdx >= 0 || stage === 'done';
+  const subtitlePhaseStarted = subIdx >= 0 || stage === 'done';
+
+  return (
+    <Modal onClose={onClose} title="任务详情">
+      <div className="space-y-5 max-h-[75vh] overflow-auto">
+        {/* 标题 + 状态 */}
+        <div>
+          <div className="text-emby-text-secondary text-xs">媒体</div>
+          <div className="text-white">{job.mediaTitle || job.mediaId}</div>
+          <div className="mt-2 text-xs text-emby-text-muted flex items-center gap-3 flex-wrap">
+            <code className="font-mono">{job.id.slice(0, 8)}</code>
+            <span>
+              {job.sourceLang} → {job.targetLang}
+            </span>
+            <span>{stageLabels[stage] ?? stage}</span>
+            <span className="tabular-nums">{job.progress}%</span>
+          </div>
+        </div>
+
+        {/* timeline */}
+        <div>
+          <div className="text-emby-text-secondary text-xs mb-2">流水线进度</div>
+          <div className="space-y-3">
+            <PhaseBlock
+              label="① audio_extract worker"
+              workerColor="blue"
+              workerId={job.audioWorkerId}
+              startedAt={job.startedAt}
+              finishedAt={job.audioUploadedAt}
+              stages={audioStages}
+              stageLabels={stageLabels}
+              currentStage={stage}
+              phaseStartIdx={0}
+              phaseEndIdx={audioStages.length - 1}
+              currentInPhaseIdx={audioIdx}
+              phaseDone={audioPhaseDone}
+              extra={
+                job.audioArtifactSize
+                  ? `FLAC ${(job.audioArtifactSize / 1024 / 1024).toFixed(2)} MB · ${formatDurationMs(job.audioArtifactDurationMs ?? 0)}`
+                  : undefined
+              }
+            />
+            <PhaseBlock
+              label="② asr_subtitle worker"
+              workerColor="purple"
+              workerId={job.subtitleWorkerId}
+              startedAt={job.audioUploadedAt}
+              finishedAt={job.finishedAt}
+              stages={subtitleStages}
+              stageLabels={stageLabels}
+              currentStage={stage}
+              phaseStartIdx={0}
+              phaseEndIdx={subtitleStages.length - 1}
+              currentInPhaseIdx={subIdx}
+              phaseDone={job.status === 'DONE'}
+              greyedOut={!subtitlePhaseStarted}
+              extra={job.segmentCount > 0 ? `${job.segmentCount} 条 cue` : undefined}
+            />
+          </div>
+        </div>
+
+        {/* meta */}
+        <div className="grid grid-cols-2 gap-3 text-xs">
+          <Meta label="创建" value={fmtTs(job.createdAt)} />
+          <Meta label="更新" value={fmtTs(job.updatedAt)} />
+          <Meta label="开始" value={fmtTs(job.startedAt)} />
+          <Meta label="audio 上传" value={fmtTs(job.audioUploadedAt)} />
+          <Meta label="结束" value={fmtTs(job.finishedAt)} />
+          <Meta label="ASR 模型" value={job.asrModel || '—'} />
+          <Meta label="翻译模型" value={job.mtModel || '—'} />
+          <Meta label="cue 数" value={String(job.segmentCount)} />
+        </div>
+
+        {/* error */}
+        {job.errorMsg && (
+          <div>
+            <div className="text-emby-text-secondary text-xs mb-1">错误信息</div>
+            <pre className="text-red-300 bg-black/30 p-3 rounded font-mono text-xs whitespace-pre-wrap break-words">
+              {job.errorMsg}
+            </pre>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated text-sm"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function PhaseBlock({
+  label,
+  workerColor,
+  workerId,
+  startedAt,
+  finishedAt,
+  stages,
+  stageLabels,
+  currentInPhaseIdx,
+  phaseDone,
+  greyedOut,
+  extra,
+}: {
+  label: string;
+  workerColor: 'blue' | 'purple';
+  workerId?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  stages: string[];
+  stageLabels: Record<string, string>;
+  currentStage: string;
+  phaseStartIdx: number;
+  phaseEndIdx: number;
+  currentInPhaseIdx: number;
+  phaseDone: boolean;
+  greyedOut?: boolean;
+  extra?: string;
+}) {
+  const headerColor = workerColor === 'blue' ? 'text-blue-300' : 'text-purple-300';
+  const dotColor = workerColor === 'blue' ? 'bg-blue-500' : 'bg-purple-500';
+  return (
+    <div className={`rounded border border-emby-border bg-emby-bg-elevated/40 p-3 ${greyedOut ? 'opacity-50' : ''}`}>
+      <div className="flex items-center justify-between mb-2">
+        <div className={`text-xs font-medium ${headerColor}`}>{label}</div>
+        <div className="text-[11px] text-emby-text-muted flex items-center gap-2">
+          {workerId && (
+            <code className="font-mono" title={workerId}>
+              {workerId.slice(0, 8)}
+            </code>
+          )}
+          {extra && <span>{extra}</span>}
+        </div>
+      </div>
+      <div className="flex items-center gap-1 flex-wrap">
+        {stages.map((s, idx) => {
+          const isPast = phaseDone || (currentInPhaseIdx >= 0 && idx < currentInPhaseIdx);
+          const isCur = currentInPhaseIdx === idx && !phaseDone;
+          const isFuture = !isPast && !isCur;
+          return (
+            <div key={s} className="flex items-center gap-1">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isPast
+                    ? dotColor
+                    : isCur
+                    ? `${dotColor} animate-pulse`
+                    : 'bg-emby-bg-elevated border border-emby-border'
+                }`}
+              />
+              <span
+                className={`text-[11px] ${
+                  isPast ? 'text-white' : isCur ? 'text-white font-medium' : 'text-emby-text-muted'
+                } ${isFuture ? '' : ''}`}
+              >
+                {stageLabels[s] ?? s}
+              </span>
+              {idx < stages.length - 1 && (
+                <span className="text-emby-text-muted text-[10px]">→</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-2 text-[11px] text-emby-text-muted flex items-center gap-3">
+        <span>开始 {fmtTs(startedAt)}</span>
+        {finishedAt && <span>结束 {fmtTs(finishedAt)}</span>}
+        {startedAt && finishedAt && (
+          <span>耗时 {formatDurationMs(new Date(finishedAt).getTime() - new Date(startedAt).getTime())}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-emby-text-secondary">{label}</div>
+      <div className="text-emby-text-primary truncate" title={value}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function fmtTs(s?: string | null): string {
+  if (!s) return '—';
+  const t = new Date(s);
+  if (!Number.isFinite(t.getTime())) return '—';
+  return t.toLocaleString('zh-CN');
+}
+
+function formatDurationMs(ms: number): string {
+  if (!ms || ms <= 0) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  if (m < 60) return `${m}m${sec.toString().padStart(2, '0')}s`;
+  const h = Math.floor(m / 60);
+  const min = m % 60;
+  return `${h}h${min.toString().padStart(2, '0')}m`;
 }

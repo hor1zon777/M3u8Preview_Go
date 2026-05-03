@@ -71,12 +71,13 @@ func newTestSubtitleService(t *testing.T, staleThreshold time.Duration) (*Subtit
 	t.Cleanup(cancel)
 
 	svc := &SubtitleService{
-		db:     db,
-		cfg:    cfg,
-		jobs:   make(chan string, 16),
-		stop:   make(chan struct{}),
-		ctx:    ctx,
-		cancel: cancel,
+		db:          db,
+		cfg:         cfg,
+		audioBroker: NewAudioBroker(),
+		jobs:        make(chan string, 16),
+		stop:        make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	return svc, db
 }
@@ -356,7 +357,7 @@ func TestWorkerComplete_Success(t *testing.T) {
 func TestCreateAndRevokeWorkerToken(t *testing.T) {
 	svc, db := newTestSubtitleService(t, 10*time.Minute)
 
-	plaintext, rec, err := svc.CreateWorkerToken("home gpu", 1)
+	plaintext, rec, err := svc.CreateWorkerToken("home gpu", 1, 2, 1)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
@@ -405,7 +406,7 @@ func TestCreateAndRevokeWorkerToken(t *testing.T) {
 func TestUpdateWorkerToken_MaxConcurrency(t *testing.T) {
 	svc, _ := newTestSubtitleService(t, 10*time.Minute)
 
-	_, rec, err := svc.CreateWorkerToken("home gpu", 1)
+	_, rec, err := svc.CreateWorkerToken("home gpu", 1, 2, 1)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
@@ -472,7 +473,7 @@ func TestClaimNextJob_TokenLimit(t *testing.T) {
 	svc, db := newTestSubtitleService(t, 10*time.Minute)
 
 	// 创建一个 MaxConcurrency=1 的 token
-	_, tokenRec, err := svc.CreateWorkerToken("shared", 1)
+	_, tokenRec, err := svc.CreateWorkerToken("shared", 1, 2, 1)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}

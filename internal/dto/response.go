@@ -3,10 +3,14 @@ package dto
 
 // APIResponse 是后端所有 JSON 响应的统一信封，与 TypeScript ApiResponse<T> 等价。
 // 为简化处理，Data 使用 interface{}（any），Meta 可为空。
+//
+// Code 是机器可读的错误码（如 "WORKER_AUDIO_SHA256_MISMATCH"），仅在失败响应时填充；
+// 客户端可据此区分不同失败原因，无需 parse Error 文本。
 type APIResponse struct {
 	Success bool        `json:"success"`
 	Data    interface{} `json:"data,omitempty"`
 	Error   string      `json:"error,omitempty"`
+	Code    string      `json:"code,omitempty"`
 	Message string      `json:"message,omitempty"`
 }
 

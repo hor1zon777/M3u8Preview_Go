@@ -13,6 +13,9 @@ import type {
   SubtitleWorker,
   SubtitleWorkerToken,
   SubtitleWorkerTokenCreateResponse,
+  SubtitleWorkerTokenCreateRequest,
+  IntermediateAudioStats,
+  AdminAlert,
 } from '@m3u8-preview/shared';
 
 /**
@@ -134,17 +137,20 @@ export const subtitleApi = {
     return data.data ?? [];
   },
 
-  /** 生成新 token，仅本次返回明文。maxConcurrency 不传走服务端默认 1。 */
-  async createWorkerToken(name: string, maxConcurrency?: number): Promise<SubtitleWorkerTokenCreateResponse> {
+  /** 生成新 token，仅本次返回明文。maxConcurrency / maxAudioConcurrency / maxSubtitleConcurrency 不传走服务端默认。 */
+  async createWorkerToken(req: SubtitleWorkerTokenCreateRequest): Promise<SubtitleWorkerTokenCreateResponse> {
     const { data } = await api.post<ApiResponse<SubtitleWorkerTokenCreateResponse>>(
       '/admin/subtitle/worker-tokens',
-      { name, maxConcurrency },
+      req,
     );
     return data.data!;
   },
 
-  /** 编辑 token（目前仅 maxConcurrency）。 */
-  async updateWorkerToken(id: string, payload: { maxConcurrency?: number }): Promise<SubtitleWorkerToken> {
+  /** 编辑 token（maxConcurrency / maxAudioConcurrency / maxSubtitleConcurrency）。 */
+  async updateWorkerToken(
+    id: string,
+    payload: { maxConcurrency?: number; maxAudioConcurrency?: number; maxSubtitleConcurrency?: number },
+  ): Promise<SubtitleWorkerToken> {
     const { data } = await api.put<ApiResponse<SubtitleWorkerToken>>(
       `/admin/subtitle/worker-tokens/${encodeURIComponent(id)}`,
       payload,
@@ -155,5 +161,21 @@ export const subtitleApi = {
   /** 吊销 token（soft revoke）。 */
   async revokeWorkerToken(id: string): Promise<void> {
     await api.delete(`/admin/subtitle/worker-tokens/${encodeURIComponent(id)}`);
+  },
+
+  // ---- v2 中转池监控 + 告警 ----
+
+  /** 中转池实时统计：文件数 / 总字节 / 最早 audio_uploaded_at / quota。 */
+  async intermediateStats(): Promise<IntermediateAudioStats> {
+    const { data } = await api.get<ApiResponse<IntermediateAudioStats>>(
+      '/admin/subtitle/intermediate-stats',
+    );
+    return data.data!;
+  },
+
+  /** admin 顶部告警条数据源（无告警时返回空数组）。 */
+  async alerts(): Promise<AdminAlert[]> {
+    const { data } = await api.get<ApiResponse<AdminAlert[]>>('/admin/subtitle/alerts');
+    return data.data ?? [];
   },
 };

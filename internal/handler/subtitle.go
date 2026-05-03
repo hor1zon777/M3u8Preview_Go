@@ -75,6 +75,10 @@ func (h *SubtitleHandler) RegisterAdmin(rg *gin.RouterGroup) {
 	rg.POST("/worker-tokens", h.createWorkerToken)
 	rg.PUT("/worker-tokens/:id", h.updateWorkerToken)
 	rg.DELETE("/worker-tokens/:id", h.revokeWorkerToken)
+
+	// v2 分布式 worker 监控
+	rg.GET("/intermediate-stats", h.intermediateStats)
+	rg.GET("/alerts", h.alerts)
 }
 
 // getStatus 公开（需登录）状态查询。
@@ -317,7 +321,7 @@ func (h *SubtitleHandler) createWorkerToken(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请求格式错误"))
 		return
 	}
-	plaintext, rec, err := h.svc.CreateWorkerToken(req.Name, req.MaxConcurrency)
+	plaintext, rec, err := h.svc.CreateWorkerToken(req.Name, req.MaxConcurrency, req.MaxAudioConcurrency, req.MaxSubtitleConcurrency)
 	if err != nil {
 		_ = c.Error(err)
 		return
@@ -373,4 +377,24 @@ func (h *SubtitleHandler) revokeWorkerToken(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, dto.APIResponse{Success: true, Message: "已吊销"})
+}
+
+// intermediateStats 给 admin 中转池监控小卡用。
+//
+// 返回 IntermediateAudioStats（fileCount / totalBytes / oldestUploadedAt / quotaBytes）。
+// admin 面板 5s 轮询。
+func (h *SubtitleHandler) intermediateStats(c *gin.Context) {
+	stats, err := h.svc.IntermediateAudioStats()
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.OK(stats))
+}
+
+// alerts 给 admin 顶部告警条用。
+//
+// 返回非空 AdminAlert 数组（无告警时返回空数组）。admin 面板 30s 轮询足够。
+func (h *SubtitleHandler) alerts(c *gin.Context) {
+	c.JSON(http.StatusOK, dto.OK(h.svc.Alerts()))
 }

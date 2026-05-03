@@ -39,9 +39,22 @@ type SubtitleJob struct {
 	//   - ClaimedAt 认领时间，配合 LastHeartbeatAt 用于检测僵尸任务
 	//   - LastHeartbeatAt worker 上次上报进度的时间；超过阈值（默认 10 分钟）由 RecoverStaleJobs 重置回 PENDING
 	// 本地 in-process worker 模式下这些字段保持空值。
-	ClaimedBy        string     `gorm:"column:claimed_by;type:text;index:idx_subtitle_claimed_by" json:"claimedBy,omitempty"`
-	ClaimedAt        *time.Time `gorm:"column:claimed_at" json:"claimedAt,omitempty"`
-	LastHeartbeatAt  *time.Time `gorm:"column:last_heartbeat_at" json:"lastHeartbeatAt,omitempty"`
+	ClaimedBy       string     `gorm:"column:claimed_by;type:text;index:idx_subtitle_claimed_by" json:"claimedBy,omitempty"`
+	ClaimedAt       *time.Time `gorm:"column:claimed_at" json:"claimedAt,omitempty"`
+	LastHeartbeatAt *time.Time `gorm:"column:last_heartbeat_at" json:"lastHeartbeatAt,omitempty"`
+
+	// 远程 worker 协作字段（v2，分布式拆分）：
+	//   - audio_extract worker 完成后写入 audio_artifact_*，stage 切到 audio_uploaded；
+	//   - asr_subtitle worker 接手后通过 audio_artifact_url 拉取 FLAC，再走 ASR/翻译/写 VTT；
+	//   - audio_worker_id / subtitle_worker_id 分别记录两阶段的执行者，便于审计与故障定位。
+	AudioArtifactPath       string     `gorm:"column:audio_artifact_path;type:text" json:"audioArtifactPath,omitempty"`
+	AudioArtifactSize       int64      `gorm:"column:audio_artifact_size;type:bigint;default:0" json:"audioArtifactSize,omitempty"`
+	AudioArtifactSHA256     string     `gorm:"column:audio_artifact_sha256;type:text" json:"audioArtifactSha256,omitempty"`
+	AudioArtifactFormat     string     `gorm:"column:audio_artifact_format;type:text" json:"audioArtifactFormat,omitempty"`
+	AudioArtifactDurationMs int64      `gorm:"column:audio_artifact_duration_ms;type:bigint;default:0" json:"audioArtifactDurationMs,omitempty"`
+	AudioUploadedAt         *time.Time `gorm:"column:audio_uploaded_at" json:"audioUploadedAt,omitempty"`
+	AudioWorkerID           string     `gorm:"column:audio_worker_id;type:text;index:idx_subtitle_audio_worker" json:"audioWorkerId,omitempty"`
+	SubtitleWorkerID        string     `gorm:"column:subtitle_worker_id;type:text;index:idx_subtitle_subtitle_worker" json:"subtitleWorkerId,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"createdAt"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updatedAt"`

@@ -15,16 +15,31 @@ import {
   Activity,
   Pencil,
   Gauge,
+  Mic,
+  Download,
+  HardDrive,
+  AlertTriangle,
+  Info,
 } from 'lucide-react';
 import { subtitleApi } from '../../services/subtitleApi.js';
-import type { SubtitleWorker, SubtitleWorkerToken } from '@m3u8-preview/shared';
+import type {
+  SubtitleWorker,
+  SubtitleWorkerToken,
+  WorkerCapability,
+} from '@m3u8-preview/shared';
 
 /**
  * 字幕远程 GPU Worker 面板。
  *
+ * 三段式：
+ *   - 顶部 admin 告警条（无 worker 在线 / 中转池满）
+ *   - 中部：在线 worker 列表（5 秒轮询，显示 capability badge）
+ *   - 底部：Worker Token 管理（默认折叠）
+ *   - 嵌入：中转池监控小卡（5s 轮询）
+ *
  * 上半区：在线 worker 列表（5 秒轮询）
  *   - last_seen 在 staleThreshold（默认 10min）内视为在线
- *   - 显示 GPU / 当前任务 / 累计完成/失败数
+ *   - 显示 GPU / 当前任务 / 累计完成/失败数 / capability badge
  *
  * 下半区：Worker Token 管理（默认折叠）
  *   - 列出 admin 生成的所有 token（不含明文）
@@ -36,8 +51,86 @@ export function SubtitleWorkersPanel() {
 
   return (
     <div className="mb-6 space-y-3">
+      <AlertsBar />
       <WorkersOnlineCard />
+      <IntermediatePoolCard />
       <TokensCard open={tokenAreaOpen} onToggle={() => setTokenAreaOpen((v) => !v)} />
+    </div>
+  );
+}
+
+// ---- 顶部告警条（M8.4） ----
+
+function AlertsBar() {
+  const { data: alerts = [] } = useQuery({
+    queryKey: ['admin', 'subtitle', 'alerts'],
+    queryFn: () => subtitleApi.alerts(),
+    refetchInterval: 30_000,
+  });
+  if (alerts.length === 0) return null;
+  return (
+    <div className="space-y-2">
+      {alerts.map((a, idx) => (
+        <div
+          key={idx}
+          className={`flex items-start gap-2 px-3 py-2 rounded-md border text-xs ${
+            a.level === 'error'
+              ? 'bg-red-900/30 border-red-700/40 text-red-200'
+              : a.level === 'warn'
+              ? 'bg-yellow-900/25 border-yellow-700/40 text-yellow-200'
+              : 'bg-blue-900/25 border-blue-700/40 text-blue-200'
+          }`}
+        >
+          {a.level === 'info' ? (
+            <Info className="w-4 h-4 mt-0.5 shrink-0" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          )}
+          <span className="leading-relaxed">{a.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---- 中转池监控小卡（M8.3，v3 broker 模式适配） ----
+
+/**
+ * v3 broker 模式：服务端不再持有 FLAC 文件，"中转池"语义改为
+ * 当前等待 subtitle worker 拉取的任务集合（DB 中 stage=audio_uploaded）。
+ *
+ * 显示：
+ *   - FLAC 待拉数 = stats.fileCount（即 audio_uploaded 任务数）
+ *   - 估算总字节 = sum(audio_artifact_size)（保留在 audio worker 本地）
+ *   - 最早 audio_ready 时间（看是不是有 FLAC 长时间没人来取）
+ */
+function IntermediatePoolCard() {
+  const { data: stats } = useQuery({
+    queryKey: ['admin', 'subtitle', 'intermediate-stats'],
+    queryFn: () => subtitleApi.intermediateStats(),
+    refetchInterval: 5000,
+  });
+  if (!stats) return null;
+  const totalMB = stats.totalBytes / 1024 / 1024;
+  return (
+    <div className="bg-emby-bg-card border border-emby-border rounded-lg px-4 py-3">
+      <div className="flex items-center justify-between mb-1">
+        <div className="flex items-center gap-2">
+          <HardDrive className="w-4 h-4 text-emby-text-secondary" />
+          <h3 className="text-sm font-medium text-white">FLAC 转交队列</h3>
+        </div>
+        <span className="text-xs text-emby-text-muted tabular-nums">
+          {stats.fileCount} 个待 ASR · 估算 {totalMB.toFixed(1)} MB
+        </span>
+      </div>
+      <div className="text-[11px] text-emby-text-muted">
+        v3 broker 模式：FLAC 留在 audio worker 本地，subtitle worker 拉取时由服务端实时桥接（服务端 0 落盘）
+      </div>
+      {stats.oldestUploadedAt && (
+        <div className="mt-1 text-[11px] text-emby-text-muted">
+          最早 audio_ready：{new Date(stats.oldestUploadedAt).toLocaleString('zh-CN')}（{formatRelativeTime(stats.oldestUploadedAt)}）
+        </div>
+      )}
     </div>
   );
 }
@@ -91,11 +184,16 @@ function WorkerRow({ worker }: { worker: SubtitleWorker }) {
         aria-label={worker.online ? '在线' : '离线'}
       />
       <div className="flex-1 min-w-0">
-        <div className="text-white font-medium truncate" title={worker.name}>
-          {worker.name}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-white font-medium truncate" title={worker.name}>
+            {worker.name}
+          </span>
           {worker.version && (
-            <span className="ml-2 text-xs text-emby-text-muted font-normal">v{worker.version}</span>
+            <span className="text-xs text-emby-text-muted font-normal">v{worker.version}</span>
           )}
+          {(worker.capabilities ?? []).map((c) => (
+            <CapabilityBadge key={c} cap={c} />
+          ))}
         </div>
         <div className="text-xs text-emby-text-muted truncate flex items-center gap-3 mt-0.5">
           {worker.gpu && (
@@ -122,6 +220,31 @@ function WorkerRow({ worker }: { worker: SubtitleWorker }) {
       </div>
     </div>
   );
+}
+
+/** 能力徽章：audio_extract = 蓝色（带宽角色）；asr_subtitle = 紫色（GPU 角色）。 */
+function CapabilityBadge({ cap }: { cap: WorkerCapability }) {
+  if (cap === 'audio_extract') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-blue-900/40 text-blue-200 border border-blue-700/40"
+        title="audio_extract：负责下载 m3u8 + 抽音 + FLAC 编码"
+      >
+        <Download className="w-3 h-3" /> 下载抽音
+      </span>
+    );
+  }
+  if (cap === 'asr_subtitle') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-purple-900/40 text-purple-200 border border-purple-700/40"
+        title="asr_subtitle：负责 ASR + 翻译 + VTT"
+      >
+        <Mic className="w-3 h-3" /> ASR 字幕
+      </span>
+    );
+  }
+  return null;
 }
 
 // ---- Token 管理 ----
@@ -161,8 +284,18 @@ function TokensList() {
   });
 
   const createMutation = useMutation({
-    mutationFn: (payload: { name: string; maxConcurrency: number }) =>
-      subtitleApi.createWorkerToken(payload.name, payload.maxConcurrency),
+    mutationFn: (payload: {
+      name: string;
+      maxConcurrency: number;
+      maxAudioConcurrency: number;
+      maxSubtitleConcurrency: number;
+    }) =>
+      subtitleApi.createWorkerToken({
+        name: payload.name,
+        maxConcurrency: payload.maxConcurrency,
+        maxAudioConcurrency: payload.maxAudioConcurrency,
+        maxSubtitleConcurrency: payload.maxSubtitleConcurrency,
+      }),
     onSuccess: (resp) => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'subtitle', 'worker-tokens'] });
       setNewToken({ token: resp.token, name: resp.record.name });
@@ -184,8 +317,17 @@ function TokensList() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: (payload: { id: string; maxConcurrency: number }) =>
-      subtitleApi.updateWorkerToken(payload.id, { maxConcurrency: payload.maxConcurrency }),
+    mutationFn: (payload: {
+      id: string;
+      maxConcurrency: number;
+      maxAudioConcurrency: number;
+      maxSubtitleConcurrency: number;
+    }) =>
+      subtitleApi.updateWorkerToken(payload.id, {
+        maxConcurrency: payload.maxConcurrency,
+        maxAudioConcurrency: payload.maxAudioConcurrency,
+        maxSubtitleConcurrency: payload.maxSubtitleConcurrency,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'subtitle', 'worker-tokens'] });
       setEditing(null);
@@ -256,7 +398,9 @@ function TokensList() {
       {showCreate && (
         <CreateTokenModal
           onClose={() => setShowCreate(false)}
-          onSubmit={(name, maxConcurrency) => createMutation.mutate({ name, maxConcurrency })}
+          onSubmit={(name, maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency) =>
+            createMutation.mutate({ name, maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency })
+          }
           submitting={createMutation.isPending}
         />
       )}
@@ -266,8 +410,13 @@ function TokensList() {
           token={editing}
           submitting={updateMutation.isPending}
           onClose={() => setEditing(null)}
-          onSubmit={(maxConcurrency) =>
-            updateMutation.mutate({ id: editing.id, maxConcurrency })
+          onSubmit={(maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency) =>
+            updateMutation.mutate({
+              id: editing.id,
+              maxConcurrency,
+              maxAudioConcurrency,
+              maxSubtitleConcurrency,
+            })
           }
         />
       )}
@@ -287,17 +436,6 @@ function TokenRow({
   onRevoke: () => void;
 }) {
   const revoked = !!token.revokedAt;
-  const max = token.maxConcurrency;
-  const cur = token.currentRunning;
-  // 进度条颜色：满载红、>=70% 黄、其它绿
-  const ratio = max > 0 ? cur / max : 0;
-  const barColor = max <= 0
-    ? 'bg-emby-text-muted'
-    : ratio >= 1
-    ? 'bg-red-500'
-    : ratio >= 0.7
-    ? 'bg-yellow-500'
-    : 'bg-emby-green';
   return (
     <tr className="border-t border-emby-border">
       <td className="px-4 py-2.5 text-white">{token.name}</td>
@@ -305,16 +443,24 @@ function TokenRow({
         <code className="text-xs font-mono text-emby-text-secondary">{token.tokenPrefix}…</code>
       </td>
       <td className="px-4 py-2.5">
-        <div className="flex items-center gap-2 min-w-[110px]">
-          <div className="flex-1 h-1.5 rounded-full bg-emby-bg-elevated overflow-hidden">
-            <div
-              className={`h-full ${barColor} transition-all`}
-              style={{ width: `${max > 0 ? Math.min(100, (cur / max) * 100) : 100}%` }}
-            />
-          </div>
-          <span className="text-xs tabular-nums text-emby-text-secondary whitespace-nowrap">
-            {cur} / {max <= 0 ? '∞' : max}
-          </span>
+        <div className="space-y-1.5 min-w-[160px]">
+          <ConcurrencyBar
+            label="audio"
+            cur={token.currentAudioRunning}
+            max={token.maxAudioConcurrency}
+            color="blue"
+          />
+          <ConcurrencyBar
+            label="subtitle"
+            cur={token.currentSubtitleRunning}
+            max={token.maxSubtitleConcurrency}
+            color="purple"
+          />
+          {token.maxConcurrency > 0 && (
+            <div className="text-[10px] text-emby-text-muted">
+              总上限 {token.currentRunning} / {token.maxConcurrency}
+            </div>
+          )}
         </div>
       </td>
       <td className="px-4 py-2.5 text-xs text-emby-text-secondary">
@@ -358,17 +504,62 @@ function TokenRow({
   );
 }
 
+function ConcurrencyBar({
+  label,
+  cur,
+  max,
+  color,
+}: {
+  label: string;
+  cur: number;
+  max: number;
+  color: 'blue' | 'purple';
+}) {
+  const ratio = max > 0 ? cur / max : 0;
+  const fillColor =
+    max <= 0
+      ? 'bg-emby-text-muted'
+      : ratio >= 1
+      ? 'bg-red-500'
+      : ratio >= 0.7
+      ? 'bg-yellow-500'
+      : color === 'blue'
+      ? 'bg-blue-500'
+      : 'bg-purple-500';
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-[10px] text-emby-text-muted w-12 shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 rounded-full bg-emby-bg-elevated overflow-hidden">
+        <div
+          className={`h-full ${fillColor} transition-all`}
+          style={{ width: `${max > 0 ? Math.min(100, ratio * 100) : 100}%` }}
+        />
+      </div>
+      <span className="text-[10px] tabular-nums text-emby-text-secondary whitespace-nowrap">
+        {cur} / {max <= 0 ? '∞' : max}
+      </span>
+    </div>
+  );
+}
+
 function CreateTokenModal({
   onClose,
   onSubmit,
   submitting,
 }: {
   onClose: () => void;
-  onSubmit: (name: string, maxConcurrency: number) => void;
+  onSubmit: (
+    name: string,
+    maxConcurrency: number,
+    maxAudioConcurrency: number,
+    maxSubtitleConcurrency: number,
+  ) => void;
   submitting: boolean;
 }) {
   const [name, setName] = useState('');
-  const [maxConcurrency, setMaxConcurrency] = useState(1);
+  const [maxConcurrency, setMaxConcurrency] = useState(0);
+  const [maxAudioConcurrency, setMaxAudioConcurrency] = useState(2);
+  const [maxSubtitleConcurrency, setMaxSubtitleConcurrency] = useState(1);
   return (
     <Modal title="生成 Worker Token" onClose={onClose}>
       <div className="space-y-3">
@@ -386,21 +577,31 @@ function CreateTokenModal({
             className="w-full px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green text-sm"
           />
         </div>
-        <div>
-          <label className="block text-xs text-emby-text-secondary mb-1">
-            并发上限（该 token 名下 worker 同时持有的 RUNNING 任务数，1-64）
-          </label>
-          <input
-            type="number"
-            min={1}
+        <div className="grid grid-cols-3 gap-2">
+          <NumberField
+            label="audio 并发"
+            hint="audio_extract（下载抽音）维度上限。机 A 带宽足时可调到 2~3。0 = 不限。"
+            min={0}
+            max={64}
+            value={maxAudioConcurrency}
+            onChange={setMaxAudioConcurrency}
+          />
+          <NumberField
+            label="subtitle 并发"
+            hint="asr_subtitle（GPU ASR）维度上限。单卡通常保持 1。0 = 不限。"
+            min={0}
+            max={64}
+            value={maxSubtitleConcurrency}
+            onChange={setMaxSubtitleConcurrency}
+          />
+          <NumberField
+            label="总上限（兜底）"
+            hint="不区分能力的总并发上限。0 = 不限，仅由两条维度上限管控。"
+            min={0}
             max={64}
             value={maxConcurrency}
-            onChange={(e) => setMaxConcurrency(Math.max(1, Math.min(64, Number(e.target.value) || 1)))}
-            className="w-32 px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green"
+            onChange={setMaxConcurrency}
           />
-          <p className="mt-1 text-[11px] text-emby-text-muted">
-            单 worker 默认串行处理 = 1。多 worker 共用同一 token 时，可调到 N 让 N 个任务并行。
-          </p>
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -411,7 +612,9 @@ function CreateTokenModal({
           </button>
           <button
             disabled={!name.trim() || submitting}
-            onClick={() => onSubmit(name.trim(), maxConcurrency)}
+            onClick={() =>
+              onSubmit(name.trim(), maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency)
+            }
             className="px-3 py-1.5 rounded bg-emby-green text-white hover:bg-emby-green-dark text-sm disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
           >
             {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
@@ -431,30 +634,52 @@ function EditTokenModal({
 }: {
   token: SubtitleWorkerToken;
   submitting: boolean;
-  onSubmit: (maxConcurrency: number) => void;
+  onSubmit: (
+    maxConcurrency: number,
+    maxAudioConcurrency: number,
+    maxSubtitleConcurrency: number,
+  ) => void;
   onClose: () => void;
 }) {
   const [maxConcurrency, setMaxConcurrency] = useState(token.maxConcurrency);
+  const [maxAudioConcurrency, setMaxAudioConcurrency] = useState(token.maxAudioConcurrency);
+  const [maxSubtitleConcurrency, setMaxSubtitleConcurrency] = useState(token.maxSubtitleConcurrency);
+  const dirty =
+    maxConcurrency !== token.maxConcurrency ||
+    maxAudioConcurrency !== token.maxAudioConcurrency ||
+    maxSubtitleConcurrency !== token.maxSubtitleConcurrency;
   return (
     <Modal title={`编辑 Token：${token.name}`} onClose={onClose}>
       <div className="space-y-3">
-        <div>
-          <label className="block text-xs text-emby-text-secondary mb-1">
-            并发上限（0 = 不限，1-64）
-          </label>
-          <input
-            type="number"
+        <div className="grid grid-cols-3 gap-2">
+          <NumberField
+            label="audio 并发"
+            hint={`当前 ${token.currentAudioRunning} 条 audio 阶段任务。0 = 不限。`}
+            min={0}
+            max={64}
+            value={maxAudioConcurrency}
+            onChange={setMaxAudioConcurrency}
+          />
+          <NumberField
+            label="subtitle 并发"
+            hint={`当前 ${token.currentSubtitleRunning} 条 subtitle 阶段任务。0 = 不限。`}
+            min={0}
+            max={64}
+            value={maxSubtitleConcurrency}
+            onChange={setMaxSubtitleConcurrency}
+          />
+          <NumberField
+            label="总上限（兜底）"
+            hint={`当前 RUNNING ${token.currentRunning} 条。0 = 不限。`}
             min={0}
             max={64}
             value={maxConcurrency}
-            onChange={(e) => setMaxConcurrency(Math.max(0, Math.min(64, Number(e.target.value) || 0)))}
-            autoFocus
-            className="w-32 px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green"
+            onChange={setMaxConcurrency}
           />
-          <p className="mt-1 text-[11px] text-emby-text-muted">
-            当前运行：{token.currentRunning} 条。降低上限不会中断已经在跑的任务，仅影响后续 claim。
-          </p>
         </div>
+        <p className="text-[11px] text-emby-text-muted">
+          降低上限不会中断已经在跑的任务，仅影响后续 claim。
+        </p>
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -463,8 +688,8 @@ function EditTokenModal({
             取消
           </button>
           <button
-            disabled={submitting || maxConcurrency === token.maxConcurrency}
-            onClick={() => onSubmit(maxConcurrency)}
+            disabled={submitting || !dirty}
+            onClick={() => onSubmit(maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency)}
             className="px-3 py-1.5 rounded bg-emby-green text-white hover:bg-emby-green-dark text-sm disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
           >
             {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
@@ -473,6 +698,37 @@ function EditTokenModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+function NumberField({
+  label,
+  hint,
+  min,
+  max,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  min: number;
+  max: number;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div>
+      <label className="block text-xs text-emby-text-secondary mb-1">{label}</label>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Math.max(min, Math.min(max, Number(e.target.value) || 0)))}
+        className="w-full px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green"
+      />
+      {hint && <p className="mt-1 text-[10px] text-emby-text-muted leading-snug">{hint}</p>}
+    </div>
   );
 }
 

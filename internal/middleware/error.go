@@ -18,8 +18,12 @@ import (
 
 // AppError 是业务层主动抛出的可预期错误。
 // 对齐 TS 版 AppError：携带 HTTP 状态码与用户可见消息。
+//
+// Code 是机器可读的错误码（如 "WORKER_AUDIO_SHA256_MISMATCH"），让 worker 客户端
+// 能区分不同失败原因；HTTP status 仍然是粗粒度区分手段。Code 为空时只回 message。
 type AppError struct {
 	Status  int
+	Code    string
 	Message string
 	Cause   error
 }
@@ -33,9 +37,20 @@ func (e *AppError) Error() string {
 
 func (e *AppError) Unwrap() error { return e.Cause }
 
-// NewAppError 构造 AppError。
+// NewAppError 构造 AppError（不带 Code）。
 func NewAppError(status int, message string) *AppError {
 	return &AppError{Status: status, Message: message}
+}
+
+// NewAppErrorWithCode 构造带机器可读 code 的 AppError。
+func NewAppErrorWithCode(status int, code, message string) *AppError {
+	return &AppError{Status: status, Code: code, Message: message}
+}
+
+// WithCode 链式给已有 AppError 添加 code（保留原 status / message）。
+func (e *AppError) WithCode(code string) *AppError {
+	e.Code = code
+	return e
 }
 
 // WrapAppError 在保留原始错误的前提下转成 AppError。
@@ -83,6 +98,7 @@ func ErrorHandler(production bool) gin.HandlerFunc {
 				c.AbortWithStatusJSON(appErr.Status, dto.APIResponse{
 					Success: false,
 					Error:   appErr.Message,
+					Code:    appErr.Code,
 				})
 			}
 			return
