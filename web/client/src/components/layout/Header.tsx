@@ -1,4 +1,5 @@
 import { useAuthStore } from '../../stores/authStore.js';
+import { useSiteName } from '../../hooks/useSiteName.js';
 import { useNavigate, NavLink, Link } from 'react-router-dom';
 import { useState, useRef, useEffect } from 'react';
 import {
@@ -9,6 +10,7 @@ import {
 export function Header() {
   const user = useAuthStore(s => s.user);
   const logout = useAuthStore(s => s.logout);
+  const siteName = useSiteName();
   const navigate = useNavigate();
   const [showDropdown, setShowDropdown] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -52,7 +54,7 @@ export function Header() {
       {/* Logo */}
       <Link to="/" className="flex items-center gap-2 flex-shrink-0 mr-2 lg:mr-4">
         <Clapperboard className="w-6 h-6 text-emby-green" />
-        <span className="text-lg font-bold text-emby-green hidden lg:block">M3u8 Preview</span>
+        <span className="text-lg font-bold text-emby-green hidden lg:block">{siteName}</span>
       </Link>
 
       {/* Desktop nav links */}

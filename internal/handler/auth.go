@@ -61,6 +61,7 @@ func (h *AuthHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/refresh", h.refresh)
 	rg.POST("/logout", h.logout)
 	rg.GET("/register-status", h.registerStatus)
+	rg.GET("/site-info", h.siteInfo)
 	rg.GET("/captcha-config", h.captchaConfig)
 }
 
@@ -189,6 +190,13 @@ func (h *AuthHandler) logout(c *gin.Context) {
 func (h *AuthHandler) registerStatus(c *gin.Context) {
 	allow := h.svc.GetRegisterStatus()
 	c.JSON(http.StatusOK, dto.OK(dto.RegisterStatusResponse{AllowRegistration: allow}))
+}
+
+// siteInfo 返回站点显示元信息（当前仅 siteName）。
+// 公开接口，未鉴权可访问；front-end 在登录前/后均通过它读取站点名称，
+// 避免把 admin-only 的 settings 列表对外暴露。
+func (h *AuthHandler) siteInfo(c *gin.Context) {
+	c.JSON(http.StatusOK, dto.OK(dto.SiteInfoResponse{SiteName: h.svc.GetSiteName()}))
 }
 
 func (h *AuthHandler) me(c *gin.Context) {

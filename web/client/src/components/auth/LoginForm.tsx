@@ -4,6 +4,7 @@ import { Clapperboard } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore.js';
 import { authApi } from '../../services/authApi.js';
 import type { CaptchaPublicConfig } from '../../services/authApi.js';
+import { useSiteName } from '../../hooks/useSiteName.js';
 import { CaptchaWidget } from './CaptchaWidget.js';
 
 export function LoginForm() {
@@ -19,6 +20,7 @@ export function LoginForm() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const navigate = useNavigate();
   const location = useLocation();
+  const siteName = useSiteName();
 
   useEffect(() => {
     authApi.getRegisterStatus().then((res) => setAllowRegistration(res.allowRegistration)).catch(() => { setAllowRegistration(false); });
@@ -63,7 +65,7 @@ export function LoginForm() {
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
           <Clapperboard className="w-12 h-12 text-emby-green mx-auto mb-3" />
-          <h1 className="text-3xl font-bold text-white mb-2">M3u8 Preview</h1>
+          <h1 className="text-3xl font-bold text-white mb-2">{siteName}</h1>
           <p className="text-emby-text-secondary">登录以继续</p>
         </div>
 

@@ -25,8 +25,10 @@ export function AdminDashboardPage() {
       adminApi.updateSetting(key, value),
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'settings'] });
-      // 重置同步标志位，让 useEffect 能够重新同步最新的服务器数据
+      // siteName 改动需要让全站使用同一份缓存的 useSiteName 立即拿到新值，
+      // 否则 Header / Login / Register / document.title 仍显示旧名称。
       if (variables.key === 'siteName') {
+        queryClient.invalidateQueries({ queryKey: ['site-info'] });
         siteNameSynced.current = false;
       }
       if (['captchaEndpoint', 'captchaSiteKey', 'captchaSecretKey', 'captchaManifestPubKey'].includes(variables.key)) {

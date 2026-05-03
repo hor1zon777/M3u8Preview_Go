@@ -47,6 +47,12 @@ type RegisterStatusResponse struct {
 	AllowRegistration bool `json:"allowRegistration"`
 }
 
+// SiteInfoResponse GET /auth/site-info
+// 公开接口，向前端提供未鉴权可读的站点级元信息（当前仅站点名称）。
+type SiteInfoResponse struct {
+	SiteName string `json:"siteName"`
+}
+
 // SSETicketResponse POST /auth/sse-ticket
 type SSETicketResponse struct {
 	Ticket string `json:"ticket"`

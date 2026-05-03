@@ -71,6 +71,18 @@ export const authApi = {
     return data.data!;
   },
 
+  /**
+   * 查询站点显示名称（公开接口，未鉴权可访问）。
+   * 与 register-status 同样使用裸 axios，避免 401 拦截器在登录前触发刷新循环。
+   */
+  async getSiteInfo() {
+    const { data } = await axios.get<ApiResponse<{ siteName: string }>>(
+      '/api/v1/auth/site-info',
+      { timeout: 10000 },
+    );
+    return data.data!;
+  },
+
   async getCaptchaConfig() {
     const { data } = await axios.get<ApiResponse<CaptchaPublicConfig>>(
       '/api/v1/auth/captcha-config',

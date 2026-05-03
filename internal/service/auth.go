@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -236,6 +237,20 @@ func (s *AuthService) GetRegisterStatus() bool {
 		return true
 	}
 	return setting.Value != "false"
+}
+
+// GetSiteName 读 systemSetting 返回站点显示名称；空值或不存在时回退到默认 "M3u8 Preview"。
+// 与 migrate.go 的 SettingSiteName 默认值保持一致，避免 admin 清空后前端拿到空字符串。
+func (s *AuthService) GetSiteName() string {
+	const defaultSiteName = "M3u8 Preview"
+	var setting model.SystemSetting
+	if err := s.db.Where("key = ?", model.SettingSiteName).Take(&setting).Error; err != nil {
+		return defaultSiteName
+	}
+	if strings.TrimSpace(setting.Value) == "" {
+		return defaultSiteName
+	}
+	return setting.Value
 }
 
 // --- 内部辅助 ---
