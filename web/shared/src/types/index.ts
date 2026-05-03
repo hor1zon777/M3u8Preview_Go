@@ -446,7 +446,6 @@ export interface SubtitleJob {
 
 export interface SubtitleSettings {
   enabled: boolean;
-  autoGenerate: boolean;
   whisperBin: string;
   whisperModel: string;
   whisperLanguage: string;
@@ -472,7 +471,6 @@ export interface SubtitleSettings {
  */
 export interface SubtitleSettingsUpdate {
   enabled?: boolean;
-  autoGenerate?: boolean;
   whisperBin?: string;
   whisperModel?: string;
   whisperLanguage?: string;
@@ -504,6 +502,23 @@ export interface SubtitleBatchRegenerateRequest {
 
 export interface SubtitleBatchRegenerateResponse {
   enqueued: number;
+  skipped: number;
+}
+
+/** 批量禁用 / 取消 / 删除等仅以 mediaIds 为入参的操作请求体。 */
+export interface SubtitleBatchMediaIDsRequest {
+  mediaIds: string[];
+}
+
+/** 批量启用 / 禁用切换。disabled=true 切到 DISABLED；false 还原为 PENDING 并入队。 */
+export interface SubtitleBatchSetDisabledRequest {
+  mediaIds: string[];
+  disabled: boolean;
+}
+
+/** 批量操作的统一返回：affected = 实际被改动 / 删除条数；skipped = 状态不允许或行不存在等被跳过的条数。 */
+export interface SubtitleBatchOpResponse {
+  affected: number;
   skipped: number;
 }
 

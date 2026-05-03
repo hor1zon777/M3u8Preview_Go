@@ -13,7 +13,10 @@
 //	  POST   /api/v1/admin/subtitle/jobs/:mediaId/retry   重新生成
 //	  DELETE /api/v1/admin/subtitle/jobs/:mediaId         删除任务
 //	  PUT    /api/v1/admin/subtitle/jobs/:mediaId/disabled?value=true|false
-//	  POST   /api/v1/admin/subtitle/jobs/batch-regenerate
+//	  POST   /api/v1/admin/subtitle/jobs/batch-regenerate 批量重新生成
+//	  POST   /api/v1/admin/subtitle/jobs/batch-disable    批量禁用 / 启用
+//	  POST   /api/v1/admin/subtitle/jobs/batch-cancel     批量取消（→ DISABLED）
+//	  POST   /api/v1/admin/subtitle/jobs/batch-delete     批量删除任务 + VTT
 //	  GET    /api/v1/admin/subtitle/queue                 队列概况
 //	  GET    /api/v1/admin/subtitle/settings              配置回显（脱敏）
 package handler
@@ -58,6 +61,9 @@ func (h *SubtitleHandler) RegisterAdmin(rg *gin.RouterGroup) {
 	rg.GET("/settings", h.settings)
 	rg.PUT("/settings", h.updateSettings)
 	rg.POST("/jobs/batch-regenerate", h.batchRegenerate)
+	rg.POST("/jobs/batch-disable", h.batchSetDisabled)
+	rg.POST("/jobs/batch-cancel", h.batchCancel)
+	rg.POST("/jobs/batch-delete", h.batchDelete)
 	rg.GET("/jobs/:mediaId", h.getJob)
 	rg.POST("/jobs/:mediaId/retry", h.retry)
 	rg.DELETE("/jobs/:mediaId", h.deleteJob)
@@ -223,6 +229,61 @@ func (h *SubtitleHandler) batchRegenerate(c *gin.Context) {
 			middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusServiceUnavailable, "字幕功能未启用"))
 			return
 		}
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.OK(resp))
+}
+
+// batchSetDisabled 批量禁用 / 启用所选媒体的字幕任务。
+// 字幕功能未启用时返回 503，便于前端给出明确文案。
+func (h *SubtitleHandler) batchSetDisabled(c *gin.Context) {
+	var req dto.SubtitleBatchSetDisabledRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请求格式错误"))
+		return
+	}
+	resp, err := h.svc.BatchSetDisabled(req.MediaIDs, req.Disabled)
+	if err != nil {
+		if errors.Is(err, service.ErrSubtitleDisabled) {
+			middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusServiceUnavailable, "字幕功能未启用"))
+			return
+		}
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.OK(resp))
+}
+
+// batchCancel 批量取消所选媒体的字幕任务（PENDING/RUNNING/FAILED → DISABLED）。
+func (h *SubtitleHandler) batchCancel(c *gin.Context) {
+	var req dto.SubtitleBatchMediaIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请求格式错误"))
+		return
+	}
+	resp, err := h.svc.BatchCancel(req.MediaIDs)
+	if err != nil {
+		if errors.Is(err, service.ErrSubtitleDisabled) {
+			middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusServiceUnavailable, "字幕功能未启用"))
+			return
+		}
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.OK(resp))
+}
+
+// batchDelete 批量删除所选媒体的字幕任务及对应 VTT 文件。
+// 与单条 DELETE 不同，此处不要求字幕功能启用——清理历史数据应当永远可用。
+func (h *SubtitleHandler) batchDelete(c *gin.Context) {
+	var req dto.SubtitleBatchMediaIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请求格式错误"))
+		return
+	}
+	resp, err := h.svc.BatchDelete(req.MediaIDs)
+	if err != nil {
 		_ = c.Error(err)
 		return
 	}

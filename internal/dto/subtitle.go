@@ -75,10 +75,34 @@ type SubtitleBatchRegenerateResponse struct {
 	Skipped  int `json:"skipped"`
 }
 
+// SubtitleBatchMediaIDsRequest 一组 mediaId 的批量操作请求体。
+// 用于批量取消 / 批量删除 / 批量禁用（共用入参）。
+type SubtitleBatchMediaIDsRequest struct {
+	MediaIDs []string `json:"mediaIds" binding:"required,min=1,dive,required"`
+}
+
+// SubtitleBatchSetDisabledRequest 批量设置启用/禁用状态。
+type SubtitleBatchSetDisabledRequest struct {
+	MediaIDs []string `json:"mediaIds" binding:"required,min=1,dive,required"`
+	// Disabled=true 把所选标记为 DISABLED；false 还原为 PENDING 并重新入队。
+	Disabled bool `json:"disabled"`
+}
+
+// SubtitleBatchOpResponse 批量操作的统一返回。
+//
+//	Affected：实际被改动 / 删除的条数
+//	Skipped：因状态不允许（如已 DONE）或 row 不存在而跳过的条数
+type SubtitleBatchOpResponse struct {
+	Affected int `json:"affected"`
+	Skipped  int `json:"skipped"`
+}
+
 // SubtitleSettingsResponse admin 面板展示当前配置（敏感字段脱敏）。
+//
+// 注：历史版本曾包含 AutoGenerate（自动为新媒体入队）字段；当前版本字幕仅手动入队，
+// 此字段已移除。前端读取本响应若需向后兼容，请把 autoGenerate 视为永远 false。
 type SubtitleSettingsResponse struct {
 	Enabled          bool   `json:"enabled"`
-	AutoGenerate     bool   `json:"autoGenerate"`
 	WhisperBin       string `json:"whisperBin"`
 	WhisperModel     string `json:"whisperModel"`
 	WhisperLanguage  string `json:"whisperLanguage"`
@@ -102,7 +126,6 @@ type SubtitleSettingsResponse struct {
 // LocalWorkerEnabled / WorkerStaleThreshold 等部署相关字段不在此处修改。
 type SubtitleSettingsUpdateRequest struct {
 	Enabled          *bool   `json:"enabled,omitempty"`
-	AutoGenerate     *bool   `json:"autoGenerate,omitempty"`
 	WhisperBin       *string `json:"whisperBin,omitempty"`
 	WhisperModel     *string `json:"whisperModel,omitempty"`
 	WhisperLanguage  *string `json:"whisperLanguage,omitempty"`

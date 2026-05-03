@@ -9,6 +9,7 @@ import type {
   SubtitleQueueStatus,
   SubtitleBatchRegenerateRequest,
   SubtitleBatchRegenerateResponse,
+  SubtitleBatchOpResponse,
   SubtitleWorker,
   SubtitleWorkerToken,
   SubtitleWorkerTokenCreateResponse,
@@ -63,6 +64,33 @@ export const subtitleApi = {
     const { data } = await api.post<ApiResponse<SubtitleBatchRegenerateResponse>>(
       '/admin/subtitle/jobs/batch-regenerate',
       req,
+    );
+    return data.data!;
+  },
+
+  /** 批量禁用 / 启用所选媒体。disabled=true 切到 DISABLED；false 还原为 PENDING 并入队。 */
+  async batchSetDisabled(mediaIds: string[], disabled: boolean): Promise<SubtitleBatchOpResponse> {
+    const { data } = await api.post<ApiResponse<SubtitleBatchOpResponse>>(
+      '/admin/subtitle/jobs/batch-disable',
+      { mediaIds, disabled },
+    );
+    return data.data!;
+  },
+
+  /** 批量取消所选任务（PENDING/RUNNING/FAILED → DISABLED；DONE/已禁用 跳过）。 */
+  async batchCancel(mediaIds: string[]): Promise<SubtitleBatchOpResponse> {
+    const { data } = await api.post<ApiResponse<SubtitleBatchOpResponse>>(
+      '/admin/subtitle/jobs/batch-cancel',
+      { mediaIds },
+    );
+    return data.data!;
+  },
+
+  /** 批量删除所选任务和已生成的 VTT 文件。 */
+  async batchDelete(mediaIds: string[]): Promise<SubtitleBatchOpResponse> {
+    const { data } = await api.post<ApiResponse<SubtitleBatchOpResponse>>(
+      '/admin/subtitle/jobs/batch-delete',
+      { mediaIds },
     );
     return data.data!;
   },

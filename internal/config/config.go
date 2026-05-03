@@ -61,8 +61,6 @@ type BcryptConfig struct {
 type SubtitleConfig struct {
 	// Enabled 关闭后所有 subtitle 端点返回 503，worker 不启动
 	Enabled bool
-	// AutoGenerate 为 true 时：启动扫描 ACTIVE media 入队 + 新建 media 钩子入队
-	AutoGenerate bool
 	// WhisperBin 默认 "whisper-cli"（whisper.cpp 官方编译产物）
 	WhisperBin string
 	// WhisperModel GGML 模型文件绝对路径（如 /opt/whisper-models/ggml-medium-q5_0.bin）
@@ -200,7 +198,6 @@ func Load(projectRoot string) (*Config, error) {
 		PosterConcurrency:    clamp(atoiDefault(os.Getenv("POSTER_MIGRATION_CONCURRENCY"), 2), 1, 10),
 		Subtitle: SubtitleConfig{
 			Enabled:              parseBoolDefault(os.Getenv("SUBTITLE_ENABLED"), false),
-			AutoGenerate:         parseBoolDefault(os.Getenv("SUBTITLE_AUTO_GENERATE"), true),
 			WhisperBin:           getenv("SUBTITLE_WHISPER_BIN", "whisper-cli"),
 			WhisperModel:         os.Getenv("SUBTITLE_WHISPER_MODEL"),
 			WhisperLanguage:      getenv("SUBTITLE_WHISPER_LANG", "ja"),

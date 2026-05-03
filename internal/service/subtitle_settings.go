@@ -40,7 +40,6 @@ const subtitleSettingPrefix = "subtitle."
 // 任何未列入这里的 *config.SubtitleConfig 字段都不会被持久化 / 修改。
 const (
 	settingSubtitleEnabled          = subtitleSettingPrefix + "enabled"
-	settingSubtitleAutoGenerate     = subtitleSettingPrefix + "autoGenerate"
 	settingSubtitleWhisperBin       = subtitleSettingPrefix + "whisperBin"
 	settingSubtitleWhisperModel     = subtitleSettingPrefix + "whisperModel"
 	settingSubtitleWhisperLanguage  = subtitleSettingPrefix + "whisperLanguage"
@@ -56,7 +55,6 @@ const (
 func allSubtitleSettingKeys() []string {
 	return []string{
 		settingSubtitleEnabled,
-		settingSubtitleAutoGenerate,
 		settingSubtitleWhisperBin,
 		settingSubtitleWhisperModel,
 		settingSubtitleWhisperLanguage,
@@ -96,8 +94,6 @@ func applySubtitleSettingRow(cfg *config.SubtitleConfig, key, value string) {
 	switch key {
 	case settingSubtitleEnabled:
 		cfg.Enabled = parseBoolWithDefault(value, cfg.Enabled)
-	case settingSubtitleAutoGenerate:
-		cfg.AutoGenerate = parseBoolWithDefault(value, cfg.AutoGenerate)
 	case settingSubtitleWhisperBin:
 		if v := strings.TrimSpace(value); v != "" {
 			cfg.WhisperBin = v
@@ -212,10 +208,6 @@ func applySubtitlePatch(db *gorm.DB, cfg *config.SubtitleConfig, req *dto.Subtit
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled
 		updates[settingSubtitleEnabled] = boolToStr(*req.Enabled)
-	}
-	if req.AutoGenerate != nil {
-		cfg.AutoGenerate = *req.AutoGenerate
-		updates[settingSubtitleAutoGenerate] = boolToStr(*req.AutoGenerate)
 	}
 	if req.WhisperBin != nil {
 		v := strings.TrimSpace(*req.WhisperBin)

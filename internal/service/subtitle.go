@@ -3,10 +3,10 @@
 //
 //   - 单 worker 串行消费（CPU 服务器上避免 whisper.cpp 多实例竞争 CPU）
 //   - 幂等入队：同 media 重复入队不会重复跑
-//   - 启动时扫描 ACTIVE media 自动入队（首次部署 / 重启后批量补字幕）
-//   - 新建 media 时通过 OnMediaCreated 钩子入队
+//   - 入队仅由 admin 在字幕管理页手动触发（"重新生成所选" / 批量按钮等）；
+//     新建媒体不会自动入队，启动时也不再扫描存量
 //   - 流水线：ffmpeg 抽音频 → whisper.cpp ASR → LLM 翻译 → 写 WebVTT
-//   - 失败有 error_msg；admin 可手动重试 / 批量重新生成 / 删除
+//   - 失败有 error_msg；admin 可手动重试 / 批量重新生成 / 删除 / 禁用 / 取消
 package service
 
 import (
@@ -52,9 +52,6 @@ type SubtitleService struct {
 	enqueuedIDs sync.Map // mediaID -> struct{} 防重复入队
 	ctx         context.Context
 	cancel      context.CancelFunc
-
-	// scanRunning 防止 admin 反复打开"启用"时多次并发扫描存量 media。
-	scanRunning atomic.Bool
 }
 
 // NewSubtitleService 构造。
@@ -160,13 +157,11 @@ func (s *SubtitleService) Start() error {
 		s.runStaleRecoveryLoop()
 	}()
 
-	// 扫描存量 ACTIVE media（异步，不阻塞启动）
-	if cur.AutoGenerate {
-		go s.scanExisting()
-	}
+	// 启动时不再扫描存量 media 自动入队；改为在 admin 字幕管理页手动选择后再批量入队，
+	// 避免大库一次性把上千条 media 推进 whisper 队列堵死。
 
-	log.Printf("[subtitle] started (lang=%s→%s, autoGenerate=%v, localWorker=%v)",
-		cur.WhisperLanguage, cur.TargetLang, cur.AutoGenerate, cur.LocalWorkerEnabled)
+	log.Printf("[subtitle] started (lang=%s→%s, localWorker=%v, manual-enqueue-only)",
+		cur.WhisperLanguage, cur.TargetLang, cur.LocalWorkerEnabled)
 	return nil
 }
 
@@ -259,15 +254,12 @@ func (s *SubtitleService) EnsureJob(mediaID string) error {
 }
 
 // HookOnMediaCreated 给 MediaService 注册的钩子。
-// 不返回 error；任何失败只打日志，不影响 media 创建主流程。
+//
+// 历史版本会按 cfg.AutoGenerate 自动入队字幕；当前版本一律手动入队，
+// 因此这里保持空实现以避免 MediaService 接口断裂；不再依赖此 hook 的代码路径
+// 也可以在重构时彻底移除。
 func (s *SubtitleService) HookOnMediaCreated(mediaID string) {
-	cur := s.snap()
-	if !cur.Enabled || !cur.AutoGenerate {
-		return
-	}
-	if err := s.EnsureJob(mediaID); err != nil {
-		log.Printf("[subtitle] hook ensure job failed media=%s: %v", mediaID, err)
-	}
+	_ = mediaID
 }
 
 // HookOnMediaDeleted 给 MediaService 注册的钩子，删除字幕文件。
@@ -296,7 +288,9 @@ func (s *SubtitleService) enqueue(mediaID string) {
 	}
 }
 
-// scanExisting 启动时扫描所有 ACTIVE media，给没有 DONE 字幕的入队。
+// scanExisting 历史版本用于启动期扫描存量 ACTIVE media 自动入队字幕。
+// 当前版本字幕仅手动入队，已不再调用此函数；保留实现作为快速回滚 / 未来接入
+// "管理员一键扫描"按钮的可选骨架，无副作用。
 func (s *SubtitleService) scanExisting() {
 	// 给 GORM 一秒预热避免和迁移竞争
 	time.Sleep(time.Second)
@@ -351,6 +345,20 @@ func (s *SubtitleService) worker() {
 
 // processOne 跑一条任务的全流程。失败时把 error 写入 job。
 func (s *SubtitleService) processOne(mediaID string) {
+	// 取消/禁用守护：worker 从 channel 拿到 mediaID 后，若用户在排队期间通过
+	// "批量取消 / 批量禁用 / 删除"把任务标为 DISABLED 或直接删除，此处提前返回，
+	// 避免下方无条件 UPDATE 把 DISABLED 状态覆盖回 RUNNING。
+	{
+		var job model.SubtitleJob
+		if err := s.db.Where("media_id = ?", mediaID).Take(&job).Error; err != nil {
+			// 已被批量删除：放弃即可
+			return
+		}
+		if job.Status == model.SubtitleStatusDisabled {
+			return
+		}
+	}
+
 	var media model.Media
 	if err := s.db.Take(&media, "id = ?", mediaID).Error; err != nil {
 		s.markFailed(mediaID, fmt.Errorf("media not found: %w", err))
@@ -564,7 +572,7 @@ func (s *SubtitleService) ListJobs(page, limit int, statusFilter, search, catego
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 200 {
+	if limit < 1 || limit > 1000 {
 		limit = 20
 	}
 
@@ -795,6 +803,108 @@ func (s *SubtitleService) BatchRegenerate(req dto.SubtitleBatchRegenerateRequest
 	return resp, nil
 }
 
+// BatchSetDisabled 批量设置 DISABLED 状态。
+//
+//	disabled=true：所选 media 的 SubtitleJob 行（不存在则会按 SetDisabled 语义补建一条占位）
+//	  状态切到 DISABLED，worker 后续不会处理；
+//	disabled=false：解除禁用，重新入队（FAILED → PENDING；不存在则按 EnsureJob 创建）。
+//
+// 若字幕功能未启用，返回 ErrSubtitleDisabled。逐条调用，单条失败不影响其它。
+func (s *SubtitleService) BatchSetDisabled(mediaIDs []string, disabled bool) (dto.SubtitleBatchOpResponse, error) {
+	if !s.snap().Enabled {
+		return dto.SubtitleBatchOpResponse{}, ErrSubtitleDisabled
+	}
+	out := dto.SubtitleBatchOpResponse{}
+	for _, id := range mediaIDs {
+		if id == "" {
+			out.Skipped++
+			continue
+		}
+		if err := s.SetDisabled(id, disabled); err != nil {
+			out.Skipped++
+			log.Printf("[subtitle] batch set-disabled skip media=%s disabled=%v: %v", id, disabled, err)
+			continue
+		}
+		out.Affected++
+	}
+	return out, nil
+}
+
+// BatchCancel 批量取消任务。
+//
+// 与"禁用"的语义区分：
+//   - 禁用是长效状态切换（DISABLED 行为持续，直到再次手动解除）
+//   - 取消针对"当前正在排队 / 处理 / 失败"的任务，把它们从 active pipeline 中拿出来；
+//     状态同样落到 DISABLED 占位，但语义上是"放弃这次生成"。
+//
+// 处理规则：
+//   - 不存在 SubtitleJob 行：跳过（没有可取消对象）
+//   - 状态 ∈ {PENDING, RUNNING, FAILED}：标记 DISABLED，并从内存 enqueuedIDs 剔除，
+//     避免 worker 重复 pick 同一 mediaID
+//   - 状态 ∈ {DONE, DISABLED}：跳过（无需取消）
+//
+// RUNNING 任务：当前没有 per-job cancel 通道，状态切到 DISABLED 后 processOne 末尾的
+// 写库动作仍会发生，但不会再被重新入队；下次 worker 拉到同 mediaID 时已通过 processOne
+// 入口的 DISABLED 守护提前返回。
+func (s *SubtitleService) BatchCancel(mediaIDs []string) (dto.SubtitleBatchOpResponse, error) {
+	if !s.snap().Enabled {
+		return dto.SubtitleBatchOpResponse{}, ErrSubtitleDisabled
+	}
+	out := dto.SubtitleBatchOpResponse{}
+	for _, id := range mediaIDs {
+		if id == "" {
+			out.Skipped++
+			continue
+		}
+		var job model.SubtitleJob
+		if err := s.db.Where("media_id = ?", id).Take(&job).Error; err != nil {
+			out.Skipped++
+			continue
+		}
+		switch job.Status {
+		case model.SubtitleStatusDone, model.SubtitleStatusDisabled:
+			out.Skipped++
+			continue
+		}
+		if err := s.db.Model(&job).Update("status", model.SubtitleStatusDisabled).Error; err != nil {
+			out.Skipped++
+			log.Printf("[subtitle] batch cancel skip media=%s: %v", id, err)
+			continue
+		}
+		s.enqueuedIDs.Delete(id)
+		out.Affected++
+	}
+	return out, nil
+}
+
+// BatchDelete 批量删除字幕任务和已生成的 VTT 文件。
+//
+// 与 BatchCancel 不同：行被物理删除，下次再点"重新生成"会创建全新的 PENDING。
+// 不存在的行视为"已删除"，跳过但不报错。
+func (s *SubtitleService) BatchDelete(mediaIDs []string) (dto.SubtitleBatchOpResponse, error) {
+	out := dto.SubtitleBatchOpResponse{}
+	for _, id := range mediaIDs {
+		if id == "" {
+			out.Skipped++
+			continue
+		}
+		var job model.SubtitleJob
+		if err := s.db.Where("media_id = ?", id).Take(&job).Error; err != nil {
+			out.Skipped++
+			continue
+		}
+		s.deleteVTTFile(&job)
+		if err := s.db.Delete(&job).Error; err != nil {
+			out.Skipped++
+			log.Printf("[subtitle] batch delete skip media=%s: %v", id, err)
+			continue
+		}
+		s.enqueuedIDs.Delete(id)
+		out.Affected++
+	}
+	return out, nil
+}
+
 // QueueStatus 返回各状态的任务计数（dashboard 用）。
 func (s *SubtitleService) QueueStatus() (dto.SubtitleQueueStatus, error) {
 	type row struct {
@@ -838,7 +948,6 @@ func (s *SubtitleService) CurrentSettings() dto.SubtitleSettingsResponse {
 	}
 	return dto.SubtitleSettingsResponse{
 		Enabled:          cur.Enabled,
-		AutoGenerate:     cur.AutoGenerate,
 		WhisperBin:       cur.WhisperBin,
 		WhisperModel:     cur.WhisperModel,
 		WhisperLanguage:  cur.WhisperLanguage,
@@ -856,33 +965,18 @@ func (s *SubtitleService) CurrentSettings() dto.SubtitleSettingsResponse {
 // 行为：
 //   - 校验 patch 字段（线程数、批大小范围、URL 格式等）
 //   - 持锁写 DB（system_settings upsert）+ 同步更新 *s.cfg 字段
-//   - 启用开关从 false 翻到 true 时（且 AutoGenerate 也是 true）异步扫描存量 ACTIVE media
-//     入队，让"新启用"立即对历史媒体生效
 //   - 不重启 worker / 不变 LocalWorkerEnabled / WorkerStaleThreshold 等部署相关字段
+//   - 不再扫描存量 media；启用字幕功能后是否对历史媒体生成由管理员在
+//     字幕管理页手动批量入队
 //
 // 返回更新后的脱敏 settings 响应，便于 handler 直接回显前端。
 func (s *SubtitleService) UpdateSettings(req dto.SubtitleSettingsUpdateRequest) (dto.SubtitleSettingsResponse, error) {
 	s.cfgMu.Lock()
-	prevEnabled := s.cfg.Enabled
-	prevAutoGen := s.cfg.AutoGenerate
 	if err := applySubtitlePatch(s.db, s.cfg, &req); err != nil {
 		s.cfgMu.Unlock()
 		return dto.SubtitleSettingsResponse{}, err
 	}
-	newEnabled := s.cfg.Enabled
-	newAutoGen := s.cfg.AutoGenerate
 	s.cfgMu.Unlock()
-
-	// 启用开关 false→true 且自动生成为 on：异步扫描存量 ACTIVE media 入队。
-	// 已经启用的状态下打开 AutoGenerate 也触发扫描，让历史 media 补字幕。
-	turnedOn := !prevEnabled && newEnabled
-	autoGenTurnedOn := !prevAutoGen && newAutoGen && newEnabled
-	if (turnedOn || autoGenTurnedOn) && !s.scanRunning.Swap(true) {
-		go func() {
-			defer s.scanRunning.Store(false)
-			s.scanExisting()
-		}()
-	}
 
 	return s.CurrentSettings(), nil
 }

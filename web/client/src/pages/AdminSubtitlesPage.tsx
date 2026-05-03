@@ -171,6 +171,53 @@ export function AdminSubtitlesPage() {
     },
   });
 
+  // 批量禁用 / 取消 / 删除：三者共用一个轻量 mutation，
+  // 调用时通过 op 参数路由到对应 service 方法，便于在按钮上展示统一的"处理中"态。
+  const batchOpMutation = useMutation({
+    mutationFn: async ({ op, mediaIds, disabled }: {
+      op: 'disable' | 'enable' | 'cancel' | 'delete';
+      mediaIds: string[];
+      disabled?: boolean;
+    }) => {
+      switch (op) {
+        case 'disable':
+          return { op, ...(await subtitleApi.batchSetDisabled(mediaIds, true)) };
+        case 'enable':
+          return { op, ...(await subtitleApi.batchSetDisabled(mediaIds, false)) };
+        case 'cancel':
+          return { op, ...(await subtitleApi.batchCancel(mediaIds)) };
+        case 'delete':
+          return { op, ...(await subtitleApi.batchDelete(mediaIds)) };
+        default:
+          throw new Error(`unknown op: ${op satisfies never}`);
+      }
+    },
+    onSuccess: (resp) => {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'subtitle'] });
+      clearSelection();
+      const label =
+        resp.op === 'disable' ? '禁用'
+          : resp.op === 'enable' ? '启用'
+          : resp.op === 'cancel' ? '取消'
+          : '删除';
+      alert(`已${label} ${resp.affected} 条，跳过 ${resp.skipped} 条`);
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error
+        ?? (err as { message?: string })?.message
+        ?? '批量操作失败';
+      alert(msg);
+    },
+  });
+
+  function runBatchOp(op: 'disable' | 'enable' | 'cancel' | 'delete', confirmText: string) {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    if (!confirm(confirmText)) return;
+    batchOpMutation.mutate({ op, mediaIds: ids });
+  }
+
   const totalPages = data?.totalPages ?? 1;
 
   return (
@@ -279,6 +326,31 @@ export function AdminSubtitlesPage() {
           title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
         >
           <Play className="w-4 h-4" /> 重新生成所选 ({selectedIds.size})
+        </button>
+        {/* 批量禁用 / 取消 / 删除：仅在选中时启用，统一通过 batchOpMutation 路由 */}
+        <button
+          disabled={!settings?.enabled || batchOpMutation.isPending || selectedIds.size === 0}
+          onClick={() => runBatchOp('disable', `禁用所选 ${selectedIds.size} 条字幕任务？禁用后 worker 将不再处理。`)}
+          className="px-3 py-2 text-sm rounded-md bg-zinc-700 text-white hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+        >
+          <PauseCircle className="w-4 h-4" /> 禁用所选 ({selectedIds.size})
+        </button>
+        <button
+          disabled={!settings?.enabled || batchOpMutation.isPending || selectedIds.size === 0}
+          onClick={() => runBatchOp('cancel', `取消所选 ${selectedIds.size} 条字幕任务？排队 / 处理中 / 失败的会被标记为已禁用，已完成的不变。`)}
+          className="px-3 py-2 text-sm rounded-md bg-orange-600/80 text-white hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+        >
+          <XCircle className="w-4 h-4" /> 取消所选 ({selectedIds.size})
+        </button>
+        <button
+          disabled={batchOpMutation.isPending || selectedIds.size === 0}
+          onClick={() => runBatchOp('delete', `删除所选 ${selectedIds.size} 条字幕任务及其 VTT 文件？此操作不可撤销。`)}
+          className="px-3 py-2 text-sm rounded-md bg-red-700/80 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+        >
+          <Trash2 className="w-4 h-4" /> 删除所选 ({selectedIds.size})
         </button>
         <button
           disabled={!settings?.enabled || batchMutation.isPending}
@@ -490,6 +562,9 @@ export function AdminSubtitlesPage() {
               <option value={20}>20</option>
               <option value={50}>50</option>
               <option value={100}>100</option>
+              <option value={200}>200</option>
+              <option value={500}>500</option>
+              <option value={1000}>1000</option>
             </select>
             条/页
           </div>
@@ -666,7 +741,6 @@ function SubtitleSettingsModal({
   // 受控表单。初始值用服务端最新配置；翻译 API Key 字段保留服务端脱敏占位，
   // 用户没改时不会回传，避免覆盖真实值（service 端也对 "***" 做了忽略保护）。
   const [enabled, setEnabled] = useState(settings.enabled);
-  const [autoGenerate, setAutoGenerate] = useState(settings.autoGenerate);
   const [whisperBin, setWhisperBin] = useState(settings.whisperBin);
   const [whisperModel, setWhisperModel] = useState(settings.whisperModel);
   const [whisperLanguage, setWhisperLanguage] = useState(settings.whisperLanguage);
@@ -698,7 +772,6 @@ function SubtitleSettingsModal({
 
     // 仅在和服务端值不同的字段加入 patch，减少误覆盖
     if (enabled !== settings.enabled) patch.enabled = enabled;
-    if (autoGenerate !== settings.autoGenerate) patch.autoGenerate = autoGenerate;
     if (whisperBin !== settings.whisperBin) patch.whisperBin = whisperBin;
     if (whisperModel !== settings.whisperModel) patch.whisperModel = whisperModel;
     if (whisperLanguage !== settings.whisperLanguage) patch.whisperLanguage = whisperLanguage;
@@ -746,9 +819,13 @@ function SubtitleSettingsModal({
     <Modal onClose={onClose} title="字幕配置（网页编辑）">
       <form onSubmit={handleSubmit} className="space-y-4 text-sm">
         {/* 开关组 */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <ToggleRow label="启用字幕生成" hint="关闭后所有字幕端点返回 503，worker 不消费任务" checked={enabled} onChange={setEnabled} />
-          <ToggleRow label="自动为新媒体生成" hint="新建媒体时自动入队；启用本开关也会立即扫描存量 ACTIVE 媒体" checked={autoGenerate} onChange={setAutoGenerate} />
+        <div className="grid grid-cols-1 gap-3">
+          <ToggleRow
+            label="启用字幕生成"
+            hint="关闭后所有字幕端点返回 503，worker 不消费任务。启用后字幕仅在管理员手动选中并点击「重新生成所选」时才会入队。"
+            checked={enabled}
+            onChange={setEnabled}
+          />
         </div>
 
         {/* Whisper.cpp */}
