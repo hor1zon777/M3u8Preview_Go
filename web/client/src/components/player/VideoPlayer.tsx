@@ -458,17 +458,34 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(
     }, [subtitleSettings.enabled, subtitleStatus?.vttUrl]);
 
     const isRotatedQuarter = rotation === 90 || rotation === 270;
-    const rotatedStyle: React.CSSProperties | undefined = fillContainer && rotation !== 0
-      ? {
-          position: 'absolute',
-          top: '50%',
-          left: '50%',
-          width: isRotatedQuarter ? containerSize.height : containerSize.width,
-          height: isRotatedQuarter ? containerSize.width : containerSize.height,
-          transform: `translate(-50%, -50%) rotate(${rotation}deg)`,
-          transformOrigin: 'center',
-        }
-      : undefined;
+    // 旋转策略：把 transform 套在外层 wrapper div 上，video 保持 w-full h-full 不变。
+    //
+    // 历史 bug：直接在 <video> 上应用 transform: rotate(90deg) 时，PC Chrome / Edge
+    // 在硬件解码模式下会因 video 自带独立 GPU 合成层与 CSS transform 合成顺序冲突，
+    // 导致 90° / 270° 时画面黑屏（音频正常）。
+    // 解决：transform 落到 wrapper div，video 不参与 rotate；浏览器对 div 走标准
+    // 合成，video 层保持稳定，黑屏问题消失。
+    //
+    // wrapper 的尺寸需"未旋转前"是目标视觉框的旋转回退尺寸：
+    //   - 90° / 270°：wrapper 实际 width=容器高、height=容器宽，再旋转 90° 后视觉
+    //     正好填满容器。
+    //   - 180°：wrapper 与容器同尺寸，旋转 180° 视觉不变。
+    const rotationWrapperStyle: React.CSSProperties | undefined =
+      fillContainer && rotation !== 0
+        ? {
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            width: isRotatedQuarter ? containerSize.height : containerSize.width,
+            height: isRotatedQuarter ? containerSize.width : containerSize.height,
+            transform: `translate(-50%, -50%) rotate(${rotation}deg)`,
+            transformOrigin: 'center',
+            // 提示浏览器为 wrapper 单独建合成层，避免在旋转切换瞬间触发 video
+            // 层重合成抖动；同时缓和某些显卡驱动下的子像素采样问题。
+            willChange: 'transform',
+            backfaceVisibility: 'hidden',
+          }
+        : undefined;
 
     const showSubtitleOverlay =
       subtitleSettings.enabled &&
@@ -505,29 +522,38 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(
         }
       : {};
 
+    // video 节点：不再直接承载 rotate，永远使用 className 控制大小。
+    // rotation === 0 时直接渲染 video；非 0 时套一层 wrapper 把 transform 隔离出去。
+    const videoNode = (
+      <video
+        ref={videoRef}
+        className={fillContainer ? "w-full h-full object-contain" : "w-full aspect-video"}
+        controls={controls}
+        playsInline
+      >
+        {/* 字幕 VTT 走同源签名 URL，无需 crossOrigin；不会影响 HLS 播放
+            注意：不再使用 default，由副作用根据用户开关切换 mode=hidden/disabled，
+            改用自定义渲染层显示字幕文本，方便用户自定义大小/颜色/背景透明度等。 */}
+        {subtitleStatus?.status === 'DONE' && subtitleStatus.vttUrl && (
+          <track
+            ref={trackRef}
+            key={subtitleStatus.vttUrl}
+            kind="subtitles"
+            src={subtitleStatus.vttUrl}
+            srcLang={subtitleStatus.targetLang || 'zh'}
+            label="中文（机翻）"
+          />
+        )}
+      </video>
+    );
+
     return (
       <div ref={containerRef} className={fillContainer ? "relative bg-black w-full h-full overflow-hidden" : "relative bg-black rounded-lg overflow-hidden"}>
-        <video
-          ref={videoRef}
-          className={fillContainer ? "w-full h-full object-contain" : "w-full aspect-video"}
-          style={rotatedStyle}
-          controls={controls}
-          playsInline
-        >
-          {/* 字幕 VTT 走同源签名 URL，无需 crossOrigin；不会影响 HLS 播放
-              注意：不再使用 default，由副作用根据用户开关切换 mode=hidden/disabled，
-              改用自定义渲染层显示字幕文本，方便用户自定义大小/颜色/背景透明度等。 */}
-          {subtitleStatus?.status === 'DONE' && subtitleStatus.vttUrl && (
-            <track
-              ref={trackRef}
-              key={subtitleStatus.vttUrl}
-              kind="subtitles"
-              src={subtitleStatus.vttUrl}
-              srcLang={subtitleStatus.targetLang || 'zh'}
-              label="中文（机翻）"
-            />
-          )}
-        </video>
+        {rotationWrapperStyle ? (
+          <div style={rotationWrapperStyle}>{videoNode}</div>
+        ) : (
+          videoNode
+        )}
 
         {/* 自定义字幕渲染层；与原生 controls 互不干扰：
             - controls=true 时浏览器原生控制条会盖在最上方，自定义字幕也在 video 上方
