@@ -477,8 +477,15 @@ func (s *SubtitleService) checkClaimCapacity(workerID string, canAudio, canSubti
 		return allowAudio, allowSubtitle
 	}
 
-	// 旧字段总上限兜底（不区分能力）
-	if tok.MaxConcurrency > 0 {
+	// 旧字段总上限兜底（不区分能力）。
+	//
+	// 仅当 token **没有任何**分维度上限（MaxAudioConcurrency / MaxSubtitleConcurrency 都 = 0）
+	// 时才生效；只要 admin 已经为该 token 配置了至少一条分维度上限，旧的
+	// MaxConcurrency 就让位给分维度上限——避免出现 schema 历史默认值
+	// （MaxConcurrency=1, MaxAudioConcurrency=2）互相打架，导致 audio 维度的
+	// 2 永远被旧字段的 1 总上限卡住、worker 实际只能并发 1 个任务的歧义。
+	useLegacyTotal := tok.MaxAudioConcurrency <= 0 && tok.MaxSubtitleConcurrency <= 0
+	if useLegacyTotal && tok.MaxConcurrency > 0 {
 		var total int64
 		if err := s.db.Table("subtitle_jobs AS sj").
 			Joins("JOIN subtitle_workers AS sw ON sw.id = sj.claimed_by").

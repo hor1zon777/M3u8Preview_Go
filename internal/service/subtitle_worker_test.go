@@ -468,12 +468,17 @@ func TestClaimNextJob_GlobalLimit(t *testing.T) {
 	}
 }
 
-// TestClaimNextJob_TokenLimit Token 维度并发上限：同 token 下两个 worker 受限于 MaxConcurrency=1。
+// TestClaimNextJob_TokenLimit Token audio 维度并发上限：同 token 下两个 worker 受限于 MaxAudioConcurrency=1。
+//
+// 新语义（v3.x）：当 token 配置了任一分维度上限（MaxAudioConcurrency / MaxSubtitleConcurrency > 0）时，
+// 分维度上限作为权威，旧的 MaxConcurrency 总上限兜底自动失效。
+// 这避免了 schema 历史默认 (MaxConcurrency=1, MaxAudioConcurrency=2) 互相打架，
+// 让 audio 维度的多并发配置（机 A 通常带宽足，可以同时拉多个 m3u8）真正生效。
 func TestClaimNextJob_TokenLimit(t *testing.T) {
 	svc, db := newTestSubtitleService(t, 10*time.Minute)
 
-	// 创建一个 MaxConcurrency=1 的 token
-	_, tokenRec, err := svc.CreateWorkerToken("shared", 1, 2, 1)
+	// MaxConcurrency=0（不限），MaxAudioConcurrency=1（audio 维度限 1 条）
+	_, tokenRec, err := svc.CreateWorkerToken("shared", 0, 1, 1)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
@@ -508,18 +513,18 @@ func TestClaimNextJob_TokenLimit(t *testing.T) {
 		t.Fatalf("first claim: %v %+v", err, first)
 	}
 
-	// 同 token 上限 1，worker-B 拿不到
+	// audio 维度上限 1，worker-B 拿不到
 	second, err := svc.ClaimNextJob("worker-B")
 	if err != nil {
 		t.Fatalf("second claim err: %v", err)
 	}
 	if second != nil {
-		t.Fatalf("expected nil due to token limit, got %+v", second)
+		t.Fatalf("expected nil due to audio limit, got %+v", second)
 	}
 
-	// 把 token 上限调到 2 后，worker-B 应该能抢到
+	// 把 audio 维度上限调到 2 后，worker-B 应该能抢到
 	v := 2
-	if _, err := svc.UpdateWorkerToken(tokenRec.ID, dto.SubtitleWorkerTokenUpdateRequest{MaxConcurrency: &v}); err != nil {
+	if _, err := svc.UpdateWorkerToken(tokenRec.ID, dto.SubtitleWorkerTokenUpdateRequest{MaxAudioConcurrency: &v}); err != nil {
 		t.Fatalf("update limit: %v", err)
 	}
 	third, err := svc.ClaimNextJob("worker-B")
@@ -527,6 +532,68 @@ func TestClaimNextJob_TokenLimit(t *testing.T) {
 		t.Fatalf("third claim err: %v", err)
 	}
 	if third == nil {
-		t.Fatal("worker-B should claim after raising token limit")
+		t.Fatal("worker-B should claim after raising audio limit")
+	}
+}
+
+// TestClaimNextJob_LegacyMaxConcurrency 当 token 没有配任何分维度上限（新字段都 = 0）
+// 时，旧的 MaxConcurrency 仍作为总上限兜底。
+//
+// 这是 v2 之前的兼容路径：老数据库迁移过来的 token 可能只有 MaxConcurrency 字段，
+// 此时回到"该 token 名下所有 RUNNING 任务总数 ≤ MaxConcurrency"的传统语义，
+// 避免老用户升级后并发突然失控。
+//
+// 注：CreateWorkerToken 会把分维度参数的 0 clamp 到默认 (audio=2, subtitle=1)，
+// 所以这里直接 db.Create 插一条裸 token 来精确构造 "新字段都 = 0" 的场景。
+func TestClaimNextJob_LegacyMaxConcurrency(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+
+	tokenRec := model.SubtitleWorkerToken{
+		Name:                   "legacy",
+		TokenHash:              "x",
+		TokenPrefix:            "mwt_lega",
+		MaxConcurrency:         1,
+		MaxAudioConcurrency:    0,
+		MaxSubtitleConcurrency: 0,
+	}
+	if err := db.Create(&tokenRec).Error; err != nil {
+		t.Fatalf("seed legacy token: %v", err)
+	}
+	// GORM Create 对 int 零值会落到 schema default（audio=2 / subtitle=1），
+	// 这里再 UPDATE 一次显式把分维度字段强制写回 0，构造真正的 legacy token。
+	if err := db.Model(&model.SubtitleWorkerToken{}).Where("id = ?", tokenRec.ID).
+		Updates(map[string]any{
+			"max_audio_concurrency":    0,
+			"max_subtitle_concurrency": 0,
+		}).Error; err != nil {
+		t.Fatalf("force legacy zeros: %v", err)
+	}
+
+	for _, id := range []string{"worker-A", "worker-B"} {
+		if err := db.Create(&model.SubtitleWorker{
+			ID:           id,
+			TokenID:      tokenRec.ID,
+			Name:         id,
+			LastSeenAt:   time.Now(),
+			RegisteredAt: time.Now(),
+		}).Error; err != nil {
+			t.Fatalf("seed worker %s: %v", id, err)
+		}
+	}
+
+	seedPendingJob(t, db, "media-A", "https://example.com/a.m3u8")
+	seedPendingJob(t, db, "media-B", "https://example.com/b.m3u8")
+
+	// worker-A 抢一条
+	if first, err := svc.ClaimNextJob("worker-A"); err != nil || first == nil {
+		t.Fatalf("first claim: %v %+v", err, first)
+	}
+	// 旧字段兜底：MaxConcurrency=1 触发，worker-B 拿不到
+	second, err := svc.ClaimNextJob("worker-B")
+	if err != nil {
+		t.Fatalf("second claim err: %v", err)
+	}
+	if second != nil {
+		t.Fatalf("expected nil due to legacy MaxConcurrency, got %+v", second)
 	}
 }

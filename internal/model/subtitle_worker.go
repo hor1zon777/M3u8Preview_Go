@@ -40,7 +40,13 @@ type SubtitleWorkerToken struct {
 	TokenHash   string `gorm:"column:token_hash;type:text;not null" json:"-"`
 	TokenPrefix string `gorm:"column:token_prefix;type:text;not null;index:idx_worker_token_prefix" json:"tokenPrefix"`
 	// MaxConcurrency 旧字段：不区分 capability 时的总并发上限兜底；0 表示不限。
-	MaxConcurrency int `gorm:"column:max_concurrency;type:integer;not null;default:1" json:"maxConcurrency"`
+	//
+	// 注：default:0 = 与字段注释"0 表示不限"对齐。早期版本 default 是 1，
+	// 配合新字段 MaxAudioConcurrency 默认 2 时会把 audio 维度永远卡在 1，
+	// 导致 audio worker 即便配置了多并发也只能跑 1 个任务。
+	// 服务端 checkClaimCapacity 也已加上"分维度任一 > 0 时跳过本字段"的逻辑，
+	// 双保险避免旧默认值再次成为隐性瓶颈。
+	MaxConcurrency int `gorm:"column:max_concurrency;type:integer;not null;default:0" json:"maxConcurrency"`
 	// MaxAudioConcurrency / MaxSubtitleConcurrency 是 v2 分布式拆分后按 capability 维度的并发上限。
 	// 默认 audio=2（带宽密集，机 A 可同时拉多个 m3u8）/ subtitle=1（GPU 密集，单卡一次跑一条）。
 	// 0 表示该维度不限（仍受 MaxConcurrency 与 cfg.GlobalMaxConcurrency 兜底）。
