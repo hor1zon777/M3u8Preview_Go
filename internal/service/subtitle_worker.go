@@ -1225,13 +1225,19 @@ func (s *SubtitleService) ListOnlineWorkers() ([]dto.SubtitleWorkerItem, error) 
 	return out, nil
 }
 
-// ListWorkerTokens 列出所有 token（不含明文）。带每个 token 的 currentRunning 实时统计。
+// ListWorkerTokens 列出未吊销的 token（不含明文）。带每个 token 的 currentRunning 实时统计。
+//
+// 已吊销（revoked_at != NULL）的 token 不再返回——admin 面板需要的是当前可用凭证视图。
+// 审计 / 历史诉求由数据库行本体保留，吊销动作走 RevokeWorkerToken 留痕。
 //
 // v2 新增：分维度统计 currentAudioRunning / currentSubtitleRunning，便于 admin 看清楚
 // 限流来自哪一侧（audio_extract 还是 asr_subtitle）。
 func (s *SubtitleService) ListWorkerTokens() ([]dto.SubtitleWorkerTokenItem, error) {
 	var tokens []model.SubtitleWorkerToken
-	if err := s.db.Order("created_at DESC").Find(&tokens).Error; err != nil {
+	if err := s.db.
+		Where("revoked_at IS NULL").
+		Order("created_at DESC").
+		Find(&tokens).Error; err != nil {
 		return nil, err
 	}
 	if len(tokens) == 0 {
