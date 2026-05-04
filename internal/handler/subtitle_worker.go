@@ -82,6 +82,7 @@ func (h *SubtitleWorkerHandler) Register(rg *gin.RouterGroup) {
 	//  - audio-stream：audio worker 收到 fetch 通知后流式上传 FLAC（broker 实时转发）
 	//  - audio (GET)：subtitle worker 拉 FLAC，服务端 broker 桥接
 	rg.POST("/jobs/:jobId/audio-ready", h.audioReady)
+	rg.POST("/jobs/:jobId/audio-lost", h.audioLost)
 	rg.POST("/audio-fetch-poll", h.audioFetchPoll)
 	rg.POST("/jobs/:jobId/audio-stream", h.audioStream)
 	rg.GET("/jobs/:jobId/audio", h.audioFetch)
@@ -287,6 +288,42 @@ func (h *SubtitleWorkerHandler) audioReady(c *gin.Context) {
 		return
 	}
 	if err := h.svc.WorkerAudioReady(jobID, meta); err != nil {
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.APIResponse{Success: true})
+}
+
+// audioLost 是 v3.1 audio worker 在 long-poll 收到 broker fetch 通知后，发现本地
+// FLAC 实际不在（被误删 / storage_dir 改动 / 索引损坏）时主动声明的端点。
+//
+// 与 audio-fail（fail 端点的复用）的差别：
+//   - fail 端点要求 claimed_by == workerId，但 audio_ready 之后 claimed_by 已清空
+//     （随即被 subtitle worker 重新占用），audio worker 无法走 fail 端点反馈丢失
+//   - 本端点校验 audio_worker_id == workerId，让 FLAC owner 显式声明丢失
+//
+// 服务端响应：清空音频元数据 + claimed_by + subtitle_worker_id，stage 回 queued，
+// 让任意 audio worker 重新跑全流程；subtitle worker 后续 fail/heartbeat 调用会因
+// claimed_by 已清空被 410 优雅退出。
+//
+// 错误响应：
+//   - 400 invalid JSON / missing fields
+//   - 404 job not found
+//   - 409 stage 不允许（必须是 audio_uploaded / asr / translate / writing 之一，
+//         详见 service.audioLostAllowedStages）
+//   - 410 audio_worker_id 不匹配请求方（WORKER_AUDIO_LOST_NOT_OWNED）
+func (h *SubtitleWorkerHandler) audioLost(c *gin.Context) {
+	jobID := c.Param("jobId")
+	if jobID == "" {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "missing jobId"))
+		return
+	}
+	var req dto.WorkerAudioLostRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "invalid audio-lost payload: "+err.Error()))
+		return
+	}
+	if err := h.svc.WorkerAudioLost(jobID, req.WorkerID, req.ErrorMsg); err != nil {
 		_ = c.Error(err)
 		return
 	}

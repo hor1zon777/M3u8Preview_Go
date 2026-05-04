@@ -45,6 +45,7 @@ const (
 	WorkerErrCodeAudioSHA256Mismatch = "WORKER_AUDIO_SHA256_MISMATCH"
 	WorkerErrCodeAudioNotReady       = "WORKER_AUDIO_NOT_READY"
 	WorkerErrCodeAudioGone           = "WORKER_AUDIO_GONE"
+	WorkerErrCodeAudioLostNotOwned   = "WORKER_AUDIO_LOST_NOT_OWNED" // audio-lost 调用方不是 audio_worker_id
 	WorkerErrCodeJobNotOwned         = "WORKER_JOB_NOT_OWNED"
 	WorkerErrCodeCapabilityMismatch  = "WORKER_CAPABILITY_MISMATCH"
 	// v3 broker 专属错误码：
@@ -674,6 +675,107 @@ func (s *SubtitleService) WorkerAudioReady(jobID string, meta dto.WorkerAudioRea
 
 	log.Printf("[subtitle/worker] audio-ready job=%s media=%s owner=%s size=%d sha=%s dur=%dms format=%s",
 		jobID, job.MediaID, meta.WorkerID, meta.Size, expectedSHA[:min(8, len(expectedSHA))], meta.DurationMs, meta.Format)
+	return nil
+}
+
+// audioLostAllowedStages 是 WorkerAudioLost 接受的 source stage 集合。
+//
+// 关键：fetch task 是 subtitle worker GET /audio 触发 broker EnqueueFetch 后才派给
+// audio worker 的，而 subtitle worker claim 时已经把 stage 从 audio_uploaded 推进
+// 到 asr。因此 audio_lost 在最常见路径（subtitle worker 已 claim）下看到的 stage
+// 是 asr / translate / writing。如果只校验 audio_uploaded，端点永远走不通。
+//
+// 允许集合：audio_uploaded（subtitle worker 还没 claim）+ 所有 subtitle 阶段。
+// 这些 stage 下 audio_worker_id 都应当 == 调用方，所以 ownership 仍然是有效的。
+var audioLostAllowedStages = []string{
+	model.SubtitleStageAudioUploaded,
+	model.SubtitleStageASR,
+	model.SubtitleStageTranslate,
+	model.SubtitleStageWriting,
+}
+
+func isAudioLostStageAllowed(stage string) bool {
+	for _, s := range audioLostAllowedStages {
+		if stage == s {
+			return true
+		}
+	}
+	return false
+}
+
+// WorkerAudioLost 是 v3.1 audio worker 在收到 broker fetch 通知后发现本地 FLAC
+// 已丢失（文件被误删 / storage_dir 改动 / 索引损坏）时主动声明的端点处理。
+//
+// 与 WorkerFail 的区别：
+//   - WorkerFail 校验 `claimed_by == workerID`，但 audio_ready 之后 claimed_by 已清空
+//     （随即被 subtitle worker 重新占用），audio worker 此时无法用 fail 端点反馈
+//   - 本端点校验 `audio_worker_id == workerID`，专门给 FLAC owner 声明丢失
+//
+// 行为：
+//  1. 校验 ownership：audio_worker_id == workerID
+//  2. 校验 stage ∈ {audio_uploaded, asr, translate, writing}
+//     （详见 audioLostAllowedStages 的注释；fetch 派发时 stage 通常是 asr）
+//  3. CAS UPDATE：清空 audio_artifact_*、audio_worker_id、subtitle_worker_id、claimed_by；
+//     status=PENDING、stage=queued。让任意 audio worker 重新跑全流程。
+//
+// 副作用：subtitle worker 那边的 GET /audio 因 broker 30s 超时返回 503；其后续 fail
+// 调用会因 claimed_by 已清空被 410 拒绝（→ subtitle worker runner 抛 WorkerJobLost
+// 优雅退出，不致命）。
+//
+// 不计入 worker.failed_jobs 统计（中间态回滚，不是终态失败）。
+func (s *SubtitleService) WorkerAudioLost(jobID, workerID, errMsg string) error {
+	var job model.SubtitleJob
+	if err := s.db.Where("id = ?", jobID).Take(&job).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return middleware.NewAppError(http.StatusNotFound, "job not found")
+		}
+		return middleware.WrapAppError(http.StatusInternalServerError, "query job", err)
+	}
+	if job.AudioWorkerID != workerID {
+		return middleware.NewAppErrorWithCode(http.StatusGone, WorkerErrCodeAudioLostNotOwned,
+			fmt.Sprintf("job audio owner is %q, not %q", job.AudioWorkerID, workerID))
+	}
+	if !isAudioLostStageAllowed(job.Stage) {
+		return middleware.NewAppErrorWithCode(http.StatusConflict, WorkerErrCodeAudioNotReady,
+			fmt.Sprintf("job stage %s does not allow audio-lost", job.Stage))
+	}
+
+	now := time.Now()
+	msg := truncateString("audio-lost: "+errMsg, 1000)
+	res := s.db.Model(&model.SubtitleJob{}).
+		Where("id = ? AND audio_worker_id = ? AND stage IN ?", jobID, workerID, audioLostAllowedStages).
+		Updates(map[string]any{
+			"status":                     model.SubtitleStatusPending,
+			"stage":                      model.SubtitleStageQueued,
+			"progress":                   0,
+			"audio_worker_id":            "",
+			"subtitle_worker_id":         "",
+			"claimed_by":                 "", // 让 subtitle worker 后续 fail/heartbeat 走 410 路径
+			"audio_artifact_path":        "",
+			"audio_artifact_size":        0,
+			"audio_artifact_sha256":      "",
+			"audio_artifact_format":      "",
+			"audio_artifact_duration_ms": 0,
+			"audio_uploaded_at":          nil,
+			"last_heartbeat_at":          nil,
+			"error_msg":                  msg,
+		})
+	if res.Error != nil {
+		return middleware.WrapAppError(http.StatusInternalServerError, "audio-lost update", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		// 期间被别的事务改了 stage / owner（罕见竞态）
+		return middleware.NewAppErrorWithCode(http.StatusGone, WorkerErrCodeAudioLostNotOwned, "job state changed during audio-lost")
+	}
+
+	// 顺手刷 worker last_seen，避免 audio worker 因这次不存盘的 long-poll 处理被 stale 回收
+	_ = s.db.Model(&model.SubtitleWorker{}).Where("id = ?", workerID).Updates(map[string]any{
+		"current_job_id": "",
+		"last_seen_at":   now,
+	}).Error
+
+	log.Printf("[subtitle/worker] audio-lost: job=%s media=%s owner=%s prev_stage=%s err=%q -> rolled back to queued",
+		jobID, job.MediaID, workerID, job.Stage, msg)
 	return nil
 }
 

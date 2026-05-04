@@ -267,6 +267,22 @@ type WorkerAudioFetchPollRequest struct {
 	TimeoutSec int `json:"timeoutSec,omitempty"`
 }
 
+// WorkerAudioLostRequest 是 audio worker 在收到 fetch 通知后发现本地 FLAC 已丢失
+// （文件被误删 / storage_dir 改动 / 索引损坏 等）时上报的请求体。
+//
+// 服务端校验 audio_worker_id == workerId（注意不是 claimed_by，因为 audio_ready
+// 之后 claimed_by 已清空，仅 audio_worker_id 标识 owner），通过后清空 audio_artifact_*
+// 元数据并把 stage 回到 queued，让其它 audio worker 重新跑。
+//
+// 设计目的：避免 subtitle worker 反复 GET /audio 触发 broker 死循环——audio worker
+// 主动声明丢失比让 stale recovery 等待 ~5 分钟更及时。
+type WorkerAudioLostRequest struct {
+	WorkerID string `json:"workerId" binding:"required"`
+	// ErrorMsg 描述具体原因（"file not found in storage_dir=..." 等），落到
+	// subtitle_jobs.error_msg 方便 admin 排查。
+	ErrorMsg string `json:"errorMsg"`
+}
+
 // WorkerAudioFetchTask audio worker long-poll 拿到的指令。
 //
 // Action 取值：

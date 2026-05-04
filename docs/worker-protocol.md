@@ -280,7 +280,39 @@ Worker 启动时调用，把自身信息 upsert 到服务器。同一 `workerId`
 
 ---
 
-### 3.5 POST /api/v1/worker/audio-fetch-poll 🆕 v3
+### 3.5 POST /api/v1/worker/jobs/:jobId/audio-lost 🆕 v3.1
+
+**audio worker 在收到 broker fetch 通知后发现本地 FLAC 已丢失时调用**。让服务端把任务回滚到 `queued`，避免 broker 反复派发同一个 fetch 死循环。
+
+服务端校验：
+
+| 项 | 期望 |
+|---|---|
+| `audio_worker_id` | 必须 == 请求体的 `workerId`（FLAC owner） |
+| `stage` | 必须 ∈ `{audio_uploaded, asr, translate, writing}` |
+
+校验通过后：清空 `audio_artifact_*`、`audio_worker_id`、`subtitle_worker_id`、`claimed_by`，状态回到 `PENDING/queued`。
+
+> 为何 stage 不止 `audio_uploaded`：fetch 任务是 `subtitle worker GET /audio` 触发 broker `EnqueueFetch` 后才派给 audio worker 的，而 subtitle worker `claim` 时已把 stage 从 `audio_uploaded` 推进到 `asr`。所以 fetch 派发瞬间 stage 通常是 `asr` 而非 `audio_uploaded`，必须放宽到全部 subtitle 阶段才能让 audio-lost 真正走通。
+>
+> 与 `fail` 的区别：`fail` 校验 `claimed_by == workerId`，但 `audio_ready` 之后 `claimed_by` 短暂为空（随即被 subtitle worker 重新占用）；audio worker 此时是通过 `audio_worker_id` 标识 owner，必须用本端点反馈丢失。
+
+**副作用**：subtitle worker 那边的 `GET /audio` 因 broker 30s 超时返回 503；其后续 `fail` 调用会因 `claimed_by` 已清空被 410 拒绝（subtitle worker runner 抛 `WorkerJobLost` 优雅退出，不致命）。
+
+**请求体**：
+
+```json
+{
+  "workerId": "550e8400-...",
+  "errorMsg": "no local FLAC for job=... (storage_dir=C:\\..., entries=0)"
+}
+```
+
+**响应**：`{"success":true}` (200) / `404 not found` / `409 WORKER_AUDIO_NOT_READY`（stage 不在允许集合中）/ `410 WORKER_AUDIO_LOST_NOT_OWNED`
+
+---
+
+### 3.6 POST /api/v1/worker/audio-fetch-poll 🆕 v3
 
 **audio worker 长轮询**：等待服务端下发 fetch / cleanup 指令。这是 v3 broker 模式的核心通知通道。
 
@@ -416,6 +448,7 @@ worker token 是高权限凭据，允许触发重试（与 admin Retry 等价）
 | Code | HTTP | 含义 |
 |------|------|------|
 | `WORKER_JOB_NOT_OWNED` | 403/410 | claimed_by / audio_worker_id 不匹配请求方 |
+| `WORKER_AUDIO_LOST_NOT_OWNED` | 410 | audio-lost 调用方不是当前 audio_worker_id |
 | `WORKER_AUDIO_NOT_READY` | 409 | audio-ready 时 stage 不允许（v3.1 起允许 downloading / extracting / encoding_intermediate）|
 | `WORKER_AUDIO_GONE` | 410 | audio_worker_id 为空 / 没人在等 fetch |
 | `WORKER_AUDIO_SHA256_MISMATCH` | 412 | 保留（v3 不再校验，但常量保留） |
