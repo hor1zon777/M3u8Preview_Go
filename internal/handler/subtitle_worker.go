@@ -37,6 +37,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -52,6 +53,11 @@ const maxVTTUploadBytes = 10 * 1024 * 1024
 // audio-stream 上传大小上限：1 GB（覆盖 4 小时无损 FLAC）。
 // 配合 broker 流式转发；body 直接是二进制 FLAC，不是 multipart。
 const maxAudioStreamBytes = 1 * 1024 * 1024 * 1024
+
+// audio-stream-chunk 单个分片上限：95 MiB。
+// 客户端按 90 MiB 切片（绕开 Cloudflare 100 MB body 上限），服务端预留 5 MiB
+// 余量做 headers / TLS / 长度膨胀兜底；超限统一在 Go MaxBytesReader 这层 413。
+const maxAudioStreamChunkBytes = 95 * 1024 * 1024
 
 // audio-fetch-poll 客户端可指定的最大 hold 时长（秒）。
 const (
@@ -79,12 +85,14 @@ func (h *SubtitleWorkerHandler) Register(rg *gin.RouterGroup) {
 	// v3 分布式 worker broker 端点（替换 v2 落盘版）：
 	//  - audio-ready：audio worker 完成本地 FLAC 后注册元数据（不传文件）
 	//  - audio-fetch-poll：audio worker long-poll 等待 fetch / cleanup 指令
-	//  - audio-stream：audio worker 收到 fetch 通知后流式上传 FLAC（broker 实时转发）
+	//  - audio-stream：audio worker 收到 fetch 通知后流式上传 FLAC（broker 实时转发，单流，内网可用）
+	//  - audio-stream-chunk：v3.2 分块上传，每块 ≤90 MiB，绕开 Cloudflare 100 MB 限制（broker 在同一 pipe 拼接）
 	//  - audio (GET)：subtitle worker 拉 FLAC，服务端 broker 桥接
 	rg.POST("/jobs/:jobId/audio-ready", h.audioReady)
 	rg.POST("/jobs/:jobId/audio-lost", h.audioLost)
 	rg.POST("/audio-fetch-poll", h.audioFetchPoll)
 	rg.POST("/jobs/:jobId/audio-stream", h.audioStream)
+	rg.POST("/jobs/:jobId/audio-stream-chunk", h.audioStreamChunk)
 	rg.GET("/jobs/:jobId/audio", h.audioFetch)
 	// retry 用 mediaId 维度，跟 admin /jobs/:mediaId/retry 一致
 	rg.POST("/media/:mediaId/retry", h.retry)
@@ -396,6 +404,65 @@ func (h *SubtitleWorkerHandler) audioStream(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAudioStreamBytes)
 
 	if err := h.svc.WorkerAudioStreamReceive(jobID, workerID, c.Request.Body); err != nil {
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.APIResponse{Success: true})
+}
+
+// audioStreamChunk 是 v3.2 分块上传：把 FLAC 切成多个 ≤90 MiB chunk 顺序 POST 上来，
+// broker 在同一条 io.Pipe 上拼接转发给等待中的 subtitle worker GET。
+//
+// 用于绕开 Cloudflare / 其它 CDN 的 100 MiB body 上限。subtitle worker 端无感知，
+// 仍然在一条 GET 上看到连续的 FLAC 字节流 + EOF。
+//
+// Body 是裸 FLAC 字节流的一个分片（不是 multipart）。
+//
+// Headers：
+//   - X-Worker-Id：上传方 audio worker id（owner 校验）
+//   - X-Chunk-Index：0-based 顺序号；必须从 0 严格递增，否则整段中止
+//   - X-Chunk-Last：仅最后一块设置为 "1"
+//
+// 错误响应：
+//   - 400 missing workerId / 非法 chunkIndex
+//   - 403 不是该任务的 owner audio worker
+//   - 409 chunk 乱序，整段已中止（subtitle worker GET 端会收到错误）
+//   - 410 没人在等这个 jobId 的 fetch
+//   - 413 单 chunk > 95 MiB
+func (h *SubtitleWorkerHandler) audioStreamChunk(c *gin.Context) {
+	jobID := c.Param("jobId")
+	if jobID == "" {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "missing jobId"))
+		return
+	}
+	workerID := c.GetHeader("X-Worker-Id")
+	if workerID == "" {
+		workerID = c.Query("workerId")
+	}
+	if workerID == "" {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "missing X-Worker-Id"))
+		return
+	}
+
+	chunkIdxStr := c.GetHeader("X-Chunk-Index")
+	if chunkIdxStr == "" {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "missing X-Chunk-Index"))
+		return
+	}
+	chunkIdx, err := strconv.Atoi(chunkIdxStr)
+	if err != nil || chunkIdx < 0 {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest,
+			"invalid X-Chunk-Index: "+chunkIdxStr))
+		return
+	}
+	// X-Chunk-Last 任意非空非 "0" 视为末块，便于客户端写 "1" / "true"
+	last := c.GetHeader("X-Chunk-Last")
+	isLast := last != "" && last != "0" && last != "false"
+
+	// 单 chunk 上限：超过 maxAudioStreamChunkBytes 直接 413（client 应缩小切片）
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAudioStreamChunkBytes)
+
+	if err := h.svc.WorkerAudioStreamChunkReceive(jobID, workerID, chunkIdx, isLast, c.Request.Body); err != nil {
 		_ = c.Error(err)
 		return
 	}

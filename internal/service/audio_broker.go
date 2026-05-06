@@ -1,5 +1,5 @@
 // Package service
-// audio_broker.go 实现 v3 分布式音频"零落盘"中转。
+// audio_broker.go 实现 v3 / v3.2 分布式音频"零落盘"中转。
 //
 // v2（已废弃）：audio worker 上传 FLAC 到服务端 <UploadsDir>/intermediate/<jobId>.flac，
 // subtitle worker GET 服务端的文件。服务端要承担磁盘容量。
@@ -29,8 +29,20 @@
 //   5. 任务进 DONE 后，服务端通过同一个 long-poll 通道下发 cleanup 指令；
 //      audio worker 删本地 FLAC + 索引项。
 //
+// v3.2 chunked 上传（绕开 Cloudflare 等 CDN 100 MiB body 上限）：
+//   - audio worker 把第 4 步那一次 POST /audio-stream 改成 N 次顺序
+//     POST /audio-stream-chunk，每块 ≤ 90 MiB。
+//   - 每个 chunk 带 X-Chunk-Index（0-based 严格递增）+ X-Chunk-Last（仅末块）。
+//   - broker 在同一条 io.Pipe 上拼接所有 chunk 的字节，subtitle worker GET 端
+//     仍然看到一条连续的 chunked 流 + EOF，无感知。
+//   - 任意 chunk 乱序 / io 错误 → broker.abortCoupling 立刻 close pipe writer
+//     with error，subtitle worker GET 端的 io.Copy 收到错误，HTTP 链路上抛 5xx。
+//   - 单流 ReceiveStream 与 chunked ReceiveChunk 互斥：同一个 fetch 不能混用，
+//     混用会因 takeCoupling 抢占而失败。客户端按部署环境二选一。
+//
 // 并发安全：每个 audio worker 一个独立的 fetch 通道（buffered chan）；每个等待中的
 // fetch 一个 io.Pipe + chan struct{}（done 信号）。所有共享状态都用 mutex 保护。
+// chunked 路径上的 nextChunkIdx / streamStarted 由 fetchCoupling.chunkMu 保护。
 
 package service
 
@@ -100,22 +112,31 @@ type AudioFetchTask struct {
 // fetchCoupling 一对生产者-消费者协调对象。
 //
 //   - subtitle worker GET handler 创建（通过 RequestFetch），持有 reader 端
-//   - audio worker POST audio-stream handler 拿到 writer 端写入
+//   - audio worker POST audio-stream / audio-stream-chunk handler 拿到 writer 端写入
 //   - subtitle worker 端 io.Copy(writer, reader) 把数据流给客户端
 //   - done 信号让"开始接收第一字节"超时检测能停在 audio worker 真的开始上传时
+//
+// v3.2 增加 chunked 上传：单次 fetch 期间多个 ReceiveChunk 调用顺序拼接同一条 pipe。
+// streamStarted / nextChunkIdx 由 chunkMu 保护，避免并发 chunk 互踩。
 type fetchCoupling struct {
 	reader      *io.PipeReader
 	writer      *io.PipeWriter
-	streamStart chan struct{} // audio worker 调 ReceiveStream 时关闭，让 RequestFetch 取消 firstByteTimeout
+	streamStart chan struct{} // 第一次 Receive(Stream|Chunk) 时关闭，让 RequestFetch 取消 firstByteTimeout
 	done        chan struct{} // 整个 fetch 结束（成功或失败）时关闭
+
+	// chunked 上传状态（仅 ReceiveChunk 路径使用，单流 ReceiveStream 路径不读不写）
+	chunkMu       sync.Mutex
+	nextChunkIdx  int  // 期望的下一个 chunk 序号（0-based）
+	streamStarted bool // 第一个 chunk / 单流是否已到（避免重复 close streamStart）
 }
 
 // 错误集合。
 var (
-	ErrAudioOwnerOffline = errors.New("audio worker offline (no long-poll within timeout)")
-	ErrAudioStreamTaken  = errors.New("another fetch is already in progress for this job")
-	ErrAudioNoFetcher    = errors.New("no subtitle worker waiting for this job's audio")
-	ErrAudioStreamStuck  = errors.New("audio worker accepted fetch task but never started uploading")
+	ErrAudioOwnerOffline    = errors.New("audio worker offline (no long-poll within timeout)")
+	ErrAudioStreamTaken     = errors.New("another fetch is already in progress for this job")
+	ErrAudioNoFetcher       = errors.New("no subtitle worker waiting for this job's audio")
+	ErrAudioStreamStuck     = errors.New("audio worker accepted fetch task but never started uploading")
+	ErrAudioChunkOutOfOrder = errors.New("audio chunk out-of-order")
 )
 
 // Poll 是 audio worker long-poll 的实现。
@@ -236,13 +257,15 @@ func (b *AudioBroker) RequestFetch(jobID, ownerWorkerID string, w io.Writer) err
 	}
 }
 
-// ReceiveStream 是 audio worker POST /audio-stream 的处理实现。
+// ReceiveStream 是 audio worker POST /audio-stream 的处理实现（v3 单流模式）。
 //
 // 把 body 流式 io.Copy 到对应的 fetch coupling 的 pipe writer。subtitle worker 那边
 // 会实时拿到。
 //
 // expectedSize 用于让调用方在 handler 层做 LimitReader（防止巨型 body 占资源），
 // broker 内部不强制；返回 (bytesWritten, error)。
+//
+// 注意：单流模式与 chunk 模式互斥；同一个 fetch 不能混用。
 func (b *AudioBroker) ReceiveStream(jobID string, body io.Reader) (int64, error) {
 	if jobID == "" {
 		return 0, fmt.Errorf("jobId required")
@@ -253,7 +276,13 @@ func (b *AudioBroker) ReceiveStream(jobID string, body io.Reader) (int64, error)
 	}
 
 	// 通知 RequestFetch 端"上传开始了"，关掉 firstByte 超时
-	close(coupling.streamStart)
+	// （streamStarted 标志保护双 close panic：chunked 路径同样会 close streamStart）
+	coupling.chunkMu.Lock()
+	if !coupling.streamStarted {
+		close(coupling.streamStart)
+		coupling.streamStarted = true
+	}
+	coupling.chunkMu.Unlock()
 
 	// 流式 copy 到 pipe writer
 	written, err := io.Copy(coupling.writer, body)
@@ -263,6 +292,73 @@ func (b *AudioBroker) ReceiveStream(jobID string, body io.Reader) (int64, error)
 	}
 	// 正常结束：close pipe writer 让 subtitle worker 那侧的 io.Copy 看到 EOF
 	_ = coupling.writer.Close()
+	return written, nil
+}
+
+// ReceiveChunk 是 audio worker POST /audio-stream-chunk 的处理实现（v3.2 分块模式）。
+//
+// 用于 audio worker 通过 Cloudflare 等 CDN 推送时绕开 100MB body 上限：把 FLAC 切成
+// 多个 ≤90MiB 的 chunk 顺序上传，broker 在同一条 io.Pipe 上拼接。subtitle worker
+// 端 GET 仍然看到一条连续的 chunked 流，无感知。
+//
+// 协议：
+//   - chunkIndex 必须从 0 开始严格递增；乱序则整段中止（subtitle worker GET 收到错误）
+//   - 第一个 chunk 时关闭 coupling.streamStart，让 RequestFetch 取消 firstByteTimeout
+//   - 写入完成（io.Copy）每块都成功；失败立即 abort
+//   - isLast=true 时 close pipe writer (EOF) + 从 pendingFetches 移除
+//
+// 与 ReceiveStream 互斥：同一个 fetch 不能混用两种协议（混用会因 takeCoupling 抢
+// 占而出错）。
+//
+// 返回 (写入字节数, error)。
+//
+//   - ErrAudioNoFetcher：没人在等这个 jobId（subtitle worker 已离开 / 任务已完）
+//   - ErrAudioChunkOutOfOrder：chunk 序号不匹配，整段已中止
+//   - 其它 error：io 错误，整段已中止
+func (b *AudioBroker) ReceiveChunk(jobID string, chunkIndex int, isLast bool, body io.Reader) (int64, error) {
+	if jobID == "" {
+		return 0, fmt.Errorf("jobId required")
+	}
+	if chunkIndex < 0 {
+		return 0, fmt.Errorf("chunkIndex must be >= 0")
+	}
+
+	coupling, ok := b.peekCoupling(jobID)
+	if !ok || coupling == nil {
+		return 0, ErrAudioNoFetcher
+	}
+
+	// 序号校验 + 第一块通知 + 状态推进，全在 chunkMu 内原子完成
+	coupling.chunkMu.Lock()
+	if chunkIndex != coupling.nextChunkIdx {
+		expected := coupling.nextChunkIdx
+		coupling.chunkMu.Unlock()
+		// 整段中止：subtitle worker GET 端会收到这个错误
+		b.abortCoupling(jobID, fmt.Errorf("expected chunk %d, got %d: %w",
+			expected, chunkIndex, ErrAudioChunkOutOfOrder))
+		return 0, fmt.Errorf("expected chunk %d, got %d: %w",
+			expected, chunkIndex, ErrAudioChunkOutOfOrder)
+	}
+	if !coupling.streamStarted {
+		close(coupling.streamStart)
+		coupling.streamStarted = true
+	}
+	coupling.nextChunkIdx++
+	coupling.chunkMu.Unlock()
+
+	written, err := io.Copy(coupling.writer, body)
+	if err != nil {
+		b.abortCoupling(jobID, err)
+		return written, err
+	}
+
+	if isLast {
+		// 末块：close pipe writer (EOF) + 从 map 移除（保证只能消费一次）
+		// 用 takeCoupling 而不是直接 delete，确保仍是同一个 coupling（防 race）
+		if c, ok := b.takeCoupling(jobID); ok && c == coupling {
+			_ = c.writer.Close()
+		}
+	}
 	return written, nil
 }
 
@@ -363,4 +459,27 @@ func (b *AudioBroker) takeCoupling(jobID string) (*fetchCoupling, bool) {
 	}
 	delete(b.pendingFetches, jobID)
 	return c, true
+}
+
+// peekCoupling 查看 jobID 对应的 coupling 但不取走（chunked 上传期间多次调用）。
+//
+// 用于 ReceiveChunk：每个 chunk 都需要找到同一个 coupling，只有最后一块或 abort
+// 才通过 takeCoupling 移除。
+func (b *AudioBroker) peekCoupling(jobID string) (*fetchCoupling, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	c, ok := b.pendingFetches[jobID]
+	return c, ok
+}
+
+// abortCoupling 异常中止整个 fetch：close pipe writer with error + 从 map 移除。
+//
+// 用于 ReceiveChunk 路径上的乱序 / io 错误，让 RequestFetch 那侧 io.Copy 立即收到
+// 该错误并把 5xx 透传给 subtitle worker GET。
+func (b *AudioBroker) abortCoupling(jobID string, abortErr error) {
+	c, ok := b.takeCoupling(jobID)
+	if !ok || c == nil {
+		return
+	}
+	_ = c.writer.CloseWithError(abortErr)
 }

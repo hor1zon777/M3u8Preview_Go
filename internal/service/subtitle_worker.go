@@ -838,6 +838,63 @@ func (s *SubtitleService) WorkerAudioStreamReceive(jobID, workerID string, body 
 	return nil
 }
 
+// WorkerAudioStreamChunkReceive 是 audio worker POST /audio-stream-chunk 的处理（v3.2 分块模式）。
+//
+// 与 WorkerAudioStreamReceive 同语义，区别仅在于：FLAC 被 audio worker 切成多个 ≤90 MiB
+// 的 chunk 顺序上传，broker 在同一条 io.Pipe 上拼接。每次 chunk 调用都过这个方法。
+//
+// 用于绕开 Cloudflare 等 CDN 的 100 MiB body 上限。subtitle worker GET 端无感知，仍
+// 收到一条连续的 chunked 流。
+//
+// 错误映射：
+//   - jobID/workerID 缺失 → 400
+//   - chunkIndex 非法 / 乱序 → 409
+//   - audio worker 不是 owner → 403
+//   - 没有 fetch 在等（subtitle worker 已离开） → 410
+//   - io 错误 → 500
+func (s *SubtitleService) WorkerAudioStreamChunkReceive(
+	jobID, workerID string,
+	chunkIndex int,
+	isLast bool,
+	body io.Reader,
+) error {
+	if jobID == "" || workerID == "" {
+		return middleware.NewAppError(http.StatusBadRequest, "missing jobId or workerId")
+	}
+	if chunkIndex < 0 {
+		return middleware.NewAppError(http.StatusBadRequest, "invalid chunkIndex")
+	}
+
+	// ownership 校验（与单流路径一致）
+	var job model.SubtitleJob
+	if err := s.db.Where("id = ?", jobID).Take(&job).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return middleware.NewAppError(http.StatusNotFound, "job not found")
+		}
+		return middleware.WrapAppError(http.StatusInternalServerError, "query job", err)
+	}
+	if job.AudioWorkerID != "" && job.AudioWorkerID != workerID {
+		return middleware.NewAppErrorWithCode(http.StatusForbidden, WorkerErrCodeJobNotOwned,
+			"this audio worker is not the FLAC owner of this job")
+	}
+
+	written, err := s.audioBroker.ReceiveChunk(jobID, chunkIndex, isLast, body)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrAudioNoFetcher):
+			return middleware.NewAppErrorWithCode(http.StatusGone, WorkerErrCodeAudioGone,
+				"no subtitle worker is currently waiting for this audio (timed out?)")
+		case errors.Is(err, ErrAudioChunkOutOfOrder):
+			return middleware.NewAppError(http.StatusConflict, err.Error())
+		default:
+			return middleware.WrapAppError(http.StatusInternalServerError, "audio stream chunk", err)
+		}
+	}
+	log.Printf("[subtitle/worker] audio-stream-chunk pushed: job=%s owner=%s idx=%d last=%v bytes=%d",
+		jobID, workerID, chunkIndex, isLast, written)
+	return nil
+}
+
 // WorkerAudioFetchBroker 是 subtitle worker GET /audio 的处理：协调 audio worker 实时上传，
 // 把 body 流式 pipe 到调用方提供的 ResponseWriter。
 //
