@@ -95,6 +95,70 @@ const (
 	WorkerCapASRSubtitle  = "asr_subtitle"  // ASR + 翻译 + 写 VTT
 )
 
+// === v4 错误分类（ErrorKind）===
+//
+// 三端共享的错误枚举。worker fail 上报时携带，服务端 WorkerFail 按 kind 分流：
+//
+//   - retriable_*：可重试。attempt++、按退避表写 next_retry_at；attempt 达 max_attempts
+//     强制 FAILED。
+//   - permanent_*：不可重试。直接 FAILED；不再放回队列。
+//   - neutral_*  ：与任务本身无关（worker 资源 / 优雅关闭）。回滚到对应阶段但 attempt 不变，
+//     避免一个 worker 抖动把任务的"重试预算"用光。
+//
+// 未知 kind 一律按 retriable 处理（保守路径，旧 worker 不传 kind 也走重试，与 v3 行为一致）。
+const (
+	// retriable —— 可重试（网络、临时上游 5xx、模型 OOM 等"再来一次有可能成功"的）
+	ErrorKindNetworkTimeout       = "network_timeout"
+	ErrorKindNetworkServer5xx     = "network_5xx"
+	ErrorKindBrokerStreamTimeout  = "broker_stream_timeout"
+	ErrorKindAudioSourceTemporary = "audio_source_temporary" // m3u8 5xx / 抖动
+	ErrorKindWhisperOOM           = "whisper_oom"
+	ErrorKindTranslateProvider5xx = "translate_provider_5xx"
+	ErrorKindUnknown              = "unknown" // 兼容老 worker / 未分类错误，按 retriable 处理
+
+	// permanent —— 不可重试（再来 N 次结果不变）
+	ErrorKindAuthInvalidToken         = "auth_invalid_token"
+	ErrorKindAudioSource404           = "audio_source_404"
+	ErrorKindFlacSHA256Mismatch       = "flac_sha256_mismatch"
+	ErrorKindWhisperModelMissing      = "whisper_model_missing"
+	ErrorKindWhisperEmptyTranscription = "whisper_empty_transcription" // VAD 过严 / 静音音频
+	ErrorKindTranslateQuotaExceeded   = "translate_quota_exceeded"
+	ErrorKindConfigInvalid            = "config_invalid"
+
+	// neutral —— 不计入 attempt（worker 自身原因导致放弃任务）
+	ErrorKindWorkerCapacity = "worker_capacity" // worker 自报"我现在不该接这条任务"
+	ErrorKindWorkerShutdown = "worker_shutdown" // 优雅关闭 / 用户暂停
+)
+
+// ErrorKindClass 把 ErrorKind 字符串映射到三档分类（retriable / permanent / neutral）。
+// service 层的 WorkerFail 按返回值决定如何更新 attempt / status / next_retry_at。
+type ErrorKindClass int
+
+const (
+	ErrorKindClassRetriable ErrorKindClass = iota
+	ErrorKindClassPermanent
+	ErrorKindClassNeutral
+)
+
+// ClassifyErrorKind 按枚举字符串返回分类。未知值按 Retriable 处理（保守路径）。
+func ClassifyErrorKind(k string) ErrorKindClass {
+	switch k {
+	case ErrorKindAuthInvalidToken,
+		ErrorKindAudioSource404,
+		ErrorKindFlacSHA256Mismatch,
+		ErrorKindWhisperModelMissing,
+		ErrorKindWhisperEmptyTranscription,
+		ErrorKindTranslateQuotaExceeded,
+		ErrorKindConfigInvalid:
+		return ErrorKindClassPermanent
+	case ErrorKindWorkerCapacity, ErrorKindWorkerShutdown:
+		return ErrorKindClassNeutral
+	default:
+		// 包含 "" / unknown / 已知 retriable 全部走可重试路径
+		return ErrorKindClassRetriable
+	}
+}
+
 // 系统设置 key（集中管理，避免拼写错误）
 const (
 	SettingSiteName               = "siteName"

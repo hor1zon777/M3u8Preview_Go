@@ -52,6 +52,12 @@ type SubtitleWorkerToken struct {
 	// 0 表示该维度不限（仍受 MaxConcurrency 与 cfg.GlobalMaxConcurrency 兜底）。
 	MaxAudioConcurrency    int        `gorm:"column:max_audio_concurrency;type:integer;not null;default:2" json:"maxAudioConcurrency"`
 	MaxSubtitleConcurrency int        `gorm:"column:max_subtitle_concurrency;type:integer;not null;default:1" json:"maxSubtitleConcurrency"`
+	// MaxPerWorkerAudio / MaxPerWorkerSubtitle 是 v4 加入的"每 worker"维度上限。
+	// 旧的 MaxAudioConcurrency / MaxSubtitleConcurrency 是该 token 名下所有 worker 之和；
+	// 这两个字段约束单个 worker 同时持有的任务数，避免 token 配额被一个 worker 抢占完。
+	// 0 = 不限（仅受 token 总量上限约束，向后兼容）。
+	MaxPerWorkerAudio    int        `gorm:"column:max_per_worker_audio;type:integer;not null;default:0" json:"maxPerWorkerAudio"`
+	MaxPerWorkerSubtitle int        `gorm:"column:max_per_worker_subtitle;type:integer;not null;default:0" json:"maxPerWorkerSubtitle"`
 	CreatedAt              time.Time  `gorm:"autoCreateTime" json:"createdAt"`
 	LastUsedAt             *time.Time `gorm:"column:last_used_at" json:"lastUsedAt,omitempty"`
 	RevokedAt              *time.Time `gorm:"column:revoked_at" json:"revokedAt,omitempty"`

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -136,11 +137,13 @@ func (s *SubtitleService) RegisterWorker(tokenID string, req dto.WorkerRegisterR
 	}
 
 	log.Printf("[subtitle/worker] registered worker=%s name=%q gpu=%q caps=%v", req.WorkerID, req.Name, req.GPU, caps)
+	cur := s.snap()
 	return &dto.WorkerRegisterResponse{
 		WorkerID:             req.WorkerID,
 		ServerTime:           now.UnixMilli(),
-		WorkerStaleThreshold: int64(s.snap().WorkerStaleThreshold.Seconds()),
+		WorkerStaleThreshold: int64(cur.WorkerStaleThreshold.Seconds()),
 		AcceptedCapabilities: caps,
+		MaxConcurrentTasks:   cur.MaxConcurrentTasksHint,
 	}, nil
 }
 
@@ -200,25 +203,58 @@ func hasCapability(caps []string, target string) bool {
 
 // ClaimNextJob 按 worker 自报的 capability 派发任务。
 //
-// v2 双 worker 协作流程：
-//
-//   - 派活优先级：subtitle 任务（GPU 资源稀缺，先满负荷）> audio 任务（带宽充足，机 A 可并发）
-//   - audio_extract worker：从 status=PENDING / stage=queued 中抢占；
-//     抢到后切到 status=RUNNING / stage=downloading，DTO 返回 m3u8Url + Headers
-//   - asr_subtitle worker：从 status=RUNNING / stage=audio_uploaded 中抢占（按 audio_uploaded_at 升序）；
-//     抢到后切到 stage=asr，DTO 返回 audioArtifactUrl + 校验信息
-//
-// 限流：见 checkClaimCapacity。
-//
-// 没有任务时返回 (nil, nil)，handler 据此回 204 No Content。
-//
-// SQLite 没有 SELECT FOR UPDATE，靠 CAS UPDATE 保证：
-//  1. 找最早的候选（FIFO）
-//  2. UPDATE WHERE id=? AND status=? AND stage=?（带状态条件）
-//  3. RowsAffected == 1 = 抢到；== 0 = 同时被别人抢了，重试
-//
-// 重试 3 次仍失败说明高竞争，返回 nil（worker 下次轮询再试）。
+// v4 long-poll：调用方可通过 ClaimNextJobLongPoll 包装让此方法在没活时
+// hold 一段时间（hold 期内若有 EnsureJob/audio_ready/retriable fail 推进任务，
+// notifyClaimWaiters 会唤醒 hold 立即重试 claim）。
 func (s *SubtitleService) ClaimNextJob(workerID string) (*dto.WorkerClaimedJob, error) {
+	return s.claimNextJobOnce(workerID)
+}
+
+// ClaimNextJobLongPoll 是 v4 加的 long-poll 入口：
+//   - 立即跑一次 claim；命中直接返回
+//   - 没命中且 wait > 0 时 hold 至 min(wait, ClaimLongPollMaxSec)
+//     期间被 notifyClaimWaiters 唤醒就重新 claim（最多再重试 1 次，避免无限循环）
+//   - hold 超时返回 (nil, nil)，handler 据此 204
+//
+// 注：参数 wait 为 0 时退回到传统短轮询行为；< 0 视为 0。
+// 服务端 ClaimLongPollMaxSec=0 时强制走短轮询，便于运维快速降级。
+func (s *SubtitleService) ClaimNextJobLongPoll(workerID string, wait time.Duration) (*dto.WorkerClaimedJob, error) {
+	job, err := s.claimNextJobOnce(workerID)
+	if err != nil || job != nil {
+		return job, err
+	}
+
+	cur := s.snap()
+	maxWait := time.Duration(cur.ClaimLongPollMaxSec) * time.Second
+	if maxWait <= 0 || wait <= 0 {
+		return nil, nil
+	}
+	if wait > maxWait {
+		wait = maxWait
+	}
+
+	// 注册一个 waiter，等被唤醒后重试一次
+	w := s.registerClaimWaiter()
+	defer s.unregisterClaimWaiter(w)
+
+	// 顺手在等待期间也跑一次 stale recovery（廉价 SQL，不阻塞）。
+	// 这样如果 worker 崩溃后立刻有新 worker 来 long-poll，stale 任务能被
+	// "在 hold 入口"立即扫到，无需等 30s ticker。
+	go s.recoverStaleJobsOnce()
+
+	select {
+	case <-w:
+		// 收到唤醒：再 claim 一次
+		return s.claimNextJobOnce(workerID)
+	case <-time.After(wait):
+		return nil, nil
+	case <-s.ctx.Done():
+		return nil, nil
+	}
+}
+
+// claimNextJobOnce 是 v3 ClaimNextJob 的实现主体（无 long-poll）。
+func (s *SubtitleService) claimNextJobOnce(workerID string) (*dto.WorkerClaimedJob, error) {
 	if workerID == "" {
 		return nil, fmt.Errorf("workerId required")
 	}
@@ -244,7 +280,7 @@ func (s *SubtitleService) ClaimNextJob(workerID string) (*dto.WorkerClaimedJob, 
 		return nil, nil
 	}
 
-	// 2) 限流前置校验（全局 + token 分维度）
+	// 2) 限流前置校验（全局 + token + 单 worker 三维度）
 	allowAudio, allowSubtitle := s.checkClaimCapacity(workerID, canAudio, canSubtitle)
 	if !allowAudio && !allowSubtitle {
 		return nil, nil
@@ -272,14 +308,142 @@ func (s *SubtitleService) ClaimNextJob(workerID string) (*dto.WorkerClaimedJob, 
 	return nil, nil
 }
 
+// registerClaimWaiter 注册一个唤醒通道，long-poll claim hold 期间用。
+// 返回的 chan 由 notifyClaimWaiters() 发送 struct{}{} 唤醒。
+func (s *SubtitleService) registerClaimWaiter() chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.claimWaiterMu.Lock()
+	s.claimWaiters = append(s.claimWaiters, ch)
+	s.claimWaiterMu.Unlock()
+	return ch
+}
+
+// unregisterClaimWaiter 从 waiter 列表移除一个通道（hold 退出时调用）。
+// 即使该 chan 已被唤醒过也安全（slice 元素移除是幂等的）。
+func (s *SubtitleService) unregisterClaimWaiter(ch chan struct{}) {
+	s.claimWaiterMu.Lock()
+	defer s.claimWaiterMu.Unlock()
+	out := s.claimWaiters[:0]
+	for _, w := range s.claimWaiters {
+		if w != ch {
+			out = append(out, w)
+		}
+	}
+	s.claimWaiters = out
+}
+
+// notifyClaimWaiters 唤醒**所有**等待中的 claim long-poll。
+//
+// 设计取舍：唤醒所有而不是一个，因为：
+//  1. waiter 之间有 capability 差异，单个唤醒可能选到不能 claim 此任务的 worker，
+//     该 worker 跑一圈 claim 后还是 nil，反而浪费一次 hold 配额
+//  2. 多 waiter 同时去抢时，CAS UPDATE WHERE status=? 会保证只有一个成功，其它
+//     落空再继续 hold，竞争开销远低于"任务卡在那里没人来 claim"
+//
+// 非阻塞：select default 跳过已满或已退出的 chan。
+func (s *SubtitleService) notifyClaimWaiters() {
+	s.claimWaiterMu.Lock()
+	waiters := append([]chan struct{}(nil), s.claimWaiters...)
+	s.claimWaiterMu.Unlock()
+	for _, w := range waiters {
+		select {
+		case w <- struct{}{}:
+		default:
+			// 已经有信号 / waiter 已退出：跳过
+		}
+	}
+}
+
+// WorkerDeregister 让 worker 优雅关闭时主动声明下线，立即把它持有的 RUNNING 任务
+// 按 ErrorKindWorkerShutdown 走 neutral 路径回滚（attempt 不增），让 stale recovery
+// 不必等到 60s timeout 才放出去。
+//
+// 行为：
+//  1. 找到所有 claimed_by=workerID 或 audio_worker_id=workerID（FLAC owner 单独算）
+//     的 RUNNING 任务
+//  2. claimed_by 路径走 WorkerFailWithKind(... ErrorKindWorkerShutdown)
+//  3. audio_worker_id 路径（subtitle worker 已经接走的 FLAC 仍属本 audio worker 持有）：
+//     调 WorkerAudioLost 让任务回 queued + 通知 audio_owner 删本地 FLAC（broker EnqueueFetch
+//     cleanup 由 stale recovery 侧统一处理；这里仅 DB 复位）
+//  4. 标记 worker.last_seen_at=0 让 admin 一眼看出"已主动下线"
+//
+// 返回受影响的任务数（claimed + audio_owner）。错误仅在 DB 查询失败时返回，
+// 单个任务的回滚失败仅记录日志、不阻塞下线流程。
+func (s *SubtitleService) WorkerDeregister(workerID string) (int, error) {
+	if workerID == "" {
+		return 0, fmt.Errorf("workerId required")
+	}
+	rolled := 0
+
+	// 1) claimed_by 名下的 RUNNING 任务（含 audio downloading/extracting/encoding 与
+	//    subtitle asr/translate/writing 两侧）
+	var claimed []model.SubtitleJob
+	if err := s.db.Where("claimed_by = ? AND status = ?", workerID, model.SubtitleStatusRunning).
+		Find(&claimed).Error; err != nil {
+		return 0, fmt.Errorf("load claimed jobs: %w", err)
+	}
+	for _, j := range claimed {
+		if err := s.WorkerFailWithKind(j.ID, workerID,
+			"worker graceful shutdown",
+			model.ErrorKindWorkerShutdown); err != nil {
+			log.Printf("[subtitle/worker] deregister rollback claimed job=%s failed: %v", j.ID, err)
+			continue
+		}
+		rolled++
+	}
+
+	// 2) audio_worker_id == workerID 但 claimed_by != workerID 的任务（subtitle worker
+	//    已经接走，但 FLAC 仍在本机）：调 audio-lost 让任务回 queued + 清音频元数据。
+	var ownerOnly []model.SubtitleJob
+	if err := s.db.Where("audio_worker_id = ? AND status = ? AND (claimed_by IS NULL OR claimed_by = '' OR claimed_by != ?)",
+		workerID, model.SubtitleStatusRunning, workerID).
+		Find(&ownerOnly).Error; err != nil {
+		log.Printf("[subtitle/worker] deregister load owner-only jobs failed: %v", err)
+	} else {
+		for _, j := range ownerOnly {
+			if !isAudioLostStageAllowed(j.Stage) {
+				continue
+			}
+			if err := s.WorkerAudioLost(j.ID, workerID, "worker graceful shutdown"); err != nil {
+				log.Printf("[subtitle/worker] deregister audio-lost job=%s failed: %v", j.ID, err)
+				continue
+			}
+			rolled++
+		}
+	}
+
+	// 3) 标记 worker 的 last_seen_at 为很久以前，让 admin 立刻看到 offline
+	//    （仍保留行，便于查询历史；下次 register 时 upsert 覆盖）
+	zeroTime := time.Unix(0, 0)
+	_ = s.db.Model(&model.SubtitleWorker{}).Where("id = ?", workerID).Updates(map[string]any{
+		"current_job_id": "",
+		"last_seen_at":   zeroTime,
+	}).Error
+
+	// 唤醒等待的 claim long-poll，让其它 worker 立即抢到回滚的任务
+	if rolled > 0 {
+		s.notifyClaimWaiters()
+	}
+	log.Printf("[subtitle/worker] deregister worker=%s rolled=%d", workerID, rolled)
+	return rolled, nil
+}
+
 // tryClaimAudioJob 抢占一条 status=PENDING / stage=queued 的任务。
 // 切换到 status=RUNNING / stage=downloading 并写 audio_worker_id。
+//
+// v4 调度：
+//   - WHERE next_retry_at IS NULL OR next_retry_at <= now()：跳过冷却中的任务
+//   - ORDER BY priority DESC, attempt ASC, created_at ASC：高优先 + 重试少 + 先进先出
+//
+// 注：sort 复合键中加入 attempt ASC 是为了让"还没重试过的任务优先派发"，
+// 减少同一条任务被同一 worker 反复抢到再失败的概率。
 func (s *SubtitleService) tryClaimAudioJob(workerID string) (*model.SubtitleJob, error) {
 	now := time.Now()
 	for attempt := 0; attempt < 3; attempt++ {
 		var job model.SubtitleJob
-		err := s.db.Where("status = ? AND stage = ?", model.SubtitleStatusPending, model.SubtitleStageQueued).
-			Order("created_at ASC").
+		err := s.db.Where("status = ? AND stage = ? AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+			model.SubtitleStatusPending, model.SubtitleStageQueued, now).
+			Order("priority DESC, attempt ASC, created_at ASC").
 			Take(&job).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -320,7 +484,8 @@ func (s *SubtitleService) tryClaimAudioJob(workerID string) (*model.SubtitleJob,
 			"last_seen_at":   now,
 		}).Error
 
-		log.Printf("[subtitle/worker] audio claimed job=%s media=%s by worker=%s", job.ID, job.MediaID, workerID)
+		log.Printf("[subtitle/worker] audio claimed job=%s media=%s by worker=%s attempt=%d/%d",
+			job.ID, job.MediaID, workerID, job.Attempt, job.MaxAttempts)
 		return &job, nil
 	}
 	return nil, nil
@@ -328,12 +493,17 @@ func (s *SubtitleService) tryClaimAudioJob(workerID string) (*model.SubtitleJob,
 
 // tryClaimSubtitleJob 抢占一条 status=RUNNING / stage=audio_uploaded 的任务。
 // 切换到 stage=asr 并写 subtitle_worker_id。
+//
+// v4 调度：与 tryClaimAudioJob 同款 priority/attempt 排序；
+// 但 stage=audio_uploaded 任务通常没经过 retry 退避（它来自 audio_ready 而非 fail），
+// next_retry_at 多数为空，过滤逻辑实际意义不大但保持一致以便统一调度语义。
 func (s *SubtitleService) tryClaimSubtitleJob(workerID string) (*model.SubtitleJob, error) {
 	now := time.Now()
 	for attempt := 0; attempt < 3; attempt++ {
 		var job model.SubtitleJob
-		err := s.db.Where("status = ? AND stage = ?", model.SubtitleStatusRunning, model.SubtitleStageAudioUploaded).
-			Order("audio_uploaded_at ASC").
+		err := s.db.Where("status = ? AND stage = ? AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+			model.SubtitleStatusRunning, model.SubtitleStageAudioUploaded, now).
+			Order("priority DESC, attempt ASC, audio_uploaded_at ASC").
 			Take(&job).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -369,7 +539,8 @@ func (s *SubtitleService) tryClaimSubtitleJob(workerID string) (*model.SubtitleJ
 			"last_seen_at":   now,
 		}).Error
 
-		log.Printf("[subtitle/worker] subtitle claimed job=%s media=%s by worker=%s", job.ID, job.MediaID, workerID)
+		log.Printf("[subtitle/worker] subtitle claimed job=%s media=%s by worker=%s attempt=%d/%d",
+			job.ID, job.MediaID, workerID, job.Attempt, job.MaxAttempts)
 		return &job, nil
 	}
 	return nil, nil
@@ -391,11 +562,13 @@ func (s *SubtitleService) toClaimedJobDTO(job *model.SubtitleJob) (*dto.WorkerCl
 	}
 
 	out := &dto.WorkerClaimedJob{
-		JobID:      job.ID,
-		MediaID:    job.MediaID,
-		MediaTitle: media.Title,
-		SourceLang: job.SourceLang,
-		TargetLang: job.TargetLang,
+		JobID:       job.ID,
+		MediaID:     job.MediaID,
+		MediaTitle:  media.Title,
+		SourceLang:  job.SourceLang,
+		TargetLang:  job.TargetLang,
+		Attempt:     job.Attempt,
+		MaxAttempts: job.MaxAttempts,
 	}
 
 	switch {
@@ -531,6 +704,40 @@ func (s *SubtitleService) checkClaimCapacity(workerID string, canAudio, canSubti
 			Count(&subRunning).Error; err != nil {
 			log.Printf("[subtitle/worker] count token subtitle running failed: %v", err)
 		} else if subRunning >= int64(tok.MaxSubtitleConcurrency) {
+			allowSubtitle = false
+		}
+	}
+
+	// === v4 单 worker 维度上限：避免 token 配额被一个 worker 抢占 ===
+	if allowAudio && tok.MaxPerWorkerAudio > 0 {
+		audioStages := []string{
+			model.SubtitleStageDownloading,
+			model.SubtitleStageExtracting,
+			model.SubtitleStageEncodingIntermediate,
+		}
+		var perWorkerAudio int64
+		if err := s.db.Model(&model.SubtitleJob{}).
+			Where("status = ? AND stage IN ? AND audio_worker_id = ?",
+				model.SubtitleStatusRunning, audioStages, workerID).
+			Count(&perWorkerAudio).Error; err != nil {
+			log.Printf("[subtitle/worker] count per-worker audio running failed: %v", err)
+		} else if perWorkerAudio >= int64(tok.MaxPerWorkerAudio) {
+			allowAudio = false
+		}
+	}
+	if allowSubtitle && tok.MaxPerWorkerSubtitle > 0 {
+		subStages := []string{
+			model.SubtitleStageASR,
+			model.SubtitleStageTranslate,
+			model.SubtitleStageWriting,
+		}
+		var perWorkerSub int64
+		if err := s.db.Model(&model.SubtitleJob{}).
+			Where("status = ? AND stage IN ? AND subtitle_worker_id = ?",
+				model.SubtitleStatusRunning, subStages, workerID).
+			Count(&perWorkerSub).Error; err != nil {
+			log.Printf("[subtitle/worker] count per-worker subtitle running failed: %v", err)
+		} else if perWorkerSub >= int64(tok.MaxPerWorkerSubtitle) {
 			allowSubtitle = false
 		}
 	}
@@ -680,6 +887,9 @@ func (s *SubtitleService) WorkerAudioReady(jobID string, meta dto.WorkerAudioRea
 		"last_seen_at":   now,
 	}).Error
 
+	// 唤醒等待中的 subtitle worker long-poll claim：FLAC 已就绪可以接活
+	s.notifyClaimWaiters()
+
 	log.Printf("[subtitle/worker] audio-ready job=%s media=%s owner=%s size=%d sha=%s dur=%dms format=%s",
 		jobID, job.MediaID, meta.WorkerID, meta.Size, expectedSHA[:min(8, len(expectedSHA))], meta.DurationMs, meta.Format)
 	return nil
@@ -780,6 +990,9 @@ func (s *SubtitleService) WorkerAudioLost(jobID, workerID, errMsg string) error 
 		"current_job_id": "",
 		"last_seen_at":   now,
 	}).Error
+
+	// 任务回 queued，唤醒等待中的 audio worker long-poll claim
+	s.notifyClaimWaiters()
 
 	log.Printf("[subtitle/worker] audio-lost: job=%s media=%s owner=%s prev_stage=%s err=%q -> rolled back to queued",
 		jobID, job.MediaID, workerID, job.Stage, msg)
@@ -1024,19 +1237,37 @@ func (s *SubtitleService) WorkerComplete(jobID string, meta dto.WorkerCompleteMe
 
 // WorkerFail worker 上报失败。
 //
-// v2 双 worker 协作下，根据当前 stage 决定回滚目标：
-//   - audio 阶段失败（downloading / extracting / encoding_intermediate）→ 回 PENDING/queued，
-//     audio_worker_id 清空，让其它 audio worker 重试
-//   - subtitle 阶段失败（asr / translate / writing）：
-//     · 中转 FLAC 还在 → 回 stage=audio_uploaded，subtitle_worker_id 清空，让其它 subtitle worker 重试
-//     · 中转 FLAC 已被 GC 或丢失 → 回 PENDING/queued，audio/subtitle worker_id 都清空 + 清 audio_artifact_*
-//   - 其它（兼容旧 worker 上报 stage=extracting 但走的是单机一条龙）→ 直接 FAILED
+// v4 行为（按 errorKind 分流）：
 //
-// claimed_by 在所有分支都清空，让 worker 不再尝试更新该任务（防止 stale worker 再写心跳）。
+//  1. permanent kind（model.ErrorKindClassPermanent）：直接 status=FAILED，stage 保留，
+//     不再放回队列。如 audio_source_404 / flac_sha256_mismatch / whisper_model_missing。
 //
-// 旧字段：MaxConcurrency / failed_jobs 统计仅在终态 FAILED 时增加；中间态回滚不计入失败统计，
-// 避免一个 audio worker 网络抖动几次就把 FailedJobs 刷得很难看。
+//  2. neutral kind（model.ErrorKindClassNeutral）：worker 自身原因放弃任务（worker_capacity /
+//     worker_shutdown）。回滚到对应阶段，attempt **不**增加，next_retry_at **不**写。
+//     避免一个 worker 自己抖动把任务的"重试预算"用光。
+//
+//  3. retriable kind（model.ErrorKindClassRetriable，含未知 kind 兜底）：
+//     - attempt += 1
+//     - attempt >= max_attempts → 强制 FAILED（终态）
+//     - 否则按 retryBackoffSec[attempt-1] 写 next_retry_at，按 stage 回滚
+//     - retry 任务 priority -= 1（让位给新任务防饿死，但服务端老化机制会慢慢补回来）
+//
+// 回滚阶段（v3 行为兼容）：
+//   - audio 阶段失败 → status=PENDING / stage=queued, audio_worker_id 清空
+//   - subtitle 阶段失败：
+//       · audio_worker_id 仍在 → stage=audio_uploaded（FLAC 仍在 audio worker 本地）
+//       · audio_worker_id 已丢 → status=PENDING / stage=queued + 清 audio_artifact_*
+//   - 未知 stage 兜底 → 直接 FAILED
+//
+// claimed_by 在所有分支都清空，避免 stale worker 再写心跳；ownership 校验仍走
+// `claimed_by == workerID`。
 func (s *SubtitleService) WorkerFail(jobID, workerID, errMsg string) error {
+	return s.WorkerFailWithKind(jobID, workerID, errMsg, "")
+}
+
+// WorkerFailWithKind 是 WorkerFail 的扩展版本，由 handler 在解析 dto.WorkerFailRequest
+// 时注入 errorKind 参数。WorkerFail 是向后兼容包装。
+func (s *SubtitleService) WorkerFailWithKind(jobID, workerID, errMsg, errorKind string) error {
 	var job model.SubtitleJob
 	if err := s.db.Where("id = ? AND claimed_by = ?", jobID, workerID).Take(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1047,56 +1278,67 @@ func (s *SubtitleService) WorkerFail(jobID, workerID, errMsg string) error {
 
 	now := time.Now()
 	msg := truncateString(errMsg, 1000)
+	cur := s.snap()
+
+	class := model.ClassifyErrorKind(errorKind)
+
 	updates := map[string]any{
 		"error_msg":         msg,
+		"last_error_kind":   errorKind,
 		"claimed_by":        "",
 		"last_heartbeat_at": &now,
 	}
-	terminal := false // 是否进入终态（影响 worker.failed_jobs 统计与 finished_at）
+
+	terminal := false   // 是否进入终态（影响 worker.failed_jobs 与 finished_at）
 	rollbackKind := "unknown"
 
-	switch {
-	case model.SubtitleAudioStages[job.Stage]:
-		// audio 阶段失败 → 回 queued，audio_worker_id 清空
-		updates["status"] = model.SubtitleStatusPending
-		updates["stage"] = model.SubtitleStageQueued
-		updates["progress"] = 0
-		updates["audio_worker_id"] = ""
-		rollbackKind = "audio_to_queued"
-
-	case model.SubtitleSubtitleStages[job.Stage]:
-		// subtitle 阶段失败：v3 看 audio_worker_id 是否还存在（FLAC 仍在 audio worker 本地）
-		ownerStillKnown := job.AudioWorkerID != ""
-		if ownerStillKnown {
-			// owner 仍在记录里 → 回到 audio_uploaded 等下一个 subtitle worker
-			updates["stage"] = model.SubtitleStageAudioUploaded
-			updates["progress"] = 35
-			updates["subtitle_worker_id"] = ""
-			rollbackKind = "subtitle_to_audio_uploaded"
-		} else {
-			// 没 owner 了 → 整条任务回 queued 重头来
-			updates["status"] = model.SubtitleStatusPending
-			updates["stage"] = model.SubtitleStageQueued
-			updates["progress"] = 0
-			updates["audio_worker_id"] = ""
-			updates["subtitle_worker_id"] = ""
-			updates["audio_artifact_path"] = ""
-			updates["audio_artifact_size"] = 0
-			updates["audio_artifact_sha256"] = ""
-			updates["audio_artifact_format"] = ""
-			updates["audio_artifact_duration_ms"] = 0
-			updates["audio_uploaded_at"] = nil
-			rollbackKind = "subtitle_to_queued_no_owner"
+	// === 终态分支：permanent 或 attempt 触顶 ===
+	maxAttempts := job.MaxAttempts
+	if maxAttempts <= 0 {
+		// 老任务（迁移前未填）：按 cfg 默认兜底
+		maxAttempts = cur.DefaultMaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 3
 		}
+	}
+	willExceedAttempts := class == model.ErrorKindClassRetriable && job.Attempt+1 >= maxAttempts
 
-	default:
-		// 未知 stage（兼容旧 worker 上报 extracting / writing 等老语义但中途没经过 audio 拆分）
-		// → 直接 FAILED
+	switch {
+	case class == model.ErrorKindClassPermanent:
+		// 永久错误：直接 FAILED，stage 保留供排查
 		updates["status"] = model.SubtitleStatusFailed
-		updates["stage"] = job.Stage // 保留失败时的 stage，方便排查
 		updates["finished_at"] = &now
 		terminal = true
-		rollbackKind = "terminal_failed"
+		rollbackKind = "permanent_failed"
+		// permanent 也算用了一次 attempt（透明展示给 UI）
+		updates["attempt"] = job.Attempt + 1
+
+	case willExceedAttempts:
+		// 已经是最后一次重试又失败 → 终态
+		updates["status"] = model.SubtitleStatusFailed
+		updates["finished_at"] = &now
+		updates["attempt"] = job.Attempt + 1
+		terminal = true
+		rollbackKind = "max_attempts_exhausted"
+
+	case class == model.ErrorKindClassNeutral:
+		// 中性：仅按 stage 回滚，不动 attempt / next_retry_at
+		applyStageRollback(&job, updates, &rollbackKind, "neutral_")
+
+	case class == model.ErrorKindClassRetriable:
+		// 可重试：attempt++、写 next_retry_at、按 stage 回滚
+		newAttempt := job.Attempt + 1
+		updates["attempt"] = newAttempt
+		backoff := backoffFor(newAttempt, cur.RetryBackoffSec)
+		nextAt := now.Add(jitterDuration(backoff, 0.2))
+		updates["next_retry_at"] = &nextAt
+		// 重试任务略降优先级，让位给新任务（老化 ticker 会慢慢补回来防饿死）
+		newPriority := job.Priority - 1
+		if newPriority < -10 {
+			newPriority = -10
+		}
+		updates["priority"] = newPriority
+		applyStageRollback(&job, updates, &rollbackKind, "retriable_")
 	}
 
 	if err := s.db.Model(&model.SubtitleJob{}).Where("id = ?", jobID).Updates(updates).Error; err != nil {
@@ -1112,26 +1354,140 @@ func (s *SubtitleService) WorkerFail(jobID, workerID, errMsg string) error {
 	}
 	_ = s.db.Model(&model.SubtitleWorker{}).Where("id = ?", workerID).Updates(workerUpdates).Error
 
-	log.Printf("[subtitle/worker] fail job=%s media=%s worker=%s stage=%s rollback=%s: %s",
-		jobID, job.MediaID, workerID, job.Stage, rollbackKind, msg)
+	// retriable 重试入队后唤醒一个等待中的 long-poll claim（提速派发）
+	if !terminal {
+		s.notifyClaimWaiters()
+	}
+
+	log.Printf("[subtitle/worker] fail job=%s media=%s worker=%s stage=%s kind=%s rollback=%s attempt=%d/%d: %s",
+		jobID, job.MediaID, workerID, job.Stage, errorKind, rollbackKind,
+		attemptForLog(updates, job.Attempt), maxAttempts, msg)
 	return nil
+}
+
+// attemptForLog 取 updates["attempt"]（int），缺省时退到 job 当前 attempt。
+// neutral 路径不写 updates["attempt"]，日志里直接打 job.Attempt（未变）即可。
+func attemptForLog(updates map[string]any, fallback int) int {
+	if v, ok := updates["attempt"]; ok {
+		if n, ok := v.(int); ok {
+			return n
+		}
+	}
+	return fallback
+}
+
+// applyStageRollback 把按 stage 回滚的字段写到 updates。
+// retriable / neutral 共用此逻辑；区别仅在 attempt / next_retry_at（由调用方控制）。
+//
+// rollbackKind 由调用方注入前缀（"neutral_" / "retriable_"），便于日志区分来源。
+func applyStageRollback(job *model.SubtitleJob, updates map[string]any, rollbackKind *string, prefix string) {
+	switch {
+	case model.SubtitleAudioStages[job.Stage]:
+		// audio 阶段失败 → 回 queued，audio_worker_id 清空
+		updates["status"] = model.SubtitleStatusPending
+		updates["stage"] = model.SubtitleStageQueued
+		updates["progress"] = 0
+		updates["audio_worker_id"] = ""
+		*rollbackKind = prefix + "audio_to_queued"
+
+	case model.SubtitleSubtitleStages[job.Stage]:
+		// subtitle 阶段失败：v3 看 audio_worker_id 是否还存在（FLAC 仍在 audio worker 本地）
+		ownerStillKnown := job.AudioWorkerID != ""
+		if ownerStillKnown {
+			updates["stage"] = model.SubtitleStageAudioUploaded
+			updates["progress"] = 35
+			updates["subtitle_worker_id"] = ""
+			*rollbackKind = prefix + "subtitle_to_audio_uploaded"
+		} else {
+			// 没 owner 了 → 整条任务回 queued 重头来
+			updates["status"] = model.SubtitleStatusPending
+			updates["stage"] = model.SubtitleStageQueued
+			updates["progress"] = 0
+			updates["audio_worker_id"] = ""
+			updates["subtitle_worker_id"] = ""
+			updates["audio_artifact_path"] = ""
+			updates["audio_artifact_size"] = 0
+			updates["audio_artifact_sha256"] = ""
+			updates["audio_artifact_format"] = ""
+			updates["audio_artifact_duration_ms"] = 0
+			updates["audio_uploaded_at"] = nil
+			*rollbackKind = prefix + "subtitle_to_queued_no_owner"
+		}
+
+	default:
+		// 未知 stage（旧 worker / 边界） → 直接 FAILED
+		now := time.Now()
+		updates["status"] = model.SubtitleStatusFailed
+		updates["stage"] = job.Stage
+		updates["finished_at"] = &now
+		*rollbackKind = prefix + "terminal_failed"
+	}
+}
+
+// backoffFor 按 attempt（1-based）从配置数组里取退避秒数；越界用最后一个值。
+// 配置为空时按 [30, 120, 600] 兜底。
+func backoffFor(attempt int, table []int) time.Duration {
+	if len(table) == 0 {
+		table = []int{30, 120, 600}
+	}
+	idx := attempt - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(table) {
+		idx = len(table) - 1
+	}
+	return time.Duration(table[idx]) * time.Second
+}
+
+// jitterDuration 在 [base * (1 - pct), base * (1 + pct)] 范围内返回随机时长。
+// 用 crypto/rand 避免数学随机的种子可预测性（虽然这里只用作避雷，但 rand 全局污染更麻烦）。
+func jitterDuration(base time.Duration, pct float64) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if pct <= 0 {
+		return base
+	}
+	span := big.NewInt(int64(float64(base) * pct * 2))
+	if span.Sign() <= 0 {
+		return base
+	}
+	n, err := rand.Int(rand.Reader, span)
+	if err != nil {
+		// 极端情况（rand 失败）退化为无 jitter
+		return base
+	}
+	delta := time.Duration(n.Int64()) - time.Duration(float64(base)*pct)
+	out := base + delta
+	if out < 0 {
+		return base
+	}
+	return out
 }
 
 // === Stale 任务回收 ===
 
 // runStaleRecoveryLoop 周期回收僵尸任务。Start() 启动调用。
 //
-// v3 broker 模式：服务端不再有中转池文件，无需周期 GC。仅做 stale recovery：
-//   - 每 60s 跑一次 recoverStaleJobsOnce
+// v4：tick 周期来自 cfg.StaleRecoveryInterval（默认 30s，向 v3 60s 缩短）。
+// 每次 ClaimNextJobLongPoll 入口也会 piggyback 一次 stale 扫描，让 worker 上线时
+// 立刻看到回收的任务。
 //
 // 不会丢已完成的工作：worker 即使在写 VTT 前一刻崩溃，也会在重新跑时从头开始
 // （单 ASR 任务幂等，多次跑结果相同）。
 func (s *SubtitleService) runStaleRecoveryLoop() {
-	staleTicker := time.NewTicker(60 * time.Second)
+	cur := s.snap()
+	interval := cur.StaleRecoveryInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	staleTicker := time.NewTicker(interval)
 	defer staleTicker.Stop()
 
-	// 启动时立刻跑一次（处理上次崩溃残留）
+	// 启动时立刻跑一次（处理上次崩溃残留）+ 老化提优先级
 	s.recoverStaleJobsOnce()
+	s.agePendingPriority()
 
 	for {
 		select {
@@ -1141,7 +1497,28 @@ func (s *SubtitleService) runStaleRecoveryLoop() {
 			return
 		case <-staleTicker.C:
 			s.recoverStaleJobsOnce()
+			s.agePendingPriority()
 		}
+	}
+}
+
+// agePendingPriority 老化机制：把 created_at 超过 10min 仍 PENDING/queued 的任务
+// priority += 1（封顶 +5），避免 retriable 失败任务因 priority -= 1 长期落底导致
+// 饥饿。新任务（priority=0）和重试任务（priority=-1）刚入队时排序无差，老化后才
+// 慢慢拉开。
+//
+// 单条 SQL UPDATE 完成，10min 内重复跑也只会把 priority 抬到 max。
+func (s *SubtitleService) agePendingPriority() {
+	cutoff := time.Now().Add(-10 * time.Minute)
+	res := s.db.Model(&model.SubtitleJob{}).
+		Where("status = ? AND stage = ? AND priority < ? AND created_at < ?",
+			model.SubtitleStatusPending, model.SubtitleStageQueued, 5, cutoff).
+		Update("priority", gorm.Expr("priority + 1"))
+	if res.Error != nil {
+		log.Printf("[subtitle/worker] age priority failed: %v", res.Error)
+	} else if res.RowsAffected > 0 {
+		log.Printf("[subtitle/worker] aged %d pending jobs (+1 priority)", res.RowsAffected)
+		s.notifyClaimWaiters()
 	}
 }
 
@@ -1164,8 +1541,12 @@ func (s *SubtitleService) recoverStaleJobsOnce() {
 	cur := s.snap()
 	staleThreshold := cur.WorkerStaleThreshold
 	hbCutoff := time.Now().Add(-staleThreshold)
-	// audio_uploaded 单独长 TTL：24h 内没 subtitle worker 接 → 重置
-	auCutoff := time.Now().Add(-24 * time.Hour)
+	// audio_uploaded 单独 TTL：v3 是硬编码 24h；v4 改成可配置（默认 1h）。
+	auTTL := cur.AudioUploadedTTL
+	if auTTL <= 0 {
+		auTTL = time.Hour
+	}
+	auCutoff := time.Now().Add(-auTTL)
 
 	totalReset := 0
 
@@ -1305,6 +1686,8 @@ func (s *SubtitleService) recoverStaleJobsOnce() {
 
 	if totalReset > 0 {
 		log.Printf("[subtitle/worker] stale recovery total reset=%d (threshold=%s)", totalReset, staleThreshold)
+		// 任务回到可派发状态，唤醒等待中的 claim long-poll
+		s.notifyClaimWaiters()
 	}
 }
 
@@ -1478,6 +1861,8 @@ func (s *SubtitleService) ListWorkerTokens() ([]dto.SubtitleWorkerTokenItem, err
 			MaxConcurrency:         t.MaxConcurrency,
 			MaxAudioConcurrency:    t.MaxAudioConcurrency,
 			MaxSubtitleConcurrency: t.MaxSubtitleConcurrency,
+			MaxPerWorkerAudio:      t.MaxPerWorkerAudio,
+			MaxPerWorkerSubtitle:   t.MaxPerWorkerSubtitle,
 			CurrentRunning:         runMap[t.ID],
 			CurrentAudioRunning:    audioMap[t.ID],
 			CurrentSubtitleRunning: subMap[t.ID],
@@ -1507,7 +1892,8 @@ func (s *SubtitleService) ListWorkerTokens() ([]dto.SubtitleWorkerTokenItem, err
 //   - maxConcurrency 控制该 token 名下 worker 集合并发上限；0 / 负数会被强制为 1
 //   - maxAudioConcurrency / maxSubtitleConcurrency 是 v2 分能力维度上限；
 //     0 = 走默认（audio=2 / subtitle=1），其它正值原样使用，超过 64 截断
-func (s *SubtitleService) CreateWorkerToken(name string, maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency int) (string, *dto.SubtitleWorkerTokenItem, error) {
+//   - maxPerWorkerAudio / maxPerWorkerSubtitle 是 v4 单 worker 维度上限；0 = 不限。
+func (s *SubtitleService) CreateWorkerToken(name string, maxConcurrency, maxAudioConcurrency, maxSubtitleConcurrency, maxPerWorkerAudio, maxPerWorkerSubtitle int) (string, *dto.SubtitleWorkerTokenItem, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", nil, fmt.Errorf("name required")
@@ -1530,6 +1916,18 @@ func (s *SubtitleService) CreateWorkerToken(name string, maxConcurrency, maxAudi
 	if maxSubtitleConcurrency > 64 {
 		maxSubtitleConcurrency = 64
 	}
+	if maxPerWorkerAudio < 0 {
+		maxPerWorkerAudio = 0
+	}
+	if maxPerWorkerAudio > 64 {
+		maxPerWorkerAudio = 64
+	}
+	if maxPerWorkerSubtitle < 0 {
+		maxPerWorkerSubtitle = 0
+	}
+	if maxPerWorkerSubtitle > 64 {
+		maxPerWorkerSubtitle = 64
+	}
 
 	plaintext, err := generateWorkerTokenPlaintext()
 	if err != nil {
@@ -1547,12 +1945,15 @@ func (s *SubtitleService) CreateWorkerToken(name string, maxConcurrency, maxAudi
 		MaxConcurrency:         maxConcurrency,
 		MaxAudioConcurrency:    maxAudioConcurrency,
 		MaxSubtitleConcurrency: maxSubtitleConcurrency,
+		MaxPerWorkerAudio:      maxPerWorkerAudio,
+		MaxPerWorkerSubtitle:   maxPerWorkerSubtitle,
 	}
 	if err := s.db.Create(&rec).Error; err != nil {
 		return "", nil, fmt.Errorf("create token: %w", err)
 	}
-	log.Printf("[subtitle/worker] admin created token id=%s name=%q prefix=%s max=%d audio=%d subtitle=%d",
-		rec.ID, rec.Name, rec.TokenPrefix, rec.MaxConcurrency, rec.MaxAudioConcurrency, rec.MaxSubtitleConcurrency)
+	log.Printf("[subtitle/worker] admin created token id=%s name=%q prefix=%s max=%d audio=%d subtitle=%d perW_audio=%d perW_sub=%d",
+		rec.ID, rec.Name, rec.TokenPrefix, rec.MaxConcurrency, rec.MaxAudioConcurrency, rec.MaxSubtitleConcurrency,
+		rec.MaxPerWorkerAudio, rec.MaxPerWorkerSubtitle)
 	return plaintext, &dto.SubtitleWorkerTokenItem{
 		ID:                     rec.ID,
 		Name:                   rec.Name,
@@ -1560,6 +1961,8 @@ func (s *SubtitleService) CreateWorkerToken(name string, maxConcurrency, maxAudi
 		MaxConcurrency:         rec.MaxConcurrency,
 		MaxAudioConcurrency:    rec.MaxAudioConcurrency,
 		MaxSubtitleConcurrency: rec.MaxSubtitleConcurrency,
+		MaxPerWorkerAudio:      rec.MaxPerWorkerAudio,
+		MaxPerWorkerSubtitle:   rec.MaxPerWorkerSubtitle,
 		CreatedAt:              rec.CreatedAt,
 	}, nil
 }
@@ -1594,6 +1997,16 @@ func (s *SubtitleService) UpdateWorkerToken(id string, req dto.SubtitleWorkerTok
 		updates["max_subtitle_concurrency"] = v
 		rec.MaxSubtitleConcurrency = v
 	}
+	if req.MaxPerWorkerAudio != nil {
+		v := clampIntInRange(*req.MaxPerWorkerAudio, 0, 64)
+		updates["max_per_worker_audio"] = v
+		rec.MaxPerWorkerAudio = v
+	}
+	if req.MaxPerWorkerSubtitle != nil {
+		v := clampIntInRange(*req.MaxPerWorkerSubtitle, 0, 64)
+		updates["max_per_worker_subtitle"] = v
+		rec.MaxPerWorkerSubtitle = v
+	}
 	item := dto.SubtitleWorkerTokenItem{
 		ID:                     rec.ID,
 		Name:                   rec.Name,
@@ -1601,6 +2014,8 @@ func (s *SubtitleService) UpdateWorkerToken(id string, req dto.SubtitleWorkerTok
 		MaxConcurrency:         rec.MaxConcurrency,
 		MaxAudioConcurrency:    rec.MaxAudioConcurrency,
 		MaxSubtitleConcurrency: rec.MaxSubtitleConcurrency,
+		MaxPerWorkerAudio:      rec.MaxPerWorkerAudio,
+		MaxPerWorkerSubtitle:   rec.MaxPerWorkerSubtitle,
 		CreatedAt:              rec.CreatedAt,
 		LastUsedAt:             rec.LastUsedAt,
 		RevokedAt:              rec.RevokedAt,

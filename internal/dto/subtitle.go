@@ -55,6 +55,13 @@ type SubtitleJobItem struct {
 	AudioArtifactFormat     string     `json:"audioArtifactFormat,omitempty"`
 	AudioArtifactDurationMs int64      `json:"audioArtifactDurationMs,omitempty"`
 	AudioUploadedAt         *time.Time `json:"audioUploadedAt,omitempty"`
+
+	// v4 重试调度字段（admin 列表展示）
+	Attempt       int        `json:"attempt"`
+	MaxAttempts   int        `json:"maxAttempts"`
+	LastErrorKind string     `json:"lastErrorKind,omitempty"`
+	NextRetryAt   *time.Time `json:"nextRetryAt,omitempty"`
+	Priority      int        `json:"priority"`
 }
 
 // SubtitleJobDetail 详情接口返回。等同列表项，预留扩展字段。
@@ -178,16 +185,25 @@ type WorkerRegisterRequest struct {
 //
 // AcceptedCapabilities 是服务端实际接受的能力集（默认 = 客户端提交；token 限制时会缩减）。
 // 客户端可据此在 UI 上 sanity check（例如收到的不包含自己声明的能力时给出告警）。
+//
+// MaxConcurrentTasks（v4）：服务端建议的本 worker 最大并发任务数。worker 端用作
+// 本地 inflight 限流上限。0 = 不下发，worker 退回本地 settings。
 type WorkerRegisterResponse struct {
 	WorkerID             string   `json:"workerId"`
 	ServerTime           int64    `json:"serverTime"`           // unix ms，便于 worker 校时
 	WorkerStaleThreshold int64    `json:"workerStaleThreshold"` // 服务端容忍的心跳间隔（秒），worker 应 < 此值上报心跳
 	AcceptedCapabilities []string `json:"acceptedCapabilities"`
+	MaxConcurrentTasks   int      `json:"maxConcurrentTasks,omitempty"`
 }
 
 // WorkerClaimRequest 认领任务请求。
 type WorkerClaimRequest struct {
 	WorkerID string `json:"workerId" binding:"required"`
+	// WaitSec 客户端可接受的 long-poll 最长 hold 秒数。
+	//   - 0（缺省）：保持向后兼容，立即返回（短轮询行为）
+	//   - >0：服务端 hold 最多 min(WaitSec, 60) 秒，期间任意 EnsureJob / WorkerAudioReady /
+	//     stale recovery 唤醒后立即派发；超时返回 204 让客户端重连
+	WaitSec int `json:"waitSec,omitempty"`
 }
 
 // WorkerClaimedJob 服务端原子认领后返回给 worker 的任务信息。
@@ -221,6 +237,10 @@ type WorkerClaimedJob struct {
 
 	SourceLang string `json:"sourceLang"`
 	TargetLang string `json:"targetLang"`
+
+	// v4 重试调度信息：让 worker 在 UI 上能展示"第 X/N 次重试"。
+	Attempt     int `json:"attempt,omitempty"`
+	MaxAttempts int `json:"maxAttempts,omitempty"`
 }
 
 // WorkerHeartbeatRequest worker 上报阶段 + 进度。
@@ -294,9 +314,21 @@ type WorkerAudioFetchTask struct {
 }
 
 // WorkerFailRequest 失败上报。
+//
+// ErrorKind（v4 加入）：客户端按已知错误特征上报枚举字符串（见 model.ErrorKind*）。
+// 缺省时服务端按 ErrorKindUnknown 处理（保守的 retriable 路径，等同 v3 行为）。
 type WorkerFailRequest struct {
+	WorkerID  string `json:"workerId" binding:"required"`
+	ErrorMsg  string `json:"errorMsg"`
+	ErrorKind string `json:"errorKind,omitempty"`
+}
+
+// WorkerDeregisterRequest 是 worker 优雅关闭时主动调用的端点请求体。
+//
+// 服务端把该 worker 当前持有的 RUNNING 任务按 stage 回滚（按 ErrorKindWorkerShutdown 走
+// neutral 路径，attempt 不增），让 stale recovery 不必等到 60s timeout 才放出去。
+type WorkerDeregisterRequest struct {
 	WorkerID string `json:"workerId" binding:"required"`
-	ErrorMsg string `json:"errorMsg"`
 }
 
 // === Admin worker 管理（/api/v1/admin/subtitle/worker-tokens 等） ===
@@ -311,6 +343,9 @@ type SubtitleWorkerTokenItem struct {
 	// v2 新增：分能力维度的并发上限（admin 面板可分别调）
 	MaxAudioConcurrency    int `json:"maxAudioConcurrency"`
 	MaxSubtitleConcurrency int `json:"maxSubtitleConcurrency"`
+	// v4 新增：单 worker 维度的上限（避免 token 配额被一个 worker 抢占完）
+	MaxPerWorkerAudio    int `json:"maxPerWorkerAudio"`
+	MaxPerWorkerSubtitle int `json:"maxPerWorkerSubtitle"`
 	// CurrentRunning 该 token 名下所有 worker 当前持有的 RUNNING 任务数（admin 列表实时统计）
 	CurrentRunning int `json:"currentRunning"`
 	// CurrentAudioRunning / CurrentSubtitleRunning 分维度统计，便于 admin 看出限流来自哪一侧
@@ -328,6 +363,9 @@ type SubtitleWorkerTokenCreateRequest struct {
 	// 缺省时按服务端默认（audio=2 / subtitle=1）
 	MaxAudioConcurrency    int `json:"maxAudioConcurrency,omitempty"`
 	MaxSubtitleConcurrency int `json:"maxSubtitleConcurrency,omitempty"`
+	// v4：单 worker 维度上限（缺省 0 = 不限）
+	MaxPerWorkerAudio    int `json:"maxPerWorkerAudio,omitempty"`
+	MaxPerWorkerSubtitle int `json:"maxPerWorkerSubtitle,omitempty"`
 }
 
 // SubtitleWorkerTokenUpdateRequest admin 编辑 token。所有字段都用指针，nil 表示不修改。
@@ -335,6 +373,8 @@ type SubtitleWorkerTokenUpdateRequest struct {
 	MaxConcurrency         *int `json:"maxConcurrency,omitempty"`
 	MaxAudioConcurrency    *int `json:"maxAudioConcurrency,omitempty"`
 	MaxSubtitleConcurrency *int `json:"maxSubtitleConcurrency,omitempty"`
+	MaxPerWorkerAudio      *int `json:"maxPerWorkerAudio,omitempty"`
+	MaxPerWorkerSubtitle   *int `json:"maxPerWorkerSubtitle,omitempty"`
 }
 
 // SubtitleWorkerTokenCreateResponse 仅本次返回明文 token。

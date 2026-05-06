@@ -55,6 +55,9 @@ import (
 )
 
 // 默认 broker 超时（与 distributed-worker.md v3 一致）。
+//
+// v4：服务端在 NewAudioBrokerWithTimeouts / overrideTimeouts 时可以从 config 注入更大值；
+// 这些常量是兜底默认。
 const (
 	// audioFetchPollDefaultTimeout audio worker long-poll 单次请求最长 hold 时长；
 	// 超时返回 204 让 audio worker 立即重新 poll，避免连接被中间设备 idle 断开。
@@ -62,11 +65,18 @@ const (
 
 	// audioFetchHoldTimeout subtitle worker GET 最长等待时长；超过则返回 503。
 	// 这个值 ≥ audioFetchPollDefaultTimeout，确保 audio worker 至少能收到一次 long-poll。
-	audioFetchHoldTimeout = 30 * time.Second
+	//
+	// v4 默认从 30s 拉到 5min：覆盖大 FLAC 文件慢上传 + 网络抖动恢复。
+	// audio worker 收到 fetch 通知后已经在主动推流，5min 足够 ~500MB FLAC 在
+	// 1.4MB/s（11Mbps）的窄带下完成。
+	audioFetchHoldTimeout = 5 * time.Minute
 
 	// audioStreamFirstByteTimeout audio worker 收到 fetch 通知后必须在此时间内开始上传；
 	// 超过视为该 worker 异常，subtitle worker GET 返回 503。
-	audioStreamFirstByteTimeout = 15 * time.Second
+	//
+	// v4 默认从 15s 拉到 30s：audio worker 在执行 cleanup / 切换 storage_dir 之类
+	// 短任务期间，long-poll → handle_task 的延迟可能 >15s。30s 仍在用户可接受范围内。
+	audioStreamFirstByteTimeout = 30 * time.Second
 )
 
 // AudioBroker 是 v3 协议的核心中转层。
@@ -96,6 +106,21 @@ func NewAudioBroker() *AudioBroker {
 		pollTimeout:    audioFetchPollDefaultTimeout,
 		holdTimeout:    audioFetchHoldTimeout,
 		streamTimeout:  audioStreamFirstByteTimeout,
+	}
+}
+
+// SetTimeouts 在运行期覆写 broker 的超时配置（仅在 NewSubtitleService 启动时调用）。
+//
+// 用于 v4 把 cfg.AudioFetchHoldSec / cfg.AudioStreamFirstByteSec 注入。
+// 0 / 负值表示"保留默认值"，避免 cfg 默认 0 把生产配置打回兜底。
+func (b *AudioBroker) SetTimeouts(holdSec, firstByteSec int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if holdSec > 0 {
+		b.holdTimeout = time.Duration(holdSec) * time.Second
+	}
+	if firstByteSec > 0 {
+		b.streamTimeout = time.Duration(firstByteSec) * time.Second
 	}
 }
 

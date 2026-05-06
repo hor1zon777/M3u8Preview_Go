@@ -357,7 +357,7 @@ func TestWorkerComplete_Success(t *testing.T) {
 func TestCreateAndRevokeWorkerToken(t *testing.T) {
 	svc, db := newTestSubtitleService(t, 10*time.Minute)
 
-	plaintext, rec, err := svc.CreateWorkerToken("home gpu", 1, 2, 1)
+	plaintext, rec, err := svc.CreateWorkerToken("home gpu", 1, 2, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestCreateAndRevokeWorkerToken(t *testing.T) {
 func TestUpdateWorkerToken_MaxConcurrency(t *testing.T) {
 	svc, _ := newTestSubtitleService(t, 10*time.Minute)
 
-	_, rec, err := svc.CreateWorkerToken("home gpu", 1, 2, 1)
+	_, rec, err := svc.CreateWorkerToken("home gpu", 1, 2, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestClaimNextJob_TokenLimit(t *testing.T) {
 	svc, db := newTestSubtitleService(t, 10*time.Minute)
 
 	// MaxConcurrency=0（不限），MaxAudioConcurrency=1（audio 维度限 1 条）
-	_, tokenRec, err := svc.CreateWorkerToken("shared", 0, 1, 1)
+	_, tokenRec, err := svc.CreateWorkerToken("shared", 0, 1, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
@@ -595,5 +595,228 @@ func TestClaimNextJob_LegacyMaxConcurrency(t *testing.T) {
 	}
 	if second != nil {
 		t.Fatalf("expected nil due to legacy MaxConcurrency, got %+v", second)
+	}
+}
+
+// === v4 测试 ===
+
+// claimByWorker 是个测试辅助：让 worker 完成 register（让 capabilities 等字段正常）
+// 然后调一次 ClaimNextJob。
+func claimByWorker(t *testing.T, svc *SubtitleService, db *gorm.DB, workerID string) *dto.WorkerClaimedJob {
+	t.Helper()
+	// 直接 upsert worker，不走 RegisterWorker 避免依赖 token
+	now := time.Now()
+	w := model.SubtitleWorker{
+		ID:           workerID,
+		Name:         workerID,
+		Capabilities: `["audio_extract","asr_subtitle"]`,
+		LastSeenAt:   now,
+		RegisteredAt: now,
+	}
+	if err := db.Save(&w).Error; err != nil {
+		t.Fatalf("seed worker %s: %v", workerID, err)
+	}
+	job, err := svc.ClaimNextJob(workerID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	return job
+}
+
+// TestWorkerFail_PermanentKind permanent kind 直接进 FAILED 终态。
+func TestWorkerFail_PermanentKind(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+	svc.cfg.DefaultMaxAttempts = 3
+
+	jobID := seedPendingJob(t, db, "media-perm", "https://example.com/m.m3u8")
+	claimed := claimByWorker(t, svc, db, "worker-perm")
+	if claimed == nil {
+		t.Fatalf("claim returned nil")
+	}
+
+	if err := svc.WorkerFailWithKind(jobID, "worker-perm", "404 not found",
+		model.ErrorKindAudioSource404); err != nil {
+		t.Fatalf("WorkerFailWithKind: %v", err)
+	}
+
+	var got model.SubtitleJob
+	if err := db.Where("id = ?", jobID).Take(&got).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != model.SubtitleStatusFailed {
+		t.Errorf("permanent kind should FAIL, got status=%s", got.Status)
+	}
+	if got.LastErrorKind != model.ErrorKindAudioSource404 {
+		t.Errorf("LastErrorKind=%s, want %s", got.LastErrorKind, model.ErrorKindAudioSource404)
+	}
+	if got.NextRetryAt != nil {
+		t.Errorf("permanent kind should not set NextRetryAt, got %v", got.NextRetryAt)
+	}
+}
+
+// TestWorkerFail_RetriableKind retriable kind attempt++ 且写 next_retry_at。
+func TestWorkerFail_RetriableKind(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+	svc.cfg.DefaultMaxAttempts = 3
+	svc.cfg.RetryBackoffSec = []int{30, 120, 600}
+
+	jobID := seedPendingJob(t, db, "media-retry", "https://example.com/m.m3u8")
+	claimByWorker(t, svc, db, "worker-retry")
+
+	if err := svc.WorkerFailWithKind(jobID, "worker-retry", "connection reset",
+		model.ErrorKindNetworkTimeout); err != nil {
+		t.Fatalf("WorkerFailWithKind: %v", err)
+	}
+
+	var got model.SubtitleJob
+	if err := db.Where("id = ?", jobID).Take(&got).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != model.SubtitleStatusPending {
+		t.Errorf("retriable should rollback to PENDING, got status=%s", got.Status)
+	}
+	if got.Attempt != 1 {
+		t.Errorf("Attempt=%d, want 1", got.Attempt)
+	}
+	if got.NextRetryAt == nil {
+		t.Errorf("NextRetryAt should be set for retriable")
+	}
+	// next_retry_at 应在 [now, now+60s] 之间（30s base + ±20% jitter ≤ 36s）
+	if got.NextRetryAt != nil {
+		dt := got.NextRetryAt.Sub(time.Now())
+		if dt < 20*time.Second || dt > 60*time.Second {
+			t.Errorf("NextRetryAt delta=%s out of [20s, 60s]", dt)
+		}
+	}
+}
+
+// TestWorkerFail_NeutralKindNoAttempt neutral kind 不增 attempt 也不写 next_retry_at。
+func TestWorkerFail_NeutralKindNoAttempt(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+	svc.cfg.DefaultMaxAttempts = 3
+
+	jobID := seedPendingJob(t, db, "media-neutral", "https://example.com/m.m3u8")
+	claimByWorker(t, svc, db, "worker-neutral")
+
+	if err := svc.WorkerFailWithKind(jobID, "worker-neutral",
+		"graceful shutdown", model.ErrorKindWorkerShutdown); err != nil {
+		t.Fatalf("WorkerFailWithKind: %v", err)
+	}
+
+	var got model.SubtitleJob
+	if err := db.Where("id = ?", jobID).Take(&got).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Attempt != 0 {
+		t.Errorf("neutral should not increment attempt, got %d", got.Attempt)
+	}
+	if got.NextRetryAt != nil {
+		t.Errorf("neutral should not set NextRetryAt, got %v", got.NextRetryAt)
+	}
+	if got.Status != model.SubtitleStatusPending {
+		t.Errorf("neutral should rollback to PENDING, got %s", got.Status)
+	}
+}
+
+// TestWorkerFail_MaxAttemptsExhausted 触顶 max_attempts 即使 retriable 也强制 FAILED。
+func TestWorkerFail_MaxAttemptsExhausted(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+	svc.cfg.DefaultMaxAttempts = 2
+	svc.cfg.RetryBackoffSec = []int{1, 2}
+
+	jobID := seedPendingJob(t, db, "media-max", "https://example.com/m.m3u8")
+	// 把 attempt 提前置成 1（max=2 → 下一次 fail 就触顶）
+	if err := db.Model(&model.SubtitleJob{}).Where("id = ?", jobID).
+		Updates(map[string]any{"attempt": 1, "max_attempts": 2}).Error; err != nil {
+		t.Fatalf("seed attempt: %v", err)
+	}
+	claimByWorker(t, svc, db, "worker-max")
+
+	if err := svc.WorkerFailWithKind(jobID, "worker-max", "still timing out",
+		model.ErrorKindNetworkTimeout); err != nil {
+		t.Fatalf("WorkerFailWithKind: %v", err)
+	}
+
+	var got model.SubtitleJob
+	if err := db.Where("id = ?", jobID).Take(&got).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != model.SubtitleStatusFailed {
+		t.Errorf("attempt=2/max=2 should FAIL, got %s", got.Status)
+	}
+	if got.Attempt != 2 {
+		t.Errorf("attempt should be incremented to 2, got %d", got.Attempt)
+	}
+}
+
+// TestClaimNextJob_NextRetryAtCooldown next_retry_at 未到的任务不应被 claim。
+func TestClaimNextJob_NextRetryAtCooldown(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+	jobID := seedPendingJob(t, db, "media-cooldown", "https://example.com/m.m3u8")
+
+	// 把 next_retry_at 设到 1 分钟后
+	future := time.Now().Add(time.Minute)
+	if err := db.Model(&model.SubtitleJob{}).Where("id = ?", jobID).
+		Update("next_retry_at", &future).Error; err != nil {
+		t.Fatalf("seed cooldown: %v", err)
+	}
+
+	job := claimByWorker(t, svc, db, "worker-cool")
+	if job != nil {
+		t.Errorf("cooldown job should not be claimable, got %+v", job)
+	}
+}
+
+// TestWorkerDeregister_RollbackClaimedJobs deregister 把 worker 持有的任务回滚为 PENDING。
+func TestWorkerDeregister_RollbackClaimedJobs(t *testing.T) {
+	svc, db := newTestSubtitleService(t, 10*time.Minute)
+	jobID := seedPendingJob(t, db, "media-dereg", "https://example.com/m.m3u8")
+	claimed := claimByWorker(t, svc, db, "worker-dereg")
+	if claimed == nil {
+		t.Fatalf("claim nil")
+	}
+
+	rolled, err := svc.WorkerDeregister("worker-dereg")
+	if err != nil {
+		t.Fatalf("Deregister: %v", err)
+	}
+	if rolled < 1 {
+		t.Errorf("expected rolled >= 1, got %d", rolled)
+	}
+
+	var got model.SubtitleJob
+	if err := db.Where("id = ?", jobID).Take(&got).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != model.SubtitleStatusPending {
+		t.Errorf("deregister should rollback to PENDING, got %s", got.Status)
+	}
+	if got.Attempt != 0 {
+		t.Errorf("deregister is neutral, attempt should not change, got %d", got.Attempt)
+	}
+	if got.ClaimedBy != "" {
+		t.Errorf("ClaimedBy should be cleared, got %q", got.ClaimedBy)
+	}
+}
+
+// TestClassifyErrorKind 三档分类映射表稳定。
+func TestClassifyErrorKind(t *testing.T) {
+	cases := []struct {
+		kind  string
+		class model.ErrorKindClass
+	}{
+		{model.ErrorKindAudioSource404, model.ErrorKindClassPermanent},
+		{model.ErrorKindFlacSHA256Mismatch, model.ErrorKindClassPermanent},
+		{model.ErrorKindWorkerShutdown, model.ErrorKindClassNeutral},
+		{model.ErrorKindWorkerCapacity, model.ErrorKindClassNeutral},
+		{model.ErrorKindNetworkTimeout, model.ErrorKindClassRetriable},
+		{model.ErrorKindUnknown, model.ErrorKindClassRetriable},
+		{"", model.ErrorKindClassRetriable},                // 缺省 = retriable
+		{"some_unknown_value", model.ErrorKindClassRetriable}, // 未知 = retriable
+	}
+	for _, c := range cases {
+		if got := model.ClassifyErrorKind(c.kind); got != c.class {
+			t.Errorf("ClassifyErrorKind(%q)=%d, want %d", c.kind, got, c.class)
+		}
 	}
 }

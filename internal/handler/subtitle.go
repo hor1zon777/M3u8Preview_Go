@@ -321,7 +321,7 @@ func (h *SubtitleHandler) createWorkerToken(c *gin.Context) {
 		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "请求格式错误"))
 		return
 	}
-	plaintext, rec, err := h.svc.CreateWorkerToken(req.Name, req.MaxConcurrency, req.MaxAudioConcurrency, req.MaxSubtitleConcurrency)
+	plaintext, rec, err := h.svc.CreateWorkerToken(req.Name, req.MaxConcurrency, req.MaxAudioConcurrency, req.MaxSubtitleConcurrency, req.MaxPerWorkerAudio, req.MaxPerWorkerSubtitle)
 	if err != nil {
 		_ = c.Error(err)
 		return

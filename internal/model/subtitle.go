@@ -56,6 +56,30 @@ type SubtitleJob struct {
 	AudioWorkerID           string     `gorm:"column:audio_worker_id;type:text;index:idx_subtitle_audio_worker" json:"audioWorkerId,omitempty"`
 	SubtitleWorkerID        string     `gorm:"column:subtitle_worker_id;type:text;index:idx_subtitle_subtitle_worker" json:"subtitleWorkerId,omitempty"`
 
+	// === v4 重试 / 调度字段 ===
+	//
+	// Attempt 当前已重试次数（成功跑完后不重置；FAILED 终态时停止累加）。
+	// 每次 WorkerFail 上报 retriable kind 时 +1；neutral kind（worker_capacity / worker_shutdown）
+	// 不增；permanent kind 不再走重试路径，直接进 FAILED。
+	//
+	// 用 attempt < max_attempts 作为"还能再试"的硬门槛；达到上限时 WorkerFail 强制 FAILED，
+	// 避免不可重试错误（如 m3u8 永久失效、模型损坏）在三端无限循环消耗算力。
+	Attempt int `gorm:"column:attempt;type:integer;not null;default:0" json:"attempt"`
+	// MaxAttempts 此任务允许的最大尝试次数（含首次）。
+	// 默认 3：一次原始 + 最多 2 次重试。EnsureJob 入队时按服务端默认填；admin 可调。
+	MaxAttempts int `gorm:"column:max_attempts;type:integer;not null;default:3" json:"maxAttempts"`
+	// LastErrorKind 最近一次失败的错误分类（model.ErrorKind* 枚举）。
+	// 与 ErrorMsg 配合：ErrorMsg 给人看具体上下文，LastErrorKind 给机器判断要不要重试 / UI 怎么展示。
+	LastErrorKind string `gorm:"column:last_error_kind;type:text;not null;default:''" json:"lastErrorKind,omitempty"`
+	// NextRetryAt 下一次允许被 claim 的最早时间。
+	// retriable fail 后服务端按退避表填 now+backoff(attempt)；claim 查询用
+	// `next_retry_at IS NULL OR next_retry_at <= now()` 过滤掉冷却中的任务，
+	// 避免刚失败的任务被立刻重抢导致 thrashing。
+	NextRetryAt *time.Time `gorm:"column:next_retry_at;index:idx_subtitle_next_retry" json:"nextRetryAt,omitempty"`
+	// Priority claim 排序权重（高优先）。新任务默认 0；retry 任务 -1（让位给新任务，防饥饿）；
+	// admin 可手动加到 +10 表示加急；老化 ticker 把超过 10min 没派出去的任务慢慢提优先级。
+	Priority int `gorm:"column:priority;type:integer;not null;default:0;index:idx_subtitle_priority" json:"priority"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"createdAt"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updatedAt"`
 

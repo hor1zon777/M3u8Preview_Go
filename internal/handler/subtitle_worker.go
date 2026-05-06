@@ -78,6 +78,7 @@ func NewSubtitleWorkerHandler(svc *service.SubtitleService) *SubtitleWorkerHandl
 // Register 挂全部端点到已应用 RequireWorkerAuth 的 RouterGroup。
 func (h *SubtitleWorkerHandler) Register(rg *gin.RouterGroup) {
 	rg.POST("/register", h.register)
+	rg.POST("/deregister", h.deregister)
 	rg.POST("/claim", h.claim)
 	rg.POST("/jobs/:jobId/heartbeat", h.heartbeat)
 	rg.POST("/jobs/:jobId/complete", h.complete)
@@ -126,7 +127,14 @@ func (h *SubtitleWorkerHandler) claim(c *gin.Context) {
 		return
 	}
 
-	job, err := h.svc.ClaimNextJob(req.WorkerID)
+	// v4 long-poll：req.WaitSec > 0 时服务端 hold 一段时间等待新任务，
+	// 期间被 EnsureJob / WorkerAudioReady / 重试入队等事件唤醒就立即派发。
+	// 缺省 0 = 短轮询行为（向后兼容旧客户端）。
+	wait := time.Duration(req.WaitSec) * time.Second
+	if wait < 0 {
+		wait = 0
+	}
+	job, err := h.svc.ClaimNextJobLongPoll(req.WorkerID, wait)
 	if err != nil {
 		_ = c.Error(err)
 		return
@@ -137,6 +145,26 @@ func (h *SubtitleWorkerHandler) claim(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, dto.OK(job))
+}
+
+// deregister 是 v4 加的优雅关闭端点：worker 退出前调用，让服务端立即把它持有的
+// RUNNING 任务按 ErrorKindWorkerShutdown（neutral 路径，attempt 不增）回滚，避免
+// 等到 stale recovery 的 30s 超时。返回 affected 表示回滚的任务数。
+func (h *SubtitleWorkerHandler) deregister(c *gin.Context) {
+	var req dto.WorkerDeregisterRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusBadRequest, "invalid deregister payload"))
+		return
+	}
+	rolled, err := h.svc.WorkerDeregister(req.WorkerID)
+	if err != nil {
+		_ = c.Error(err)
+		return
+	}
+	c.JSON(http.StatusOK, dto.OK(map[string]any{
+		"workerId": req.WorkerID,
+		"affected": rolled,
+	}))
 }
 
 func (h *SubtitleWorkerHandler) heartbeat(c *gin.Context) {
@@ -244,7 +272,7 @@ func (h *SubtitleWorkerHandler) fail(c *gin.Context) {
 		return
 	}
 
-	if err := h.svc.WorkerFail(jobID, req.WorkerID, req.ErrorMsg); err != nil {
+	if err := h.svc.WorkerFailWithKind(jobID, req.WorkerID, req.ErrorMsg, req.ErrorKind); err != nil {
 		if errors.Is(err, service.ErrWorkerJobNotOwned) {
 			middleware.AbortWithAppError(c, middleware.NewAppError(http.StatusGone, "job no longer owned by this worker"))
 			return

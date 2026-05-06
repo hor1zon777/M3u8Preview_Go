@@ -104,6 +104,45 @@ type SubtitleConfig struct {
 	// 已达上限则返回 nil，worker 自然 sleep 后重试。
 	// 用于在共享 ASR / 翻译 API 配额时防止 worker 集群把后端 LLM 打垮。
 	GlobalMaxConcurrency int
+
+	// === v4 调度 / 重试 / 长轮询参数（全部带默认值，向后兼容） ===
+
+	// DefaultMaxAttempts 新建任务时填入 subtitle_jobs.max_attempts 的默认值。
+	// 含义为"一条任务允许的总尝试次数（含首次）"。
+	// 默认 3：原始 1 + 最多 2 次 retriable 重试。
+	DefaultMaxAttempts int
+
+	// AudioUploadedTTL stale recovery 中"FLAC 已上传但长时间无 subtitle worker 接手"
+	// 的回收阈值。v3 之前硬编码 24h；现在可调。
+	// 默认 1 小时：让 audio worker 本地磁盘不被长期占用。
+	AudioUploadedTTL time.Duration
+
+	// StaleRecoveryInterval stale recovery ticker 周期。默认 30s（v3 是 60s）。
+	// 越短崩溃恢复越快，但 SQL UPDATE 频率提升；通常 30s 足够。
+	StaleRecoveryInterval time.Duration
+
+	// ClaimLongPollMaxSec long-poll claim 端点服务端可 hold 的最长秒数。
+	// 默认 25s；客户端可在请求里传更小值，服务端 clamp 到 [0, this]。
+	// 0 = 关闭 long-poll（行为退回到 v3 短轮询）。
+	ClaimLongPollMaxSec int
+
+	// AudioFetchHoldSec broker GET /audio 端点上游 hold 时长（覆盖 audio worker 推流期间）。
+	// 默认 300（5 分钟）：覆盖大 FLAC 文件慢上传；v3 是 30s。
+	AudioFetchHoldSec int
+
+	// AudioStreamFirstByteSec broker 等待 audio worker 收到 fetch 通知后开始推流的超时。
+	// 默认 30s；v3 是 15s。
+	AudioStreamFirstByteSec int
+
+	// RetryBackoffSec 重试退避数组：retriable fail 后按 attempt 索引取退避秒数；
+	// 越界用最后一个值。每次退避会在 ±20% 区间内加 jitter（在 service 层完成）。
+	// 默认 [30, 120, 600] = 30s / 2min / 10min。
+	RetryBackoffSec []int
+
+	// MaxConcurrentTasksHint 服务端在 register 响应里下发给单个 worker 的并发建议。
+	// 0 = 不下发，worker 退回本地 settings；> 0 时 worker 会用作 inflight 上限。
+	// 默认 0。
+	MaxConcurrentTasksHint int
 }
 
 type Config struct {
@@ -217,6 +256,16 @@ func Load(projectRoot string) (*Config, error) {
 			LocalWorkerEnabled:   parseBoolDefault(os.Getenv("SUBTITLE_LOCAL_WORKER_ENABLED"), false),
 			WorkerStaleThreshold: time.Duration(clamp(atoiDefault(os.Getenv("SUBTITLE_WORKER_STALE_MINUTES"), 10), 1, 120)) * time.Minute,
 			GlobalMaxConcurrency: clamp(atoiDefault(os.Getenv("SUBTITLE_GLOBAL_MAX_CONCURRENCY"), 0), 0, 1000),
+
+			// v4 调度 / 重试参数
+			DefaultMaxAttempts:      clamp(atoiDefault(os.Getenv("SUBTITLE_DEFAULT_MAX_ATTEMPTS"), 3), 1, 20),
+			AudioUploadedTTL:        time.Duration(clamp(atoiDefault(os.Getenv("SUBTITLE_AUDIO_UPLOADED_TTL_MINUTES"), 60), 5, 24*60)) * time.Minute,
+			StaleRecoveryInterval:   time.Duration(clamp(atoiDefault(os.Getenv("SUBTITLE_STALE_RECOVERY_SECONDS"), 30), 5, 300)) * time.Second,
+			ClaimLongPollMaxSec:     clamp(atoiDefault(os.Getenv("SUBTITLE_CLAIM_LONGPOLL_MAX_SEC"), 25), 0, 60),
+			AudioFetchHoldSec:       clamp(atoiDefault(os.Getenv("SUBTITLE_AUDIO_FETCH_HOLD_SEC"), 300), 30, 1800),
+			AudioStreamFirstByteSec: clamp(atoiDefault(os.Getenv("SUBTITLE_AUDIO_STREAM_FIRSTBYTE_SEC"), 30), 5, 300),
+			RetryBackoffSec:         parseIntListEnv(os.Getenv("SUBTITLE_RETRY_BACKOFF_SECONDS"), []int{30, 120, 600}),
+			MaxConcurrentTasksHint:  clamp(atoiDefault(os.Getenv("SUBTITLE_MAX_CONCURRENT_HINT"), 0), 0, 64),
 		},
 	}
 
@@ -358,6 +407,51 @@ func clamp(n, lo, hi int) int {
 		return hi
 	}
 	return n
+}
+
+// parseIntListEnv 解析 "30,120,600" 这种逗号分隔整数列表。空 / 任一非法 → fallback。
+// 用于 SUBTITLE_RETRY_BACKOFF_SECONDS 等"列表型"参数。
+func parseIntListEnv(s string, fallback []int) []int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fallback
+	}
+	parts := strings.Split(s, ",")
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconvAtoiPositive(p)
+		if err != nil {
+			return fallback
+		}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
+}
+
+// strconvAtoiPositive 等同于 strconv.Atoi 但要求 ≥1。
+// 单独抽出来避免在 parseIntListEnv 顶部引 strconv 改动太大。
+func strconvAtoiPositive(s string) (int, error) {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("non-digit %q", c)
+		}
+		n = n*10 + int(c-'0')
+		if n > 1_000_000 {
+			return 0, fmt.Errorf("too large")
+		}
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("must be >= 1")
+	}
+	return n, nil
 }
 
 // parseCookieSecure 决定 Cookie 的 Secure 标志。

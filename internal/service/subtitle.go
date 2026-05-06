@@ -54,6 +54,15 @@ type SubtitleService struct {
 	// audio worker / subtitle worker 通过 broker 协调 FLAC 流转，服务端不持久化文件。
 	audioBroker *AudioBroker
 
+	// claimWaiterMu 保护 claimWaiters。每个 long-poll claim 创建一个 chan 注册进来；
+	// EnsureJob / WorkerAudioReady / WorkerFail（retriable）/ stale recovery 推进任务到
+	// 可派发状态后调 notifyClaimWaiters() 唤醒一个等待者，让其立即去抢任务。
+	//
+	// 用 chan struct{} buffer=1：notify 时非阻塞 send；waiter 已经退出（chan 已被 close）
+	// 时跳过。同一个 waiter 只能被唤醒一次（取下来后该 chan 不再放回）。
+	claimWaiterMu sync.Mutex
+	claimWaiters  []chan struct{}
+
 	jobs        chan string // mediaID
 	stop        chan struct{}
 	once        sync.Once
@@ -81,6 +90,10 @@ func NewSubtitleService(
 	publicBaseURL string,
 ) *SubtitleService {
 	ctx, cancel := context.WithCancel(context.Background())
+	broker := NewAudioBroker()
+	if cfg != nil {
+		broker.SetTimeouts(cfg.AudioFetchHoldSec, cfg.AudioStreamFirstByteSec)
+	}
 	return &SubtitleService{
 		db:                db,
 		cfg:               cfg,
@@ -89,7 +102,7 @@ func NewSubtitleService(
 		signer:            signer,
 		uploadsDir:        uploadsDir,
 		publicBaseURL:     publicBaseURL,
-		audioBroker:       NewAudioBroker(),
+		audioBroker:       broker,
 		jobs:              make(chan string, 4096),
 		stop:              make(chan struct{}),
 		ctx:               ctx,
@@ -245,27 +258,42 @@ func (s *SubtitleService) EnsureJob(mediaID string) error {
 		case model.SubtitleStatusDone, model.SubtitleStatusRunning, model.SubtitleStatusPending, model.SubtitleStatusDisabled:
 			return nil // 幂等：不重新入队
 		case model.SubtitleStatusFailed:
-			// 重置 + 入队
+			// 重置 + 入队（v4：重置 attempt / next_retry_at / priority，让任务从头开始算重试预算）
+			maxAtt := cur.DefaultMaxAttempts
+			if maxAtt <= 0 {
+				maxAtt = 3
+			}
 			if err := s.db.Model(&existing).Updates(map[string]any{
-				"status":    model.SubtitleStatusPending,
-				"stage":     model.SubtitleStageQueued,
-				"progress":  0,
-				"error_msg": "",
+				"status":          model.SubtitleStatusPending,
+				"stage":           model.SubtitleStageQueued,
+				"progress":        0,
+				"error_msg":       "",
+				"attempt":         0,
+				"max_attempts":    maxAtt,
+				"last_error_kind": "",
+				"next_retry_at":   nil,
+				"priority":        0,
 			}).Error; err != nil {
 				return fmt.Errorf("reset failed job: %w", err)
 			}
 			s.enqueue(mediaID)
+			s.notifyClaimWaiters()
 			return nil
 		}
 	}
 
 	// 创建新任务
+	maxAtt := cur.DefaultMaxAttempts
+	if maxAtt <= 0 {
+		maxAtt = 3
+	}
 	job := model.SubtitleJob{
-		MediaID:    mediaID,
-		Status:     model.SubtitleStatusPending,
-		Stage:      model.SubtitleStageQueued,
-		SourceLang: cur.WhisperLanguage,
-		TargetLang: cur.TargetLang,
+		MediaID:     mediaID,
+		Status:      model.SubtitleStatusPending,
+		Stage:       model.SubtitleStageQueued,
+		SourceLang:  cur.WhisperLanguage,
+		TargetLang:  cur.TargetLang,
+		MaxAttempts: maxAtt,
 	}
 	if err := s.db.Create(&job).Error; err != nil {
 		// 唯一索引冲突视为竞态，已有其它请求建好了
@@ -275,6 +303,8 @@ func (s *SubtitleService) EnsureJob(mediaID string) error {
 		return fmt.Errorf("create subtitle job: %w", err)
 	}
 	s.enqueue(mediaID)
+	// 唤醒等待中的 long-poll claim：新任务可派
+	s.notifyClaimWaiters()
 	return nil
 }
 
