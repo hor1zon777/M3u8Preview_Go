@@ -523,24 +523,17 @@ func (h *SubtitleWorkerHandler) audioFetch(c *gin.Context) {
 		return
 	}
 
-	// 提前设 header（broker pipe 开始前就发出 200 OK，避免客户端误把超时当 ECONN）
-	c.Header("Content-Type", "audio/flac")
-	c.Header("Cache-Control", "no-store")
-	c.Header("Transfer-Encoding", "chunked")
-	c.Status(http.StatusOK)
-	// flush header 让客户端看到 200，避免客户端 reqwest timeout 在 broker 等 30s 时误以为连接挂了
-	if flusher, ok := c.Writer.(http.Flusher); ok {
-		flusher.Flush()
-	}
-
+	// 不再提前发 200；service 层在 broker 开始推流前设 headers，首次 Write 自动触发 200。
+	// 若 broker 超时（重试用尽），service 返回 AppError，handler 写 503。
 	sha, err := h.svc.WorkerAudioFetchBroker(jobID, workerID, c.Writer)
 	if err != nil {
-		// 已经发了 200 + headers，无法再写 JSON 错误响应；只能记日志 + 直接关
-		// 客户端会看到 EOF + 没有 ETag，自己处理重试
-		_ = c.Error(err)
+		var appErr *middleware.AppError
+		if errors.As(err, &appErr) {
+			middleware.AbortWithAppError(c, appErr)
+		} else {
+			middleware.AbortWithAppError(c, middleware.WrapAppError(http.StatusInternalServerError, "audio fetch", err))
+		}
 		return
 	}
-	// 全部传完才知道 SHA：broker.RequestFetch 返回前已经把 body io.Copy 完
-	// 这里设 ETag 没用了（客户端已经读完 body 才看到 trailer）；如果未来需要可以改成 trailers 头
 	_ = sha
 }

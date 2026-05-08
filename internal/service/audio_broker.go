@@ -50,6 +50,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 )
@@ -77,6 +78,12 @@ const (
 	// v4 默认从 15s 拉到 30s：audio worker 在执行 cleanup / 切换 storage_dir 之类
 	// 短任务期间，long-poll → handle_task 的延迟可能 >15s。30s 仍在用户可接受范围内。
 	audioStreamFirstByteTimeout = 30 * time.Second
+
+	// audioFetchMaxRetries fetch 首字节超时后的最大重试次数（总尝试 = 1 + maxRetries）。
+	//
+	// audio worker 可能因临时原因未及时响应（GC、磁盘 IO、网络抖动），直接放弃会
+	// 导致任务失败但本地 FLAC 残留。重试给 audio worker 恢复窗口。
+	audioFetchMaxRetries = 2
 )
 
 // AudioBroker 是 v3 协议的核心中转层。
@@ -220,19 +227,44 @@ func (b *AudioBroker) EnqueueFetch(workerID string, task AudioFetchTask) {
 //  3. 等 audio worker 调 ReceiveStream，开始往 pipe writer 写
 //  4. io.Copy 到调用方 w
 //  5. 全程超时控制：streamTimeout（第一字节）+ holdTimeout（整体）
+//  6. 首字节超时时自动重试（最多 audioFetchMaxRetries 次），给 audio worker 恢复窗口
 //
 // 调用方负责设置 HTTP Headers（Content-Type 等）后再传 w。
 //
 // 返回：
 //   - nil           ：成功传输完整 body
 //   - ErrAudioStreamTaken：已经有另一个 fetch 在进行（同一 jobId）
-//   - ErrAudioOwnerOffline：超过 streamTimeout 仍未收到 audio worker 的 stream
+//   - ErrAudioOwnerOffline：超过 streamTimeout 仍未收到 audio worker 的 stream（重试用尽后）
 //   - ctx 错误      ：客户端断开 / 上层超时
 func (b *AudioBroker) RequestFetch(jobID, ownerWorkerID string, w io.Writer) error {
 	if jobID == "" || ownerWorkerID == "" {
 		return fmt.Errorf("jobId and ownerWorkerId required")
 	}
 
+	var lastErr error
+	for attempt := 0; attempt <= audioFetchMaxRetries; attempt++ {
+		err := b.doOneFetchAttempt(jobID, ownerWorkerID, w)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// 仅首字节超时可重试；其它错误（StreamTaken / ctx 取消 / io 错误）直接返回
+		if !errors.Is(err, ErrAudioOwnerOffline) {
+			return err
+		}
+
+		if attempt < audioFetchMaxRetries {
+			log.Printf("[audio-broker] fetch retry %d/%d for job=%s worker=%s (first-byte timeout)",
+				attempt+1, audioFetchMaxRetries, jobID, ownerWorkerID)
+			b.EnqueueFetch(ownerWorkerID, AudioFetchTask{Action: "fetch", JobID: jobID})
+		}
+	}
+	return lastErr
+}
+
+// doOneFetchAttempt 是单次 fetch 尝试（含 coupling 注册、通知、firstByte + hold 超时）。
+func (b *AudioBroker) doOneFetchAttempt(jobID, ownerWorkerID string, w io.Writer) error {
 	pr, pw := io.Pipe()
 	coupling := &fetchCoupling{
 		reader:      pr,

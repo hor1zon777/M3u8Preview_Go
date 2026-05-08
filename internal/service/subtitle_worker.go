@@ -1118,7 +1118,7 @@ func (s *SubtitleService) WorkerAudioStreamChunkReceive(
 //     然后 io.Copy(pipe reader → respWriter)
 //
 // 返回 (sha256, error)：sha 给 handler 设 ETag 用；error 出现时调用方应 abort 响应。
-func (s *SubtitleService) WorkerAudioFetchBroker(jobID, workerID string, respWriter io.Writer) (string, error) {
+func (s *SubtitleService) WorkerAudioFetchBroker(jobID, workerID string, respWriter http.ResponseWriter) (string, error) {
 	if jobID == "" || workerID == "" {
 		return "", middleware.NewAppError(http.StatusBadRequest, "missing jobId or workerId")
 	}
@@ -1138,7 +1138,13 @@ func (s *SubtitleService) WorkerAudioFetchBroker(jobID, workerID string, respWri
 			"audio artifact has no owner (audio_worker_id empty)")
 	}
 
-	// broker 桥接（broker 内部会 hold 30s 等 audio worker 上传）
+	// 设 HTTP headers：在 RequestFetch 之前设好，io.Copy 首次 Write 自动触发 200。
+	// 若 RequestFetch 返回错误（重试用尽），此时 body 未写，仍可返回 503。
+	respWriter.Header().Set("Content-Type", "audio/flac")
+	respWriter.Header().Set("Cache-Control", "no-store")
+	respWriter.Header().Set("Transfer-Encoding", "chunked")
+
+	// broker 桥接（含首字节超时重试）
 	if err := s.audioBroker.RequestFetch(jobID, job.AudioWorkerID, respWriter); err != nil {
 		switch {
 		case errors.Is(err, ErrAudioOwnerOffline):
