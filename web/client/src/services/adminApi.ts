@@ -100,7 +100,19 @@ export const adminApi = {
 
             if (data.phase === 'complete' && data.downloadId) {
               eventSource?.close();
-              adminApi.downloadBackupFile(data.downloadId);
+              // SSE 完成离原始按钮点击已隔了若干事件循环，Chrome 新版会拒绝
+              // EventSource 回调里 fetch+blob+a.click 的下载（user activation 已过期）。
+              // 改用浏览器原生导航 + ?ticket=：后端 Content-Disposition: attachment
+              // 会让浏览器原生触发下载且不离开当前页，规避所有 user activation 问题。
+              adminApi.triggerBackupDownload(data.downloadId).catch((err) => {
+                onProgress({
+                  phase: 'error',
+                  message: err?.message || '触发下载失败',
+                  current: 0,
+                  total: 0,
+                  percentage: 0,
+                });
+              });
             }
             if (data.phase === 'error') {
               eventSource?.close();
@@ -139,25 +151,26 @@ export const adminApi = {
     };
   },
 
+  // triggerBackupDownload 用一次性 ticket 让浏览器原生触发 ZIP 下载。
+  // 隐藏 iframe 触发：比 window.location.href 更安全（不会替换当前 history），
+  // 比 a.click 更可靠（不依赖 user activation）。
+  async triggerBackupDownload(downloadId: string): Promise<void> {
+    const ticket = await getSseTicket();
+    const url = `/api/v1/admin/backup/download/${encodeURIComponent(downloadId)}?ticket=${encodeURIComponent(ticket)}`;
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    // 30s 后回收 iframe；下载本身由浏览器原生处理，与 iframe 生命周期无关
+    setTimeout(() => {
+      if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+    }, 30000);
+  },
+
   async downloadBackupFile(downloadId: string) {
-    const response = await api.get(`/admin/backup/download/${downloadId}`, {
-      responseType: 'blob',
-      timeout: 300000,
-    });
-    const blob = response.data as Blob;
-
-    const disposition = response.headers['content-disposition'];
-    const match = disposition?.match(/filename="?([^";\n]+)"?/);
-    const filename = match?.[1] || `backup-${new Date().toISOString().slice(0, 19)}.zip`;
-
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(blobUrl);
+    // 兼容旧调用入口：直接走 ticket + 原生下载链路，避免 EventSource 回调里
+    // fetch+blob+a.click 被浏览器 user activation 策略静默丢弃。
+    await adminApi.triggerBackupDownload(downloadId);
   },
 
   async importBackup(file: File): Promise<RestoreResult> {

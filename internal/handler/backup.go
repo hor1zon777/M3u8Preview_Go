@@ -34,16 +34,20 @@ func NewBackupHandler(svc *service.BackupService) *BackupHandler {
 // SSE 路由由 RegisterSSE 注册，须走 AuthenticateSSE 中间件以识别 ?ticket=。
 func (h *BackupHandler) Register(rg *gin.RouterGroup) {
 	rg.GET("/export", h.exportDirect)
-	rg.GET("/download/:id", h.download)
 	rg.POST("/import", h.importSync)
 	rg.POST("/import/upload", h.importUpload)
 }
 
-// RegisterSSE 注册需要 ?ticket= 认证的 EventSource 路由。
+// RegisterSSE 注册需要 ?ticket= 认证的 EventSource / 浏览器原生下载路由。
+// download 也放这里：浏览器原生导航（window.location.href）无法注入 Bearer 头，
+// 必须用一次性 ticket 才能在 SSE 完成后直接触发下载，避免依赖 fetch+blob+a.click
+// 这套链路—— Chrome 新版会因 user activation 过期而静默丢弃来自 EventSource 回调
+// 里发起的 a.click() 下载。
 // 调用方应对此 group 使用 middleware.AuthenticateSSE + RequireRole("ADMIN")。
 func (h *BackupHandler) RegisterSSE(rg *gin.RouterGroup) {
 	rg.GET("/export/stream", h.exportStream)
 	rg.GET("/import/stream/:id", h.importStream)
+	rg.GET("/download/:id", h.download)
 }
 
 // exportDirect 同步打包 ZIP 到临时文件再返回，确保出错时不返回损坏数据。
