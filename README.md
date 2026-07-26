@@ -20,6 +20,7 @@ M3u8Preview 的 Go 版**全栈**项目（Gin 后端 + React/Vite 前端 + nginx�
 ## 目录
 
 - [快速开始](#快速开始)
+- [版本号](#版本号)
 - [安全架构](#安全架构)
 - [从 TS 版 M3u8Preview_R 迁移](#从-ts-版-m3u8preview_r-迁移)
 - [从命名卷升级到 bind mount](#从命名卷升级到-bind-mount)
@@ -99,6 +100,44 @@ docker build -t m3u8preview-go:latest .
 docker compose -f docker-compose.dev.yml up --build
 # Go 后端容器：http://localhost:3000
 # 前端：终端另开 cd web && npm run dev -w client，访问 :5173
+```
+
+---
+
+## 版本号
+
+单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.1.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
+
+**发版时只需改 `VERSION` 一个文件**，其余全部自动：
+
+| 字段 | 来源 |
+|---|---|
+| 版本号 | Dockerfile 构建时 `cat VERSION` |
+| git commit 短哈希 | CI 通过 `--build-arg GIT_COMMIT` 传入（`.dockerignore` 排除了 `.git`，构建阶段查不到仓库历史） |
+| 构建时间 | CI 通过 `--build-arg BUILD_TIME` 传入 |
+
+三者由 `-ldflags -X` 注入 `internal/version` 包，通过无鉴权的 `GET /api/health` 暴露：
+
+```json
+{ "status": "ok", "version": "0.1.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
+```
+
+### 显示位置
+
+- **登录页页脚** —— 未登录可见，排查线上问题时不必先登录就能确认版本
+- **顶栏用户下拉菜单底部** —— 所有登录用户可见
+- **管理面板「系统信息」卡片** —— 版本 / 提交 / 构建时间，启用主备高可用时额外显示当前节点与主备角色
+
+### 本地构建带版本号的二进制
+
+不注入时三个值保持 `dev` / `unknown`——显示 "dev" 比显示一个来路不明的版本号诚实。需要真实版本时：
+
+```bash
+PKG=github.com/hor1zon777/m3u8-preview-go/internal/version
+go build -ldflags "-X $PKG.Version=$(cat VERSION) \
+                   -X $PKG.Commit=$(git rev-parse --short HEAD) \
+                   -X $PKG.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+         ./cmd/server
 ```
 
 ---

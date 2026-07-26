@@ -1,5 +1,6 @@
 import { useAuthStore } from '../../stores/authStore.js';
 import { useSiteName } from '../../hooks/useSiteName.js';
+import { useAppVersion, formatVersion } from '../../hooks/useAppVersion.js';
 import { useNavigate, NavLink, Link } from 'react-router-dom';
 import { useState, useRef, useEffect } from 'react';
 import {
@@ -11,6 +12,7 @@ export function Header() {
   const user = useAuthStore(s => s.user);
   const logout = useAuthStore(s => s.logout);
   const siteName = useSiteName();
+  const versionLabel = formatVersion(useAppVersion());
   const navigate = useNavigate();
   const [showDropdown, setShowDropdown] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -225,6 +227,13 @@ export function Header() {
                 退出登录
               </button>
             </div>
+
+            {/* 版本号：拿不到时整块不渲染，避免留一条空白分隔线 */}
+            {versionLabel && (
+              <div className="px-4 pt-2 pb-1 border-t border-emby-border">
+                <p className="text-[11px] text-emby-text-secondary font-mono">{versionLabel}</p>
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -6,6 +6,7 @@ import { adminApi } from '../services/adminApi.js';
 import { MediaThumbnail } from '../components/media/MediaThumbnail.js';
 import { BackupSection } from '../components/admin/BackupSection.js';
 import { PosterSection } from '../components/admin/PosterSection.js';
+import { SystemInfoCard } from '../components/admin/SystemInfoCard.js';
 
 export function AdminDashboardPage() {
   const queryClient = useQueryClient();
@@ -604,6 +605,8 @@ export function AdminDashboardPage() {
           </div>
         </div>
       </div>
+
+      <SystemInfoCard />
     </div>
   );
 }

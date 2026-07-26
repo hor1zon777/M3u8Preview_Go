@@ -5,6 +5,7 @@ import { useAuthStore } from '../../stores/authStore.js';
 import { authApi } from '../../services/authApi.js';
 import type { CaptchaPublicConfig } from '../../services/authApi.js';
 import { useSiteName } from '../../hooks/useSiteName.js';
+import { useAppVersion, formatVersion } from '../../hooks/useAppVersion.js';
 import { CaptchaWidget } from './CaptchaWidget.js';
 
 export function LoginForm() {
@@ -21,6 +22,7 @@ export function LoginForm() {
   const navigate = useNavigate();
   const location = useLocation();
   const siteName = useSiteName();
+  const versionLabel = formatVersion(useAppVersion());
 
   useEffect(() => {
     authApi.getRegisterStatus().then((res) => setAllowRegistration(res.allowRegistration)).catch(() => { setAllowRegistration(false); });
@@ -130,6 +132,11 @@ export function LoginForm() {
             </p>
           )}
         </form>
+
+        {/* 版本号页脚：未登录也可见，排查线上问题时不必先登录就能确认版本 */}
+        {versionLabel && (
+          <p className="mt-6 text-center text-xs text-emby-text-secondary/70 font-mono">{versionLabel}</p>
+        )}
       </div>
     </div>
   );
