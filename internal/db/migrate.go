@@ -27,6 +27,7 @@ func allModels() []any {
 		&model.SystemSetting{},
 		&model.LoginRecord{},
 		&model.SubtitleJob{},
+		&model.SubtitleVTT{},
 		// 远程字幕 worker：先建 token 表（worker 表外键引用它）
 		&model.SubtitleWorkerToken{},
 		&model.SubtitleWorker{},

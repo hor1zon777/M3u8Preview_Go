@@ -63,6 +63,11 @@ type SubtitleService struct {
 	claimWaiterMu sync.Mutex
 	claimWaiters  []chan struct{}
 
+	// writable 是主备高可用的写闸门（由 internal/litefs.Provider 提供）。
+	// nil 表示单机部署，恒可写。replica 上后台写循环必须停下来——否则它们会在只读库上
+	// 每 30 秒失败一次并刷满日志，而真正该做这些清理的是当前的 primary。
+	writable func() bool
+
 	jobs        chan string // mediaID
 	stop        chan struct{}
 	once        sync.Once
@@ -113,6 +118,20 @@ func NewSubtitleService(
 // AudioBroker 让 handler 层能拿到 broker 实例（audio-fetch-poll / audio-stream / GET audio）。
 func (s *SubtitleService) AudioBroker() *AudioBroker {
 	return s.audioBroker
+}
+
+// SetWritableGate 注入主备高可用的写闸门。必须在 Start 之前调用。
+// 传 nil 或不调用即恒可写（单机部署 / 本地开发）。
+func (s *SubtitleService) SetWritableGate(fn func() bool) {
+	s.writable = fn
+}
+
+// canWrite 报告当前节点是否可写。闸门未注入时恒为 true。
+func (s *SubtitleService) canWrite() bool {
+	if s.writable == nil {
+		return true
+	}
+	return s.writable()
 }
 
 // snap 返回 cfg 的拷贝，调用方对返回值的修改不会影响内部状态。
@@ -193,6 +212,14 @@ func (s *SubtitleService) Start() error {
 	go func() {
 		defer s.wg.Done()
 		s.runStaleRecoveryLoop()
+	}()
+
+	// 历史 VTT 回填：把磁盘上的字幕正文灌进数据库，让它随 LiteFS 复制到备节点。
+	// 幂等且只在 primary 执行；放后台跑，避免大库启动时阻塞在文件遍历上。
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.backfillVTT()
 	}()
 
 	// 启动时不再扫描存量 media 自动入队；改为在 admin 字幕管理页手动选择后再批量入队，
@@ -323,7 +350,7 @@ func (s *SubtitleService) HookOnMediaDeleted(mediaID string) {
 	if err := s.db.Where("media_id = ?", mediaID).Take(&job).Error; err != nil {
 		return
 	}
-	s.deleteVTTFile(&job)
+	s.dropVTT(&job)
 	_ = s.db.Where("media_id = ?", mediaID).Delete(&model.SubtitleJob{}).Error
 }
 
@@ -478,11 +505,16 @@ func (s *SubtitleService) processOne(mediaID string) {
 	}
 	s.updateProgress(mediaID, model.SubtitleStageWriting, 90)
 
-	// 4) 写 VTT
+	// 4) 写 VTT：磁盘 + 数据库各一份（见 subtitle_vtt.go 的迁移策略说明）
 	relPath := mediaID + ".vtt"
 	absPath := filepath.Join(cur.SubtitlesDir, relPath)
-	if err := writeVTT(absPath, asrResult.Segments, translated); err != nil {
+	body, err := writeVTT(absPath, asrResult.Segments, translated)
+	if err != nil {
 		s.markFailed(mediaID, fmt.Errorf("write vtt: %w", err))
+		return
+	}
+	if err := s.storeVTT(mediaID, body); err != nil {
+		s.markFailed(mediaID, fmt.Errorf("store vtt: %w", err))
 		return
 	}
 
@@ -609,13 +641,11 @@ func (s *SubtitleService) ServeVTT(mediaID, userID, expires, sig string, w io.Wr
 	if job.Status != model.SubtitleStatusDone || job.VttPath == "" {
 		return 404, fmt.Errorf("vtt not ready")
 	}
-	abs := filepath.Join(s.snap().SubtitlesDir, job.VttPath)
-	f, err := os.Open(abs)
+	body, err := s.loadVTT(&job)
 	if err != nil {
-		return 404, fmt.Errorf("open vtt: %w", err)
+		return 404, fmt.Errorf("load vtt: %w", err)
 	}
-	defer func() { _ = f.Close() }()
-	if _, err := io.Copy(w, f); err != nil {
+	if _, err := w.Write(body); err != nil {
 		return 500, err
 	}
 	return 200, nil
@@ -866,7 +896,7 @@ func (s *SubtitleService) Delete(mediaID string) error {
 		}
 		return err
 	}
-	s.deleteVTTFile(&job)
+	s.dropVTT(&job)
 	return s.db.Delete(&job).Error
 }
 
@@ -1047,7 +1077,7 @@ func (s *SubtitleService) BatchDelete(mediaIDs []string) (dto.SubtitleBatchOpRes
 			out.Skipped++
 			continue
 		}
-		s.deleteVTTFile(&job)
+		s.dropVTT(&job)
 		if err := s.db.Delete(&job).Error; err != nil {
 			out.Skipped++
 			log.Printf("[subtitle] batch delete skip media=%s: %v", id, err)
@@ -1158,10 +1188,24 @@ func (s *SubtitleService) deleteVTTFile(job *model.SubtitleJob) {
 // 该约定与前端自定义渲染层配合：前端按 \n 拆分 cue 文本，
 // 第 1 行始终作为主字幕，第 2 行作为可选的"显示原文"开关来源。
 // 已存在的旧字幕（单行译文）天然兼容——拆分结果只有一行，原文为空。
-func writeVTT(absPath string, segs []ASRSegment, translations []string) error {
+// 返回渲染出的 VTT 正文，供调用方一并写入数据库（见 subtitle_vtt.go）。
+func writeVTT(absPath string, segs []ASRSegment, translations []string) ([]byte, error) {
+	body := []byte(renderVTT(segs, translations))
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-		return err
+		return nil, err
 	}
+	tmp := absPath + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, absPath); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// renderVTT 渲染 WebVTT 正文，不触碰磁盘。
+func renderVTT(segs []ASRSegment, translations []string) string {
 	var b strings.Builder
 	b.WriteString("WEBVTT\n\n")
 	for i, seg := range segs {
@@ -1191,11 +1235,7 @@ func writeVTT(absPath string, segs []ASRSegment, translations []string) error {
 		}
 		b.WriteString("\n\n")
 	}
-	tmp := absPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, absPath)
+	return b.String()
 }
 
 // collapseCueLine 清洗单行 cue 文本：

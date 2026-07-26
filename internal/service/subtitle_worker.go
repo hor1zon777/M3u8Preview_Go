@@ -1201,6 +1201,11 @@ func (s *SubtitleService) WorkerComplete(jobID string, meta dto.WorkerCompleteMe
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename vtt: %w", err)
 	}
+	// 同时入库：磁盘文件不在 LiteFS 复制范围内，主备切换后备节点只能从库里读到正文。
+	// 见 subtitle_vtt.go 的迁移策略说明。
+	if err := s.storeVTT(job.MediaID, vttBody); err != nil {
+		return fmt.Errorf("store vtt: %w", err)
+	}
 
 	finished := time.Now()
 	if err := s.db.Model(&model.SubtitleJob{}).Where("id = ?", jobID).Updates(map[string]any{
@@ -1492,8 +1497,7 @@ func (s *SubtitleService) runStaleRecoveryLoop() {
 	defer staleTicker.Stop()
 
 	// 启动时立刻跑一次（处理上次崩溃残留）+ 老化提优先级
-	s.recoverStaleJobsOnce()
-	s.agePendingPriority()
+	s.staleRecoveryPass()
 
 	for {
 		select {
@@ -1502,10 +1506,22 @@ func (s *SubtitleService) runStaleRecoveryLoop() {
 		case <-s.ctx.Done():
 			return
 		case <-staleTicker.C:
-			s.recoverStaleJobsOnce()
-			s.agePendingPriority()
+			s.staleRecoveryPass()
 		}
 	}
+}
+
+// staleRecoveryPass 跑一轮 stale 回收 + 优先级老化。
+//
+// 在主备高可用下，这两件事都是写操作，只能由 primary 做：replica 上的库是只读的，
+// 硬跑会每 30 秒失败一次刷满日志；而且这些任务本来就该由当前持有领导权的节点回收，
+// 让两边同时回收反而会产生重复派发。ticker 本身继续转，等本节点升主后自然恢复。
+func (s *SubtitleService) staleRecoveryPass() {
+	if !s.canWrite() {
+		return
+	}
+	s.recoverStaleJobsOnce()
+	s.agePendingPriority()
 }
 
 // agePendingPriority 老化机制：把 created_at 超过 10min 仍 PENDING/queued 的任务

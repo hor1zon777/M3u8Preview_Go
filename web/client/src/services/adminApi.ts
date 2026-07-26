@@ -6,6 +6,43 @@ async function getSseTicket(): Promise<string> {
   return data.data!.ticket;
 }
 
+/** SSE 连接掉线后允许浏览器自动重连的次数上限。 */
+const SSE_MAX_RETRIES = 3;
+
+/**
+ * SSE 连接中断的统一处理：区分"浏览器会自动重连的瞬时抖动"与"彻底断开"。
+ *
+ * EventSource 原生就会在掉线后自动重连，但前提是我们不调用 close()。
+ * 旧实现一收到 onerror 就 close，等于把浏览器的重连能力关掉了——主备切换、
+ * 反向代理重启这类几秒钟就恢复的抖动会直接让进度流报错中止。
+ *
+ * 判定依据是 readyState：
+ *   CONNECTING —— 浏览器正在自动重连，放它继续，只提示用户
+ *   CLOSED     —— 浏览器已彻底放弃，无法恢复
+ *
+ * 仍然设次数上限：备份导出/恢复的进度流绑定的是服务端内存里的那次操作，
+ * 若节点真的切走了，操作本身已经不存在，无限重连只会一直转圈。
+ */
+function makeSseErrorHandler(
+  get: () => EventSource | null,
+  clear: () => void,
+  onFatal: (message: string) => void,
+): () => void {
+  let retries = 0;
+  return () => {
+    const es = get();
+    if (es && es.readyState === EventSource.CONNECTING && retries < SSE_MAX_RETRIES) {
+      retries += 1;
+      // 复用主备切换提示条，见 components/HaSwitchingBanner.tsx
+      window.dispatchEvent(new CustomEvent('ha:switching'));
+      return;
+    }
+    es?.close();
+    clear();
+    onFatal('连接中断');
+  };
+}
+
 export const adminApi = {
   async getDashboard() {
     const { data } = await api.get<ApiResponse<DashboardStats>>('/admin/dashboard');
@@ -72,6 +109,7 @@ export const adminApi = {
     options: { includePosters?: boolean; includeSubtitles?: boolean },
     onProgress: (progress: ExportProgress) => void,
   ): { abort: () => void } {
+    // 见文件底部 makeSseErrorHandler 的说明。
     const params = new URLSearchParams();
     if (options.includePosters === false) {
       params.set('includePosters', 'false');
@@ -120,16 +158,11 @@ export const adminApi = {
           } catch { /* ignore parse errors */ }
         };
 
-        eventSource.onerror = () => {
-          eventSource?.close();
-          onProgress({
-            phase: 'error',
-            message: '连接中断',
-            current: 0,
-            total: 0,
-            percentage: 0,
-          });
-        };
+        eventSource.onerror = makeSseErrorHandler(
+          () => eventSource,
+          () => { eventSource = null; },
+          (message) => onProgress({ phase: 'error', message, current: 0, total: 0, percentage: 0 }),
+        );
       } catch {
         onProgress({
           phase: 'error',
@@ -239,11 +272,11 @@ export const adminApi = {
           } catch { /* ignore */ }
         };
 
-        eventSource.onerror = () => {
-          eventSource?.close();
-          eventSource = null;
-          onProgress({ phase: 'error', message: '连接中断', current: 0, total: 0, percentage: 0 });
-        };
+        eventSource.onerror = makeSseErrorHandler(
+          () => eventSource,
+          () => { eventSource = null; },
+          (message) => onProgress({ phase: 'error', message, current: 0, total: 0, percentage: 0 }),
+        );
       } catch (err: any) {
         if (err.name !== 'CanceledError' && err.name !== 'AbortError') {
           const msg = err.response?.data?.message || err.message || '上传失败';

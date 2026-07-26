@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
+import { HaSwitchingBanner } from './components/HaSwitchingBanner.js';
 import { useAuth } from './hooks/useAuth.js';
 import { AppLayout } from './components/layout/AppLayout.js';
 import { ProtectedRoute } from './components/auth/ProtectedRoute.js';
@@ -156,6 +157,7 @@ function App() {
       <QueryClientProvider client={queryClient}>
         <BrowserRouter>
           <PendingScrollRestore />
+          <HaSwitchingBanner />
           <AppRoutes />
         </BrowserRouter>
       </QueryClientProvider>

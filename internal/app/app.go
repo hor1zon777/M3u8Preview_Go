@@ -21,6 +21,7 @@ import (
 
 	"github.com/hor1zon777/m3u8-preview-go/internal/config"
 	"github.com/hor1zon777/m3u8-preview-go/internal/handler"
+	"github.com/hor1zon777/m3u8-preview-go/internal/litefs"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
 	"github.com/hor1zon777/m3u8-preview-go/internal/model"
 	"github.com/hor1zon777/m3u8-preview-go/internal/service"
@@ -51,6 +52,14 @@ type Deps struct {
 
 	// 字幕模块（可选；cfg.Subtitle.Enabled=false 时为 nil）
 	SubtitleSvc *service.SubtitleService
+
+	// LiteFS 主备角色感知。未配置 LITEFS_DIR 时同样非 nil，只是恒为 primary，
+	// 让调用方无需到处判空。
+	LiteFS *litefs.Provider
+
+	// HAEpoch 由 internal/ha 在启用租约仲裁后注入，供 /api/health 上报租约世代号。
+	// nil 表示未启用租约仲裁。
+	HAEpoch func() int64
 }
 
 // NewDeps 构造跨请求 singleton。
@@ -60,9 +69,17 @@ func NewDeps(cfg *config.Config, db *gorm.DB) *Deps {
 	if err != nil {
 		log.Fatalf("[app] load ecdh private key: %v", err)
 	}
+	// LiteFS 角色感知：未配置 LITEFS_DIR 时构造出的 Provider 恒为 primary 且不起协程。
+	lfs := litefs.New(cfg.HA.LiteFSDir, cfg.SQLitePath())
+	lfs.Start()
+	if lfs.Enabled() {
+		log.Printf("[app] LiteFS 角色感知已启用: dir=%s role=%s", cfg.HA.LiteFSDir, lfs.Role())
+	}
+
 	return &Deps{
 		Cfg:            cfg,
 		DB:             db,
+		LiteFS:         lfs,
 		JWT:            util.NewJWTService(&cfg.JWT),
 		Ticket:         util.NewSSETicketStore(),
 		Proxy:          util.NewProxySigner(cfg.Proxy.Secret, cfg.Proxy.SignatureTTL),
@@ -131,7 +148,26 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 		c.File(fullPath)
 	})
 
-	r.GET("/api/health", handler.Health)
+	// /api/health 无鉴权、无副作用，且在 replica 上同样返回 200——
+	// 它是 worker 选节点与对端故障探测的唯一信号，详见 handler.NodeStatus。
+	r.GET("/api/health", handler.Health(func() handler.NodeStatus {
+		st := handler.NodeStatus{
+			Role:     string(deps.LiteFS.Role()),
+			NodeID:   cfg.HA.NodeID,
+			TXID:     deps.LiteFS.TXID(),
+			Draining: deps.LiteFS.Draining(),
+		}
+		// SubtitleSvc 在 Build 后段才构造，这里靠闭包延迟读取。
+		if deps.SubtitleSvc != nil {
+			if b := deps.SubtitleSvc.AudioBroker(); b != nil {
+				st.BusyStreams = b.PendingFetches()
+			}
+		}
+		if deps.HAEpoch != nil {
+			st.Epoch = deps.HAEpoch()
+		}
+		return st
+	}))
 
 	// /api/v1 路由组 + 全局限流（enableRateLimit=true 时才起作用；管理员 settings 请求 bypass）
 	v1 := r.Group("/api/v1")
@@ -141,6 +177,10 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 		globalLimiterMW,
 		middleware.IsRateLimitToggleRequest,
 	))
+
+	// 只读副本写拦截：replica / 交接停写期间，非 GET 请求一律 503 + Retry-After。
+	// 放在限流之后、业务路由之前，让被拦下的写请求不消耗业务侧资源。
+	v1.Use(middleware.RequirePrimary(deps.LiteFS))
 
 	// ---- Auth 模块 ----
 	authSvc := service.NewAuthService(db, deps.JWT, cfg)
@@ -350,6 +390,11 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 		return service.NewOpenAICompatibleTranslator(snap.TranslateBaseURL, snap.TranslateAPIKey, snap.TranslateModel, snap.MaxRetries)
 	}
 	subtitleSvc := service.NewSubtitleService(db, &cfg.Subtitle, asrFactory, translatorFactory, deps.Proxy, cfg.UploadsDir, cfg.PublicBaseURL)
+	// stale 回收 / 优先级老化是写操作，只能由 primary 跑（见 staleRecoveryPass）。
+	subtitleSvc.SetWritableGate(func() bool {
+		ok, _ := deps.LiteFS.AllowWrite()
+		return ok
+	})
 	if err := subtitleSvc.Start(); err != nil {
 		// 启动失败不阻断整个 server；handler 仍会返回 disabled
 		log.Printf("[subtitle] start failed: %v (feature disabled)", err)

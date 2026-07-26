@@ -89,6 +89,30 @@ type SubtitleJob struct {
 // TableName 显式指定，避免复数变形规则差异。
 func (SubtitleJob) TableName() string { return "subtitle_jobs" }
 
+// SubtitleVTT 存放字幕正文，与 subtitle_jobs 按 media_id 一对一。
+//
+// 为什么把正文搬进数据库：主备双节点用 LiteFS 复制 SQLite（见 docs/ha-failover.md），
+// 它只复制数据库文件，磁盘上的 .vtt 不在复制范围内。故障切换后备节点能看到任务
+// 状态却拿不到字幕内容，等于字幕功能整体失效。字幕正文只有几十 KB 文本，
+// 入库后随复制天然同步，一致性最干净。
+//
+// 为什么单独一张表而不是给 subtitle_jobs 加一列：字幕正文是大字段，
+// 而 job 行会被状态轮询、admin 列表、claim 查询等高频读取；
+// 拆表让那些查询不必顺带把正文捞出来。
+//
+// 磁盘上的 .vtt 文件仍然保留（写双份、读优先库），
+// 用于兼容尚未回填的历史数据与既有的备份/恢复流程。
+type SubtitleVTT struct {
+	MediaID   string    `gorm:"column:media_id;primaryKey;type:text" json:"mediaId"`
+	Content   string    `gorm:"type:text;not null" json:"-"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updatedAt"`
+
+	Media *Media `gorm:"foreignKey:MediaID;references:ID;constraint:OnDelete:CASCADE" json:"-"`
+}
+
+// TableName 显式指定，避免复数变形规则差异。
+func (SubtitleVTT) TableName() string { return "subtitle_vtts" }
+
 // BeforeCreate 自动生成 UUID 主键。
 func (s *SubtitleJob) BeforeCreate(tx *gorm.DB) error {
 	if s.ID == "" {

@@ -51,6 +51,7 @@ func newTestSubtitleService(t *testing.T, staleThreshold time.Duration) (*Subtit
 		&model.Tag{},
 		&model.Media{},
 		&model.SubtitleJob{},
+		&model.SubtitleVTT{},
 		&model.SubtitleWorkerToken{},
 		&model.SubtitleWorker{},
 	); err != nil {

@@ -1,0 +1,74 @@
+# 主备双节点高可用叠加层（完整设计见 docs/ha-failover.md）。
+#
+# 用法（两台机器各跑一份，只有 .env 里的节点身份不同）：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d
+#
+# 基础的 docker-compose.yml 保持单机语义不变——不叠加本文件的部署完全不受影响。
+#
+# 上线前必须确认宿主内核支持 FUSE（这是唯一 Docker 管不到的前提）：
+#   ls -l /dev/fuse
+# KVM 型 VPS 基本都有；OpenVZ / LXC 容器型 VPS 可能没有，那样 LiteFS 方案不可行。
+
+services:
+  app:
+    # FUSE 挂载所需权限。官方省事写法是 privileged: true，这里是缩小权限后的等价配置。
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+
+    # 用 hosts 映射而不是公开 DNS 记录指向对端：既能用主机名做 TLS 证书校验，
+    # 又不会把源站 IP 暴露到公开 DNS（那会抵消主域名橙云的 DDoS 防护）。
+    # HA_PEER_HOSTNAME 需与对端 nginx 证书里的名字一致。
+    extra_hosts:
+      - "${HA_PEER_HOSTNAME}:${HA_PEER_PUBLIC_IP}"
+
+    volumes:
+      # LiteFS 内部数据与 LTX 事务文件，必须持久化，否则每次重启都要全量重建。
+      - ./litefs:/var/lib/litefs
+      # 节点间通道用的自签证书（对端 CA 由 entrypoint 装进容器信任链）。
+      - ./certs:/etc/nginx/certs:ro
+
+    environment:
+      # 数据库改到 LiteFS 挂载根。LiteFS 不支持子目录，DB 必须直接放在挂载点下。
+      - DATABASE_URL=file:/litefs/m3u8preview.db
+      - LITEFS_DIR=/litefs
+
+      # --- 节点身份（两台必须不同）---
+      - HA_NODE_ID=${HA_NODE_ID}
+      - HA_PEER_ID=${HA_PEER_ID}
+      # 只有"主"那台设 true：它决定自动回切的方向、首次引导的先后、
+      # 以及 Cloudflare 不可达时谁被允许自升主。
+      - HA_PREFERRED=${HA_PREFERRED:-false}
+      # 人工接管逃生舱：设成 primary / replica 可跳过全部仲裁逻辑。
+      - HA_FORCE_ROLE=${HA_FORCE_ROLE:-}
+
+      # --- 节点间地址 ---
+      - HA_SELF_ADVERTISE_URL=${HA_SELF_ADVERTISE_URL}
+      - HA_PEER_ADVERTISE_URL=${HA_PEER_ADVERTISE_URL}
+      - HA_PEER_BASE_URL=${HA_PEER_BASE_URL}
+      - HA_PEER_CA_FILE=/etc/nginx/certs/peer-ca.crt
+      - HA_SELF_PUBLIC_IP=${HA_SELF_PUBLIC_IP}
+      - HA_PEER_PUBLIC_IP=${HA_PEER_PUBLIC_IP}
+
+      # --- Cloudflare（租约仲裁 + DNS 切换）---
+      # Token 权限收窄到 Zone → DNS → Edit，且只授权这一个 zone。
+      - CF_API_TOKEN=${CF_API_TOKEN}
+      - CF_ZONE_ID=${CF_ZONE_ID}
+      - HA_DNS_RECORD=${HA_DNS_RECORD}
+      - HA_LEASE_RECORD=${HA_LEASE_RECORD}
+      - HA_HANDOFF_RECORD=${HA_HANDOFF_RECORD}
+
+      # 实测 appuser 无法在 /litefs 下写库时改为 1（见 litefs-exec.sh 注释）。
+      - LITEFS_RUN_AS_ROOT=${LITEFS_RUN_AS_ROOT:-0}
+
+  nginx:
+    volumes:
+      - ./nginx-litefs.conf:/etc/nginx/templates/litefs.conf.template:ro
+      - ./certs:/etc/nginx/certs:ro
+    environment:
+      - LITEFS_CHANNEL_PORT=${LITEFS_CHANNEL_PORT:-20203}
+      - LITEFS_PEER_IP=${HA_PEER_PUBLIC_IP}

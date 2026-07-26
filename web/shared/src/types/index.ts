@@ -264,6 +264,11 @@ export interface ApiResponse<T = unknown> {
   data?: T;
   message?: string;
   error?: string;
+  /**
+   * 机器可读错误码（服务端 dto.APIResponse.Code）。
+   * 例如主备切换期间只读副本拒绝写请求时为 'NODE_READ_ONLY'。
+   */
+  code?: string;
 }
 
 export interface PaginatedResponse<T> {

@@ -18,8 +18,14 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/app"
 	"github.com/hor1zon777/m3u8-preview-go/internal/config"
 	"github.com/hor1zon777/m3u8-preview-go/internal/db"
+	"github.com/hor1zon777/m3u8-preview-go/internal/ha"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
+	"github.com/hor1zon777/m3u8-preview-go/internal/version"
 )
+
+// resolveRoleTimeout 是开机角色决议的总超时。
+// 需要覆盖首次部署时非首选节点的等让时长（30s）加上几次 API 往返。
+const resolveRoleTimeout = 2 * time.Minute
 
 func main() {
 	projectRoot, err := os.Getwd()
@@ -28,6 +34,13 @@ func main() {
 	}
 	if filepath.Base(projectRoot) == "server" {
 		projectRoot = filepath.Dir(filepath.Dir(projectRoot))
+	}
+
+	// 子命令必须在连接数据库之前处理：ha-resolve-role 由 docker-entrypoint.sh
+	// 在 LiteFS 挂载**之前**调用，此时数据库文件还不存在。
+	if len(os.Args) > 1 && os.Args[1] == "ha-resolve-role" {
+		runResolveRole(projectRoot)
+		return
 	}
 
 	cfg := config.MustLoad(projectRoot)
@@ -61,6 +74,24 @@ func main() {
 
 	engine, deps := app.Build(cfg, gdb)
 
+	// 主备领导权仲裁。未启用时 haAgent 为 nil，其方法与通道都能安全地零值使用。
+	haAgent, err := ha.New(cfg.HA, deps.LiteFS, func() int {
+		if deps.SubtitleSvc == nil {
+			return 0
+		}
+		if b := deps.SubtitleSvc.AudioBroker(); b != nil {
+			return b.PendingFetches()
+		}
+		return 0
+	})
+	if err != nil {
+		log.Fatalf("ha agent: %v", err)
+	}
+	if haAgent != nil {
+		deps.HAEpoch = haAgent.Epoch
+		haAgent.Start()
+	}
+
 	addr := fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.Port)
 	srv := &http.Server{
 		Addr:              addr,
@@ -72,6 +103,7 @@ func main() {
 	go func() {
 		log.Printf("Server running on http://%s", addr)
 		log.Printf("Environment: %s", cfg.NodeEnv)
+		log.Printf("Version: %s (built %s)", version.String(), version.BuildTime)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
@@ -80,20 +112,56 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("forced shutdown: %v", err)
+		}
+		haAgent.Close()
+		// 停止字幕 worker（取消运行中的 ffmpeg/whisper 子进程）
+		if deps != nil && deps.SubtitleSvc != nil {
+			deps.SubtitleSvc.Stop()
+		}
+		if deps != nil && deps.LiteFS != nil {
+			deps.LiteFS.Close()
+		}
+		log.Println("HTTP server closed")
+	}
+
 	select {
 	case err := <-serverErr:
 		log.Fatalf("server error: %v", err)
 	case sig := <-quit:
 		log.Printf("%s received, shutting down gracefully...", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Fatalf("forced shutdown: %v", err)
-		}
-		// 停止字幕 worker（取消运行中的 ffmpeg/whisper 子进程）
-		if deps != nil && deps.SubtitleSvc != nil {
-			deps.SubtitleSvc.Stop()
-		}
-		log.Println("HTTP server closed")
+		shutdown()
+	case reason := <-haAgent.SwitchRequested():
+		// LiteFS 的 static 租约在 litefs.yml 里静态声明 candidate，换角色只能重新
+		// mount。因此这里主动退出，由 litefs 跟随退出、容器 restart 策略拉起，
+		// entrypoint 重新决议角色后以新身份挂载。
+		log.Printf("[ha] %s；退出进程以新角色重启", reason)
+		shutdown()
+	}
+}
+
+// runResolveRole 执行开机角色决议并把结果写成 shell 可 source 的 env 文件。
+//
+// 失败时以非零码退出，由 docker-entrypoint.sh 决定兜底策略（保守起为 replica）。
+func runResolveRole(projectRoot string) {
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("[ha] 加载配置失败: %v", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), resolveRoleTimeout)
+	defer cancel()
+
+	res := ha.Resolve(ctx, cfg.HA)
+	log.Printf("[ha] 开机角色决议: role=%s epoch=%d 依据=%s", res.Role, res.Epoch, res.Reason)
+
+	if err := ha.WriteRoleEnv(cfg.HA.RoleFilePath, res); err != nil {
+		log.Printf("[ha] %v", err)
+		os.Exit(1)
 	}
 }

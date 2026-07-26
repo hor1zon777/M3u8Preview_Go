@@ -1,0 +1,52 @@
+# LiteFS 配置（主备高可用，完整设计见 docs/ha-failover.md）。
+#
+# 本文件在构建时被复制到镜像的 /etc/litefs.yml。
+# 角色相关的三个变量由 docker-entrypoint.sh 在挂载前的"开机角色决议"填充：
+#
+#   LITEFS_CANDIDATE     true = 本节点是 primary（可写），false = replica（只读）
+#   LITEFS_SELF_HOST     本节点在集群里的 hostname
+#   LITEFS_PRIMARY_URL   当前 primary 的 LiteFS API 地址（两端都填当前 primary）
+#
+# 决议结果每次容器启动都会重新计算，绝不沿用上次的角色——旧主崩溃期间领导权
+# 可能已被切走，沿用本地状态就会出现双主。
+
+fuse:
+  # 应用访问数据库的目录。LiteFS 不支持子目录，DB 必须直接放在挂载根，
+  # 因此 DATABASE_URL 要设成 file:/litefs/m3u8preview.db。
+  dir: "/litefs"
+
+  # 必须开启：LiteFS 以 root 挂载 FUSE，而 server 降权到 appuser 运行。
+  # 依赖镜像里已写入 /etc/fuse.conf 的 user_allow_other。
+  allow-other: true
+
+data:
+  # LiteFS 内部数据与 LTX 事务文件。必须挂在持久卷上，否则每次重启都要全量重建。
+  dir: "/var/lib/litefs"
+
+  # LTX 保留时长。默认 10m 偏短：主节点下线超过保留期后回归，会触发全量快照传输。
+  # 放宽到 1h 让常见的重启 / 短时故障走增量追赶，代价是磁盘多占一些事务文件。
+  retention: "1h"
+  retention-monitor-interval: "5m"
+
+# 启动校验失败时不要直接退出。
+# 交接过程中会短暂出现"两端都是 replica"的窗口（旧主已让位、新主尚未完成重启），
+# 此时连不上 primary 属于预期状态，退出只会让容器陷入重启风暴。
+exit-on-error: false
+
+http:
+  # 只绑回环。LiteFS 的节点间 API 自身没有任何认证，官方明确要求不可公网可达；
+  # 对外由 nginx 在 20203 端口做 TLS + IP 白名单 + 共享密钥转发（见 nginx-litefs.conf）。
+  addr: "127.0.0.1:20202"
+
+lease:
+  # static：领导权由外部（Cloudflare DNS TXT 租约）裁决，LiteFS 自身不做选举。
+  # 不用 consul 是因为两节点无法组成安全的 quorum，而用户不接受第三台机器。
+  type: "static"
+
+  candidate: ${LITEFS_CANDIDATE}
+  hostname: "${LITEFS_SELF_HOST}"
+  advertise-url: "${LITEFS_PRIMARY_URL}"
+
+exec:
+  # 交给包装脚本决定以 root 还是 appuser 运行，见 litefs-exec.sh。
+  - cmd: "/usr/local/bin/litefs-exec.sh"

@@ -131,6 +131,17 @@ func (b *AudioBroker) SetTimeouts(holdSec, firstByteSec int) {
 	}
 }
 
+// PendingFetches 返回当前正在等待 FLAC 的 fetch 协调对象数量。
+//
+// 用于主备高可用的计划内交接（回切）判定：broker 是纯内存桥接（io.Pipe），
+// 强行切换节点会把正在传输的音频流拦腰截断，因此 internal/ha 会等这个数字归零
+// 再执行交接。它只是一个瞬时快照，调用方应容忍读到之后立刻变化。
+func (b *AudioBroker) PendingFetches() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pendingFetches)
+}
+
 // AudioFetchTask 是服务端通过 long-poll 下发给 audio worker 的指令。
 //
 // Action 取值：

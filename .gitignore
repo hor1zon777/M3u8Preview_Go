@@ -16,6 +16,8 @@ build-errors.log
 /data/*.db-shm
 # 登录加密协议 ECDH 私钥（自动生成，绝不入库）
 /data/ecdh.pem
+# 主备高可用的开机角色决议结果（每次容器启动重写，属机器本地状态）
+/data/litefs-role*
 # whisper.cpp GGML 模型（数百 MB ~ GB 级，绝不入库）
 /data/whisper/
 /uploads/posters/*

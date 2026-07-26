@@ -145,6 +145,106 @@ type SubtitleConfig struct {
 	MaxConcurrentTasksHint int
 }
 
+// HAConfig 主备双节点高可用配置（完整设计见 docs/ha-failover.md）。
+//
+// 三档渐进式开关，方便分阶段上线：
+//
+//	1. LiteFSDir 为空
+//	   完全单机模式：角色恒为 primary，写入不受限，不启动任何 HA 协程。
+//	   本地 Windows 开发与既有单机部署都落在这一档，无需配置任何 HA 变量。
+//
+//	2. LiteFSDir 非空、CF 参数不全
+//	   只做角色感知：读 <LiteFSDir>/.primary 判定自己是 primary 还是 replica，
+//	   据此决定是否放行写请求、是否跑后台写循环。不参与租约仲裁、不切 DNS。
+//	   适合"先手工验证 LiteFS 复制、暂不接管自动切换"的过渡期。
+//
+//	3. 全部配齐
+//	   完整 HA：Cloudflare DNS TXT 租约仲裁 + 自动故障切换 + 自动回切。
+//
+// 注意：故障切换的时间参数（续租周期、租约 TTL、自降级死线、夺取保护期）
+// 刻意不做成环境变量——它们之间存在必须满足的安全不等式
+//
+//	自降级死线 < 租约 TTL < 夺取保护期
+//
+// 一旦被误配置就会出现双主。这些常量固定在 internal/ha 包内，见该包文档。
+type HAConfig struct {
+	// LiteFSDir LiteFS FUSE 挂载目录（生产为 "/litefs"）。
+	// 空 = 未启用 LiteFS，角色恒为 primary。
+	LiteFSDir string
+
+	// NodeID 本节点标识（如 "node-a"）。两台机器必须不同。
+	NodeID string
+	// PeerID 对端节点标识（如 "node-b"）。
+	PeerID string
+	// Preferred 标记本节点是不是"主"（两台里只有一台为 true）。
+	//
+	// 它决定三件事，都是二选一的决断，用布尔比数值优先级更贴切：
+	//   - 自动回切：只有 Preferred 节点会在恢复后请求交还领导权
+	//   - 首次引导：Preferred 立即创建租约，另一台先等一会儿避免同时创建
+	//   - Cloudflare 不可达时的开机兜底：只有 Preferred 允许自升主，
+	//     从而保证任何时刻至多一个节点能走这条无仲裁的路径
+	Preferred bool
+
+	// ForceRole 人工接管开关（"primary" / "replica"）。
+	// 非空时开机决议直接采用它，跳过全部仲裁逻辑——这是排障与灰度期的逃生舱。
+	ForceRole string
+
+	// PeerBaseURL 对端节点 App 的可达地址（如 "https://node-b.example.com"）。
+	// 用于 §6 决策规则中的"直连探测"信号——正是这个独立于 Cloudflare 的
+	// 第二信号，让"CF API 故障"与"主备互相断网"两种情况不会被误判为节点宕机。
+	PeerBaseURL string
+	// PeerCAFile 可选：探测对端时额外信任的 CA 证书（PEM）。
+	// 节点间用自签证书直连时填它，避免退化成 InsecureSkipVerify。
+	PeerCAFile string
+
+	// SelfAdvertiseURL 本节点 LiteFS API 的对外地址（如 "https://node-a.internal:20203"）。
+	// 本节点是 primary 时写进 litefs.yml 的 advertise-url。
+	SelfAdvertiseURL string
+	// PeerAdvertiseURL 对端 LiteFS API 地址。本节点是 replica 时用它找 primary。
+	PeerAdvertiseURL string
+
+	// PeerPublicIP 对端公网 IP。计划内交接时由旧 owner 把 A 记录改指向对端，
+	// 缩短"DNS 还指着旧节点但它已经不可写"的窗口。
+	PeerPublicIP string
+
+	// RoleFilePath 开机角色决议结果的落盘路径（默认 <DataDir>/litefs-role）。
+	// entrypoint 在 litefs 挂载前调用 `server ha-resolve-role` 写入本文件，
+	// 再据此展开 litefs.yml 里的 ${LITEFS_CANDIDATE}。
+	RoleFilePath string
+
+	// SelfPublicIP 本节点公网 IP，用于把主域名 A 记录改指向自己。
+	SelfPublicIP string
+
+	// --- Cloudflare ---
+
+	// CFAPIToken 权限应收窄到 Zone → DNS → Edit，且只授权目标 zone。
+	CFAPIToken string
+	// CFZoneID 目标 zone ID。
+	CFZoneID string
+	// CFRecordName 用户流量的 A 记录全名（如 "media.example.com"）。
+	CFRecordName string
+	// CFLeaseRecord 租约 TXT 记录全名（如 "_ha-lease.example.com"）。
+	CFLeaseRecord string
+	// CFHandoffRecord 回切请求 TXT 记录全名（如 "_ha-handoff.example.com"）。
+	// 与租约记录分开是为了让两个节点永不写同一条记录，从结构上消除写竞态。
+	CFHandoffRecord string
+}
+
+// LiteFSEnabled 是否启用 LiteFS 角色感知（档位 2 及以上）。
+func (h HAConfig) LiteFSEnabled() bool { return h.LiteFSDir != "" }
+
+// LeaseEnabled 是否启用 Cloudflare 租约仲裁（档位 3）。
+// 任一必填项缺失都会退回档位 2，而不是带着半套配置去做危险的自动切换。
+func (h HAConfig) LeaseEnabled() bool {
+	return h.LiteFSEnabled() &&
+		h.NodeID != "" && h.PeerID != "" && h.NodeID != h.PeerID &&
+		h.PeerBaseURL != "" &&
+		h.SelfAdvertiseURL != "" && h.PeerAdvertiseURL != "" &&
+		h.CFAPIToken != "" && h.CFZoneID != "" &&
+		h.CFRecordName != "" && h.CFLeaseRecord != "" && h.CFHandoffRecord != "" &&
+		h.SelfPublicIP != "" && h.PeerPublicIP != ""
+}
+
 type Config struct {
 	Port         int
 	BindAddress  string
@@ -172,6 +272,8 @@ type Config struct {
 	ECDHPrivateKeyPath   string
 	ThumbnailConcurrency int
 	PosterConcurrency    int
+	// HA 主备高可用；未配置时全部为零值，行为与改造前完全一致。
+	HA HAConfig
 }
 
 // 已知的弱默认值：这些值出现在生产必须 fatal
@@ -281,6 +383,30 @@ func Load(projectRoot string) (*Config, error) {
 		cfg.ECDHPrivateKeyPath = p
 	} else {
 		cfg.ECDHPrivateKeyPath = filepath.Join(cfg.DataDir, "ecdh.pem")
+	}
+
+	// HA：全部可选。LITEFS_DIR 未设置时整块保持零值，服务行为与单机部署一致。
+	cfg.HA = HAConfig{
+		LiteFSDir:       strings.TrimRight(os.Getenv("LITEFS_DIR"), "/"),
+		NodeID:          strings.TrimSpace(os.Getenv("HA_NODE_ID")),
+		PeerID:          strings.TrimSpace(os.Getenv("HA_PEER_ID")),
+		Preferred:        parseBoolDefault(os.Getenv("HA_PREFERRED"), false),
+		ForceRole:        strings.ToLower(strings.TrimSpace(os.Getenv("HA_FORCE_ROLE"))),
+		PeerBaseURL:      strings.TrimRight(os.Getenv("HA_PEER_BASE_URL"), "/"),
+		PeerCAFile:       strings.TrimSpace(os.Getenv("HA_PEER_CA_FILE")),
+		SelfAdvertiseURL: strings.TrimRight(os.Getenv("HA_SELF_ADVERTISE_URL"), "/"),
+		PeerAdvertiseURL: strings.TrimRight(os.Getenv("HA_PEER_ADVERTISE_URL"), "/"),
+		PeerPublicIP:     strings.TrimSpace(os.Getenv("HA_PEER_PUBLIC_IP")),
+		RoleFilePath:     os.Getenv("HA_ROLE_FILE"),
+		SelfPublicIP:     strings.TrimSpace(os.Getenv("HA_SELF_PUBLIC_IP")),
+		CFAPIToken:      strings.TrimSpace(os.Getenv("CF_API_TOKEN")),
+		CFZoneID:        strings.TrimSpace(os.Getenv("CF_ZONE_ID")),
+		CFRecordName:    strings.TrimSpace(os.Getenv("HA_DNS_RECORD")),
+		CFLeaseRecord:   strings.TrimSpace(os.Getenv("HA_LEASE_RECORD")),
+		CFHandoffRecord: strings.TrimSpace(os.Getenv("HA_HANDOFF_RECORD")),
+	}
+	if cfg.HA.RoleFilePath == "" {
+		cfg.HA.RoleFilePath = filepath.Join(cfg.DataDir, "litefs-role")
 	}
 
 	// 默认绑定地址：生产 127.0.0.1，开发 0.0.0.0

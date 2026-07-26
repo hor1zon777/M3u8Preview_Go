@@ -45,10 +45,22 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
 
+      # .dockerignore 排除了 .git，构建阶段拿不到仓库历史，
+      # 因此 commit 与构建时间在这里算好后通过 build-arg 传进去。
+      # 版本号本身由 Dockerfile 直接读构建上下文里的 VERSION 文件。
+      - name: Prepare build metadata
+        id: buildmeta
+        run: |
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
+          build-args: |
+            GIT_COMMIT=${{ steps.buildmeta.outputs.commit }}
+            BUILD_TIME=${{ steps.buildmeta.outputs.time }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

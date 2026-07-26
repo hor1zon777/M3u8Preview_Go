@@ -46,6 +46,41 @@ api.interceptors.request.use((config) => {
 // Auth endpoints where 401 means "wrong credentials", not "token expired"
 const AUTH_ENDPOINTS = ['/auth/login', '/auth/register', '/auth/refresh'];
 
+/**
+ * 主备切换期间，只读副本会用 503 + 这个 code 拒绝写请求（服务端 middleware.RequirePrimary）。
+ * 详见 docs/ha-failover.md。
+ */
+const NODE_READ_ONLY = 'NODE_READ_ONLY';
+
+/** 最多自动重试几次；配合 Retry-After（默认 5s）大约覆盖 15 秒的切换窗口。 */
+const HA_MAX_RETRIES = 3;
+
+/** 服务端未给 Retry-After 时的默认退避秒数。 */
+const HA_FALLBACK_RETRY_SEC = 5;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 主备切换窗口内的写请求自动重试。
+ *
+ * 之所以敢自动重试非幂等的 POST/PUT/DELETE：这个 503 是由路由层中间件在
+ * **业务 handler 执行之前**返回的，请求对服务端没有产生任何副作用，重放是安全的。
+ * 若换成在业务层判断，就没有这个保证了。
+ */
+function haRetryDelayMs(error: any): number | null {
+  const res = error?.response;
+  if (res?.status !== 503 || res?.data?.code !== NODE_READ_ONLY) return null;
+
+  const cfg = error.config;
+  if (!cfg) return null;
+  cfg._haRetryCount = (cfg._haRetryCount ?? 0) + 1;
+  if (cfg._haRetryCount > HA_MAX_RETRIES) return null;
+
+  const header = Number(res.headers?.['retry-after']);
+  const sec = Number.isFinite(header) && header > 0 ? header : HA_FALLBACK_RETRY_SEC;
+  return sec * 1000;
+}
+
 // Response interceptor - auto refresh token on 401
 api.interceptors.response.use(
   (response) => {
@@ -68,6 +103,15 @@ api.interceptors.response.use(
   },
   async (error) => {
     const originalRequest = error.config;
+
+    // 主备切换：当前节点是只读副本（或正在交接领导权）。这是秒级的瞬态状态，
+    // 退避重试比把错误抛给用户合适——切换完成后（DNS 也会随之移动）请求自然成功。
+    const haDelay = haRetryDelayMs(error);
+    if (haDelay !== null) {
+      window.dispatchEvent(new CustomEvent('ha:switching'));
+      await sleep(haDelay);
+      return api(originalRequest);
+    }
 
     // Skip refresh logic for auth endpoints — their 401 is a business error
     const isAuthEndpoint = AUTH_ENDPOINTS.some(ep => originalRequest.url?.includes(ep));

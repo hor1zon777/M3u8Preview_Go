@@ -32,6 +32,10 @@ fi
 
 # 3) 非 root 场景：直接 exec（已被 USER appuser 切换）
 if [ "$(id -u)" -ne 0 ]; then
+  if [ -n "${LITEFS_DIR:-}" ]; then
+    echo "[entrypoint] 错误: LiteFS 需要 root 挂载 FUSE，当前 uid=$(id -u)" >&2
+    exit 1
+  fi
   exec "$@"
 fi
 
@@ -54,6 +58,55 @@ else
       find "$d" -uid 0 -exec chown appuser:appgroup {} + 2>/dev/null || true
     fi
   done
+fi
+
+# 5) LiteFS 主备模式（见 docs/ha-failover.md）
+#
+# 未设置 LITEFS_DIR 时整段跳过，单机部署行为与改造前完全一致。
+#
+# 关键点：开机角色决议必须在 litefs mount **之前**完成——static 租约的 candidate
+# 是在 litefs.yml 里静态声明的，挂载后无法更改。而决议本身又不能沿用上次的角色：
+# 旧主崩溃期间领导权可能已被切走，它回归时若直接起为主就是双主。因此每次容器
+# 启动都重新向 Cloudflare 租约与对端 /api/health 求证一次。
+if [ -n "${LITEFS_DIR:-}" ]; then
+  # 把对端的自签 CA 装进容器信任链。
+  # LiteFS 自身没有任何认证机制，节点间通道靠 nginx 的 TLS + IP 白名单保护；
+  # 装 CA 而不是关闭校验，是为了让这条通道不可被中间人劫持——它同时也是
+  # "对端是否存活"的判定依据之一，被劫持等于把切主决策交给了攻击者。
+  if [ -n "${HA_PEER_CA_FILE:-}" ] && [ -f "$HA_PEER_CA_FILE" ]; then
+    cp "$HA_PEER_CA_FILE" /usr/local/share/ca-certificates/ha-peer.crt
+    update-ca-certificates >/dev/null 2>&1 || \
+      echo "[entrypoint] 警告: 安装对端 CA 失败，LiteFS 复制可能因证书校验失败而无法建立" >&2
+  fi
+
+  ROLE_FILE="${HA_ROLE_FILE:-$DATA_DIR/litefs-role}"
+
+  if /app/server ha-resolve-role; then
+    # shellcheck source=/dev/null
+    . "$ROLE_FILE"
+  else
+    # 决议失败的兜底：区分两种部署形态，避免一刀切造成不必要的只读。
+    #   配了 Cloudflare 租约 → 双节点，保守起为 replica（宁可只读也不冒双主风险）
+    #   没配                → 单节点用 LiteFS，起为 primary 才能正常提供服务
+    LITEFS_SELF_HOST="${HA_NODE_ID:-$(hostname)}"
+    if [ -n "${CF_API_TOKEN:-}" ]; then
+      echo "[entrypoint] 角色决议失败，保守起为只读副本" >&2
+      LITEFS_CANDIDATE=false
+      LITEFS_PRIMARY_URL="${HA_PEER_ADVERTISE_URL:-}"
+    else
+      echo "[entrypoint] 角色决议失败且未配置租约仲裁，起为 primary" >&2
+      LITEFS_CANDIDATE=true
+      LITEFS_PRIMARY_URL="${HA_SELF_ADVERTISE_URL:-}"
+    fi
+  fi
+
+  export LITEFS_CANDIDATE LITEFS_SELF_HOST LITEFS_PRIMARY_URL
+  echo "[entrypoint] LiteFS 启动: candidate=${LITEFS_CANDIDATE} host=${LITEFS_SELF_HOST} primary=${LITEFS_PRIMARY_URL}"
+
+  # litefs mount 作为 supervisor：挂载 FUSE、连上集群后再按 litefs.yml 的 exec
+  # 启动 server，并把信号转发给子进程。
+  # 注意 CMD（"$@"）在这条路径上不生效，启动命令由 litefs-exec.sh 决定。
+  exec litefs mount
 fi
 
 exec su-exec appuser:appgroup "$@"
