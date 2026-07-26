@@ -13,6 +13,7 @@ M3u8Preview 的 Go 版**全栈**项目（Gin 后端 + React/Vite 前端 + nginx�
   - [m3u8-preview-worker](../m3u8-preview-worker) — GPU 机：通过服务端 broker 实时拉 FLAC + ASR + 翻译 + 写 VTT
   - 服务端只做任务派发 + broker 实时桥接（**0 持久化音频文件**）+ VTT 仓库；保留本地 whisper.cpp 兼容模式
   - 协议详见 [`docs/worker-protocol.md`](docs/worker-protocol.md)；架构详见 [`m3u8-preview-worker/docs/distributed-worker.md`](../m3u8-preview-worker/docs/distributed-worker.md)
+- **高可用**（可选）：两台 VPS 主备自动切换 —— LiteFS 复制 SQLite + Cloudflare DNS TXT 租约仲裁，不需要第三台机器。不启用时完全是单机部署，见 [`docs/ha-failover.md`](docs/ha-failover.md)
 - **目标**：单仓库一键 `docker compose up` 即获得完整服务
 
 ---
@@ -21,6 +22,7 @@ M3u8Preview 的 Go 版**全栈**项目（Gin 后端 + React/Vite 前端 + nginx�
 
 - [快速开始](#快速开始)
 - [版本号](#版本号)
+- [主备双节点高可用（可选）](#主备双节点高可用可选)
 - [安全架构](#安全架构)
 - [从 TS 版 M3u8Preview_R 迁移](#从-ts-版-m3u8preview_r-迁移)
 - [从命名卷升级到 bind mount](#从命名卷升级到-bind-mount)
@@ -94,6 +96,17 @@ docker build -t m3u8preview-go:latest .
 - `m3u8preview-go-app`：跑 Go 二进制 + 把前端 `dist-image` 每次启动 `rsync` 到 `client-dist` volume
 - `m3u8preview-go-nginx`：官方 `nginx:alpine` 只读挂 `client-dist` + 本项目的 `nginx.conf`
 
+本地构建时可注入版本信息（CI 会自动传，见 [版本号](#版本号)）：
+
+```bash
+docker build \
+  --build-arg GIT_COMMIT="$(git rev-parse --short HEAD)" \
+  --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t m3u8preview-go:latest .
+```
+
+> 需要两台 VPS 主备自动切换，见 [主备双节点高可用](#主备双节点高可用可选)——叠加一个 compose 文件即可，本节的单机部署不受影响。
+
 ### 方式 C — 仅容器化后端（开发后端、前端本机跑）
 
 ```bash
@@ -139,6 +152,73 @@ go build -ldflags "-X $PKG.Version=$(cat VERSION) \
                    -X $PKG.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
          ./cmd/server
 ```
+
+---
+
+## 主备双节点高可用（可选）
+
+两台 VPS 互为主备，用户连接地址默认落到主节点；主节点挂掉自动切到备节点，两台全挂时谁先上线谁接管，主节点恢复后自动切回。**不配置任何 HA 变量时，服务以单机模式运行，行为与改造前完全一致。**
+
+> 完整设计、正确性推导、演练清单见 **[docs/ha-failover.md](docs/ha-failover.md)**。本节只做概览与上手。
+
+### 组成
+
+| 层 | 方案 |
+|---|---|
+| 数据复制 | **LiteFS**（FUSE 层拦截 SQLite 事务），对应用完全透明——GORM / 事务 / SAVEPOINT 原样工作 |
+| 领导权仲裁 | **Cloudflare DNS 的一条 TXT 记录**充当带 TTL 的分布式租约。不需要第三台机器、不需要 Consul、不需要 CF Worker |
+| 用户流量 | Cloudflare A 记录跟随 primary，由当前主节点自己幂等维护 |
+| 部署 | 全部在 Docker 内，宿主唯一前提是内核有 `/dev/fuse` |
+
+### 切换语义
+
+| 场景 | 行为 | 耗时 |
+|---|---|---|
+| 主节点挂掉 | 备节点接管并切 DNS | 45–60s |
+| 主备全挂 | 不切换、不放弃；**谁先上线谁接管** | 恢复后 ≤15s |
+| 主节点恢复 | 有序交接回主节点，**零数据丢失** | 20–40s 写中断 |
+| 主备互相断网但两台都活着 | **不切换**（租约仍有效，避免脑裂） | — |
+| Cloudflare API 故障 | **fail-static**，主节点继续服务 | 无影响 |
+
+正确性来自「双信号」交叉验证：租约（经 Cloudflare）+ 对端 `/api/health` 直连探测。单靠任一个都会在上面最后两行误判。
+
+### 启用
+
+```bash
+# 1. 两台 VPS 各确认内核支持 FUSE —— 唯一 Docker 管不到的前提
+ls -l /dev/fuse
+#    KVM 型 VPS 基本都有；OpenVZ / LXC 型可能没有，那样本方案不可用
+
+# 2. Cloudflare 侧手工建两条 TXT 记录：_ha-lease 与 _ha-handoff
+#    API Token 权限收窄到 Zone -> DNS -> Edit，且只授权这一个 zone
+
+# 3. 两台各配 .env（节点身份不同，密钥必须相同），见 .env.example 末尾 HA 段落
+# 4. 叠加 HA compose 层启动
+docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d
+```
+
+`docker-compose.ha.yml` 是**叠加层**：不加载它的部署完全不受影响。
+
+### 两台必须一致的文件
+
+部署时手工放一次，之后不用管：
+
+- **`.env`** 中的 `JWT_SECRET` / `JWT_REFRESH_SECRET` / `PROXY_SECRET`
+- **`data/ecdh.pem`** —— 登录握手的长寿 ECDH 私钥。两台不一致时，DNS 切换瞬间会出现「challenge 从旧节点取、密文发到新节点」而解密失败，用户吃一次登录报错
+
+### 存量库迁移
+
+**不能用 `cp` 拷进 FUSE 目录**（LiteFS 官方明确警告会损坏），必须：
+
+```bash
+docker compose exec app litefs import -name m3u8preview.db /data/m3u8preview.db
+```
+
+字幕正文会在启动后由后台任务幂等回填进数据库（磁盘 `.vtt` 不在 LiteFS 复制范围内），无需人工操作。
+
+### 人工接管
+
+仲裁本身出问题时的逃生舱：设 `HA_FORCE_ROLE=primary` 或 `replica` 可跳过全部仲裁逻辑，把角色钉死。
 
 ---
 
@@ -291,25 +371,37 @@ m3u8-preview-go/
 │   ├── db/                     # GORM 连接 / AutoMigrate / seed
 │   ├── dto/                    # 请求/响应结构 + 加密 DTO + 字幕 worker 协议 DTO
 │   │   └── subtitle.go         # subtitle / worker / admin 端点共用 schema
+│   ├── ha/                     # 主备高可用：Cloudflare DNS TXT 租约仲裁
+│   │   ├── record.go           # _ha-lease / _ha-handoff 两条记录的编解码
+│   │   ├── cloudflare.go       # 最小 CF DNS API 客户端（以响应 Date 头作共同时钟）
+│   │   ├── probe.go            # 对端 /api/health 直连探测（故障判定的第二信号）
+│   │   ├── agent.go            # 运行期决策状态机 + 时间参数安全不等式断言
+│   │   └── resolve.go          # 开机角色决议（"谁是主"的唯一判定入口）
 │   ├── handler/                # HTTP handlers（按模块拆分）
+│   │   ├── health.go           # /api/health：版本 + 主备角色 + 复制位点
 │   │   ├── subtitle.go         # /subtitle/* + /admin/subtitle/* 端点
 │   │   └── subtitle_worker.go  # /worker/* 端点（远程 GPU worker）
+│   ├── litefs/                 # 读 .primary / <db>-pos 感知角色；写闸门唯一收口
 │   ├── middleware/             # Auth / RateLimit / Error / Validator / WorkerAuth
+│   │   ├── readonly.go         # replica 写拦截：503 + NODE_READ_ONLY
 │   │   └── worker_auth.go      # mwt_xxx Bearer token 鉴权 + bcrypt 缓存
 │   ├── model/                  # GORM 模型
-│   │   ├── subtitle.go         # subtitle_jobs 表
+│   │   ├── subtitle.go         # subtitle_jobs + subtitle_vtts 表
 │   │   └── subtitle_worker.go  # subtitle_workers / subtitle_worker_tokens 表
 │   ├── parser/                 # CSV / Excel / JSON / Text 导入解析
 │   ├── service/                # 业务层（无依赖 Gin）
 │   │   ├── subtitle.go         # 字幕任务调度 + 远程 worker 协议实现
+│   │   ├── subtitle_vtt.go     # 字幕正文存取（写双份 / 读优先库 / 幂等回填）
 │   │   ├── subtitle_worker.go  # worker token / worker 注册管理
 │   │   ├── asr.go              # 本地 whisper.cpp 调用（兼容模式）
 │   │   └── translation.go      # OpenAI 兼容 LLM 翻译（兼容模式）
 │   ├── sse/                    # SSE writer + 进度常量
-│   └── util/                   # jwt / ecdh / challenge / proxysign / ssrf / uaparser / ffmpeg
-│       └── ffmpeg_subtitle.go  # 抽音频 / 装载头部 helper
+│   ├── util/                   # jwt / ecdh / challenge / proxysign / ssrf / uaparser / ffmpeg
+│   │   └── ffmpeg_subtitle.go  # 抽音频 / 装载头部 helper
+│   └── version/                # 构建时注入的版本 / commit / 构建时间
 ├── docs/
 │   ├── MIGRATION_FROM_NODE.md  # Node → Go 迁移指南
+│   ├── ha-failover.md          # 主备双节点高可用完整设计 + 演练清单
 │   └── worker-protocol.md      # 远程字幕 worker HTTP 契约（v1）
 ├── web/                        # 前端 workspace（npm workspaces）
 │   ├── package.json            # workspace root，提供 build:shared / build:client
@@ -325,15 +417,23 @@ m3u8-preview-go/
 │           │   ├── crypto.ts       # 加密入口：fetchChallenge → WASM → envelope
 │           │   └── fingerprint.ts  # 设备指纹采集（Canvas/WebGL/UA/屏幕/时区）
 │           ├── wasm/               # Vendored WASM 产物（入库，无需 Rust 工具链）
+│           ├── hooks/useAppVersion.ts                     # 读 /api/health 的版本与节点信息
+│           ├── components/HaSwitchingBanner.tsx           # 主备切换提示条
 │           ├── components/admin/SubtitleWorkersPanel.tsx  # 在线 worker / token 面板
+│           ├── components/admin/SystemInfoCard.tsx        # 版本 / 提交 / 构建时间 / 节点角色
 │           ├── pages/AdminSubtitlesPage.tsx               # 字幕任务管理面板
 │           ├── services/subtitleApi.ts                    # 字幕相关前端 API
 │           ├── components/ hooks/ pages/ services/ stores/
 │           └── main.tsx
+├── VERSION                     # 版本号单一事实来源（构建时注入二进制）
 ├── nginx.conf                  # 生产 nginx（CSP + wasm-unsafe-eval + upstream）
+├── nginx-litefs.conf           # HA：LiteFS 节点间通道（TLS + 源 IP 白名单）
+├── litefs.yml                  # HA：LiteFS 配置（角色字段由开机决议填充）
+├── litefs-exec.sh              # HA：挂载完成后启动 server（决定 root / appuser）
 ├── Dockerfile                  # 3 阶段：node builder → go builder → alpine runner
-├── docker-entrypoint.sh        # 卷权限修正 + 前端 dist 同步 + su-exec 降 appuser
+├── docker-entrypoint.sh        # 卷权限修正 + dist 同步 + 开机角色决议 + su-exec 降权
 ├── docker-compose.yml          # 生产：GHCR 镜像 + nginx（host network）
+├── docker-compose.ha.yml       # HA 叠加层（不加载则完全不影响单机部署）
 ├── docker-compose.dev.yml      # 本地：仅 app，端口映射 3000
 ├── .env.example
 └── README.md
@@ -430,6 +530,31 @@ m3u8-preview-go/
 | `ADMIN_SEED_PASSWORD` | `Admin123` | 首次启动 admin 用户密码 |
 | `DEMO_SEED_PASSWORD` | `Demo1234` | 首次启动 demo 用户密码 |
 
+### 主备双节点高可用（全部可选）
+
+三档渐进式开关，方便分阶段上线：
+
+1. **`LITEFS_DIR` 未设置** → 完全单机模式，不启动任何 HA 协程，行为与改造前一致
+2. **`LITEFS_DIR` 已设置、Cloudflare 参数不全** → 只做角色感知（据 `.primary` 决定是否放行写请求），不参与仲裁。适合先手工验证 LiteFS 复制的过渡期
+3. **全部配齐** → 完整 HA：租约仲裁 + 自动故障切换 + 自动回切
+
+| 变量 | 说明 |
+|---|---|
+| `LITEFS_DIR` | LiteFS 挂载目录，生产为 `/litefs`。**留空即关闭整套 HA** |
+| `HA_NODE_ID` / `HA_PEER_ID` | 节点标识，两台必须不同 |
+| `HA_PREFERRED` | 只有「主」那台设 `true`。决定回切方向、首次引导先后，以及 Cloudflare 不可达时谁被允许自升主 |
+| `HA_FORCE_ROLE` | 人工接管逃生舱（`primary` / `replica`），设了就跳过全部仲裁 |
+| `HA_SELF_ADVERTISE_URL` / `HA_PEER_ADVERTISE_URL` | 两端的 LiteFS API 地址 |
+| `HA_PEER_BASE_URL` | 对端 App 地址，用于 `/api/health` 直连探测 |
+| `HA_PEER_CA_FILE` | 可选：探测对端时额外信任的 CA（自签证书场景） |
+| `HA_SELF_PUBLIC_IP` / `HA_PEER_PUBLIC_IP` | 两端公网 IP，用于维护 A 记录 |
+| `CF_API_TOKEN` / `CF_ZONE_ID` | Cloudflare 凭据，Token 权限收窄到 Zone → DNS → Edit |
+| `HA_DNS_RECORD` | 用户流量的 A 记录全名，当前主节点会把它指向自己 |
+| `HA_LEASE_RECORD` / `HA_HANDOFF_RECORD` | 租约与交还请求的 TXT 记录全名（需先在 Cloudflare 手工创建） |
+| `LITEFS_RUN_AS_ROOT` | 实测 appuser 无法在 `/litefs` 下写库时设 `1` |
+
+> 故障切换的时间参数（续租周期、租约 TTL、自降级死线、夺取保护期）**刻意不做成环境变量**——它们之间存在必须满足的安全不等式，误配置会导致双主并静默丢写。参数固定在 `internal/ha` 内并由测试断言，详见 [docs/ha-failover.md](docs/ha-failover.md)。
+
 ### 字幕功能（v3 分布式 worker broker 架构）
 
 > 默认架构下，**所有 ASR / 翻译 / 模型 / 默认语言** 等字幕参数都在 admin 面板「字幕管理」中配置，不再走环境变量；此处仅是开关 + 路径 + 心跳超时。
@@ -487,6 +612,17 @@ m3u8-preview-go/
 - [ ] 健康检查 `curl -sf http://127.0.0.1:3000/api/health` 在部署流水线中生效
 - [ ] `systemSettings.proxyAllowedExtensions` 按实际源站类型收窄
 - [ ] 前端若要换域名，记得同步 `CORS_ORIGIN` 和 `nginx.conf` 的 CSP
+
+**启用主备高可用时额外确认**（详见 [docs/ha-failover.md](docs/ha-failover.md) §14）：
+
+- [ ] 两台 VPS 各跑 `ls -l /dev/fuse` 确认内核支持 FUSE（OpenVZ / LXC 型 VPS 可能没有）
+- [ ] `data/ecdh.pem` 与三个密钥两台完全一致（否则切换瞬间会有一次登录失败）
+- [ ] 实测 appuser 能在 `/litefs` 下建库写库，不行则设 `LITEFS_RUN_AS_ROOT=1`
+- [ ] 写入 TPS 实测低于 FUSE 上限（约 100 事务/秒）；观看/活动日志若是每次播放即写需先压测
+- [ ] `_ha-lease` / `_ha-handoff` 两条 TXT 记录已在 Cloudflare 手工创建
+- [ ] Cloudflare API Token 权限仅 Zone → DNS → Edit，且只授权目标 zone
+- [ ] 存量库已用 `litefs import` 导入（**不能用 `cp`**）
+- [ ] 八个故障场景演练通过，尤其「主备断网但都能连 CF」与「CF API 不可达」两条
 
 ---
 
@@ -576,6 +712,25 @@ Cookie `Secure` 标志与访问协议不匹配。`Secure` Cookie 只能通过 HT
 `ProxyService.InvalidateExtensionsCache()`，若看到 "not invalidated" 日志，
 检查 `Deps.ProxySvc` 是否挂到了 app，以及 settings handler 路径是否命中。
 
+**Q11.（HA）写操作返回 503 且 code 为 `NODE_READ_ONLY`？**
+说明请求打到了只读副本，或该节点正在交接领导权。前端会自动退避重试并显示
+「节点切换中」，通常几秒后自然成功。持续不恢复则查 `curl -s <节点>/api/health`
+的 `role` 字段：若**两台都是 replica**，通常是 Cloudflare 与对端同时不可达导致
+双方保守降级（刻意的取舍，宁可只读也不冒双主风险）——任一方恢复后会自动升主，
+急用可临时设 `HA_FORCE_ROLE=primary` 人工接管。
+
+**Q12.（HA）容器起不来，日志报 FUSE 挂载失败？**
+按顺序排查：① 宿主 `ls -l /dev/fuse` 是否存在（OpenVZ / LXC 型 VPS 可能没有，
+本方案不可用）；② compose 是否叠加了 `docker-compose.ha.yml`（`devices` /
+`cap_add: SYS_ADMIN` / `security_opt` 都在那里）；③ `./litefs` 目录是否可写。
+
+**Q13.（HA）复制不同步，备节点数据一直是旧的？**
+先看两端 `/api/health` 的 `txid` 是否有差距。常见原因是节点间通道不通：
+LiteFS 绑在 `127.0.0.1:20202`，对外靠 nginx 的 20203 转发，检查
+`allow <对端IP>` 是否填对、对端 CA 是否已装进信任链（`HA_PEER_CA_FILE`）。
+注意主备互相断网时**主节点会继续正常服务**（不误切是设计如此），
+所以用户侧可能毫无感知，需要靠位点差距或日志告警发现。
+
 ---
 
 ## 开发命令
@@ -619,6 +774,9 @@ wasm-opt ../client/src/wasm/crypto_wasm_bg.wasm \
 
 | 项 | 当前状态 | 备注 |
 |---|---|---|
+| worker 侧主备跟随 | 未实现 | 两个 worker 仓库不在本项目内。故障切换后 worker 仍指向旧地址，字幕生成会停摆到人工介入（任务不丢，stale recovery 会回收重派）。零改动方案：把 worker 的 `SERVER_URL` 指向 `HA_DNS_RECORD` 那条 A 记录，DNS 已跟随 primary；需把 `SUBTITLE_AUDIO_FETCH_HOLD_SEC` 调到 90 以内以避开 CF 的等待上限 |
+| 复制中断告警 | 未实现 | 主备互相断网时主节点继续服务、用户无感知，需靠外部监控比对两端 `/api/health` 的 `txid` 发现 |
+| 图片文件跨节点同步 | 未实现 | `uploads/posters`、`uploads/thumbnails` 不在 LiteFS 复制范围（字幕正文已入库解决）。如需同步可加一个 syncthing 容器，仍在 Docker 范围内 |
 | Prometheus / metrics 端点 | 未实现 | 如需可在 `/api/v1/admin/*` 下新增 |
 | 前端 `useVideoThumbnail` 客户端截帧 | Hook 为空壳 | 后端 ffmpeg 方案已覆盖此需求 |
 | i18n / 多语言 | 未实现 | 全部 UI 文案为硬编码中文 |
