@@ -119,6 +119,9 @@ type Handoff struct {
 	Want string
 	// TXID 挑战者当前的 LiteFS 复制位点，供 owner 判断它是否已追平。
 	TXID string
+	// Force 请求 owner 跳过"等 audio 流结束"直接进入停写交接（管理员手动强制切换）。
+	// 只影响等待阶段：drain / 追平 / 交接的零数据丢失流程不受它影响。
+	Force bool
 }
 
 // Exists 报告是否存在有效的交还请求。
@@ -126,8 +129,13 @@ func (h Handoff) Exists() bool { return h.Want != "" }
 
 // String 序列化为 TXT 记录内容。空请求序列化为 "v=1;want=;txid="，
 // 用于清空记录（Cloudflare 的 TXT content 不允许为空串）。
+// force 仅在为 true 时输出：旧版本节点解析时忽略未知键，自然退化为平滑交接。
 func (h Handoff) String() string {
-	return fmt.Sprintf("v=%d;want=%s;txid=%s", recordVersion, h.Want, h.TXID)
+	s := fmt.Sprintf("v=%d;want=%s;txid=%s", recordVersion, h.Want, h.TXID)
+	if h.Force {
+		s += ";force=1"
+	}
+	return s
 }
 
 // ParseHandoff 解析交还请求记录。空串返回零值。
@@ -136,7 +144,7 @@ func ParseHandoff(s string) (Handoff, error) {
 	if err != nil {
 		return Handoff{}, err
 	}
-	return Handoff{Want: kv["want"], TXID: kv["txid"]}, nil
+	return Handoff{Want: kv["want"], TXID: kv["txid"], Force: kv["force"] == "1"}, nil
 }
 
 // parseKV 解析 "k=v;k=v" 形式的记录内容。

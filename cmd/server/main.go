@@ -20,6 +20,7 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/db"
 	"github.com/hor1zon777/m3u8-preview-go/internal/ha"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
+	"github.com/hor1zon777/m3u8-preview-go/internal/service"
 	"github.com/hor1zon777/m3u8-preview-go/internal/version"
 )
 
@@ -88,9 +89,14 @@ func main() {
 		log.Fatalf("ha agent: %v", err)
 	}
 	if haAgent != nil {
-		deps.HAEpoch = haAgent.Epoch
+		// 两个钩子都必须在 Start 之前注入：
+		// 自动回切闸门查 system_settings（管理员手动切走 preferred 后置 false），
+		// 让位钩子在 preferred 节点进入停写前把闸门写成关闭（经 LiteFS 复制到对端）。
+		haAgent.SetAutoFailbackGate(func() bool { return service.HAAutoFailbackEnabled(gdb) })
+		haAgent.SetPreferredYieldHook(func() error { return service.DisableHAAutoFailback(gdb) })
 		haAgent.Start()
 	}
+	deps.HAAgent = haAgent
 
 	addr := fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.Port)
 	srv := &http.Server{

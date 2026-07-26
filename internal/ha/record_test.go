@@ -118,6 +118,37 @@ func TestHandoffRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHandoffForceRoundTrip(t *testing.T) {
+	in := Handoff{Want: "node-a", TXID: "00000000000004d2", Force: true}
+	got, err := ParseHandoff(in.String())
+	if err != nil {
+		t.Fatalf("ParseHandoff: %v", err)
+	}
+	if got != in {
+		t.Fatalf("往返不一致: %+v", got)
+	}
+
+	// force=false 不输出该键：写出的内容必须与旧版本完全一致，
+	// 保证滚动升级期间旧节点能原样解析。
+	if s := (Handoff{Want: "node-a", TXID: "1"}).String(); strings.Contains(s, "force") {
+		t.Fatalf("非强制请求不应输出 force 键: %s", s)
+	}
+}
+
+func TestHandoffOldFormatCompatible(t *testing.T) {
+	// 旧版本节点写出的记录没有 force 键，解析结果应为平滑交接。
+	got, err := ParseHandoff("v=1;want=node-a;txid=00000000000004d2")
+	if err != nil {
+		t.Fatalf("ParseHandoff: %v", err)
+	}
+	if got.Force {
+		t.Fatal("旧格式记录不应解析出 force=true")
+	}
+	if got.Want != "node-a" {
+		t.Fatalf("旧格式解析错误: %+v", got)
+	}
+}
+
 func TestTXIDComparisonIsLexicographic(t *testing.T) {
 	// 追平判定直接比较十六进制字符串，前提是 LiteFS 输出等宽零填充。
 	// 这个测试固化该假设：一旦位点格式变化，回切判定会立刻失灵。

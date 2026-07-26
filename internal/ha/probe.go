@@ -161,6 +161,13 @@ func (p *Prober) Last() (PeerStatus, int) {
 	return p.last, p.failures
 }
 
+// Snapshot 在 Last 之上追加最近一次探测的时刻，供状态 API 显示数据新鲜度。
+func (p *Prober) Snapshot() (PeerStatus, int, time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.last, p.failures, p.lastAt
+}
+
 // Down 报告对端是否已被判定为宕机（连续失败达到阈值）。
 func (p *Prober) Down() bool {
 	p.mu.RLock()

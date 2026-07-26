@@ -120,7 +120,7 @@ docker compose -f docker-compose.dev.yml up --build
 
 ## 版本号
 
-单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.2.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
+单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.3.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
 
 **发版时只需改 `VERSION` 一个文件**，其余全部自动：
 
@@ -133,7 +133,7 @@ docker compose -f docker-compose.dev.yml up --build
 三者由 `-ldflags -X` 注入 `internal/version` 包，通过无鉴权的 `GET /api/health` 暴露：
 
 ```json
-{ "status": "ok", "version": "0.2.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
+{ "status": "ok", "version": "0.3.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
 ```
 
 ### 显示位置
@@ -216,6 +216,18 @@ docker compose exec app litefs import -name m3u8preview.db /data/m3u8preview.db
 ```
 
 字幕正文会在启动后由后台任务幂等回填进数据库（磁盘 `.vtt` 不在 LiteFS 复制范围内），无需人工操作。
+
+### 管理面板：状态查看与手动切换
+
+管理面板新增「高可用管理」页（`/admin/ha`）：
+
+- **未配置 HA 时**：显示分步配置向导——选择本机是主节点还是备用节点，填写域名 / Cloudflare / 节点信息后，自动生成两台节点各自的 `.env` 片段与部署操作清单（DNS 记录、证书、密钥同步、启动、迁移）。所有输入只在浏览器内生成文本，不会发送到服务器。管理员首次进入 Dashboard 也会看到引导卡片（可"不再提示"）。
+- **已配置 HA 时**：显示本机 / 对端 / 租约三卡状态，并提供**手动主/备切换**：
+  - **平滑交接**（默认）：等正在传输的音频流结束 → 停写 → 对端追平 → 让位（上限 30 分钟）；
+  - **强制切换**：跳过等流立即停写交接（停写上限 90 秒），零数据丢失流程不受影响；
+  - 切换全程异步，可随时"升级为强制"或取消；对应 API 为 `POST /api/v1/admin/ha/switch`。
+
+把首选主节点手动切走时会自动关闭**自动回切**（`system_settings.haAutoFailback`，经 LiteFS 复制到两台），否则 ~60 秒后领导权会被自动要回来；可在状态面板重新开启。
 
 ### 人工接管
 

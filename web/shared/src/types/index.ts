@@ -649,3 +649,74 @@ export interface PluginInfo {
   healthy: boolean;
   status: PluginStatusItem[];
 }
+
+// ============ 高可用管理 ============
+
+/** HA 部署档位：单机 / 仅 LiteFS 角色感知 / 完整租约仲裁。 */
+export type HaMode = 'standalone' | 'role-aware' | 'full';
+
+/** 交接进度阶段（对齐 internal/ha/status.go 的 Phase* 常量）。 */
+export type HaSwitchPhase =
+  | 'idle'
+  | 'requested'
+  | 'waiting-streams'
+  | 'draining'
+  | 'switching'
+  | 'aborted';
+
+/** 本机节点状态。 */
+export interface HaNodeInfo {
+  role: string;
+  nodeId?: string;
+  preferred: boolean;
+  txid?: string;
+  draining: boolean;
+  busyStreams: number;
+  epoch: number;
+}
+
+/** 对端探测缓存（来自本机 Agent 的 Prober，非实时请求）。 */
+export interface HaPeerInfo {
+  nodeId?: string;
+  reachable: boolean;
+  role?: string;
+  txid?: string;
+  draining: boolean;
+  busyStreams: number;
+  consecutiveFailures: number;
+  /** RFC3339；缺省表示还没探测过。 */
+  lastProbeAt?: string;
+  error?: string;
+}
+
+/** Cloudflare 租约缓存。 */
+export interface HaLeaseInfo {
+  owner: string;
+  epoch: number;
+  expiresAt: string;
+  state: string;
+  /** 本机最近一次成功读到租约的时刻。 */
+  readAt: string;
+}
+
+/** 交接进度。 */
+export interface HaSwitchInfo {
+  phase: HaSwitchPhase;
+  manual: boolean;
+  force: boolean;
+  since?: string;
+  drainSince?: string;
+  /** 仅 phase=aborted 时非空。 */
+  lastError?: string;
+}
+
+/** GET /admin/ha/status 响应。 */
+export interface HaStatus {
+  mode: HaMode;
+  setupDismissed: boolean;
+  autoFailback: boolean;
+  local: HaNodeInfo;
+  peer?: HaPeerInfo;
+  lease?: HaLeaseInfo;
+  switch: HaSwitchInfo;
+}

@@ -267,12 +267,52 @@ var allowedSettingKeys = map[string]struct{}{
 	"captchaSiteKey":          {},
 	"captchaSecretKey":        {},
 	"captchaManifestPubKey":   {},
+	// HA 管理：首次部署引导的"不再提示"标记 / 自动回切闸门（见 internal/ha）。
+	"haSetupDismissed": {},
+	"haAutoFailback":   {},
 }
 
 // IsAllowedSettingKey 供其它 service（如 backup 导入）复用白名单检查。
 func IsAllowedSettingKey(key string) bool {
 	_, ok := allowedSettingKeys[key]
 	return ok
+}
+
+// GetSetting 读取单个设置项；不存在时返回空串（不视为错误）。
+func (s *AdminService) GetSetting(key string) (string, error) {
+	var row model.SystemSetting
+	err := s.db.Where("key = ?", key).Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", middleware.WrapAppError(http.StatusInternalServerError, "查询失败", err)
+	}
+	return row.Value, nil
+}
+
+// HAAutoFailbackEnabled 查询自动回切闸门（system_settings.haAutoFailback）。
+// 缺省/查询失败时返回 true：保持既有的自动回切行为，宁可多回切也不静默失去保护。
+// 做成包级函数是因为 cmd/server/main.go 在注入 ha.Agent 钩子时还没有 AdminService。
+func HAAutoFailbackEnabled(db *gorm.DB) bool {
+	var row model.SystemSetting
+	if err := db.Where("key = ?", "haAutoFailback").Take(&row).Error; err != nil {
+		return true
+	}
+	return row.Value != "false"
+}
+
+// DisableHAAutoFailback 关闭自动回切闸门（upsert haAutoFailback=false）。
+// 由 ha.Agent 在 preferred 节点让位（进入停写）前调用，该写入经 LiteFS 复制到对端。
+func DisableHAAutoFailback(db *gorm.DB) error {
+	res := db.Model(&model.SystemSetting{}).Where("key = ?", "haAutoFailback").Update("value", "false")
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	return db.Create(&model.SystemSetting{Key: "haAutoFailback", Value: "false"}).Error
 }
 
 // UpdateSetting upsert 单个 key，返回当前值。
@@ -309,6 +349,10 @@ func (s *AdminService) UpdateSetting(key, value string) (dto.AdminSettingEntry, 
 // captchaEndpoint 为空字符串视为"清除配置"，允许通过；非空则必须是可信 URL。
 func validateSettingValue(key, value string) error {
 	switch key {
+	case "haSetupDismissed", "haAutoFailback":
+		if value != "true" && value != "false" {
+			return middleware.NewAppError(http.StatusBadRequest, key+" 只接受 true/false")
+		}
 	case "captchaEndpoint":
 		if strings.TrimSpace(value) == "" {
 			return nil

@@ -108,6 +108,33 @@ type Agent struct {
 	drainSince time.Time
 	// switching 已经发起切换，后续 tick 不再重复决策。
 	switching bool
+
+	// ---- 管理员手动切换（见 manual.go）----
+
+	// manualHandoff primary 侧：管理员要求把领导权交给对端。
+	// 纯进程内标志，不写 TXT——请求直接敲在 owner 上时无需绕行 Cloudflare。
+	manualHandoff bool
+	// manualClaim replica 侧：管理员要求把本机升为主。
+	// 复用 _ha-handoff 挑战者协议，由 tick 循环统一写记录（避免跨 goroutine 写竞态）。
+	manualClaim bool
+	// manualClaimCleanup replica 侧撤销手动升主后，由 tick 循环写空记录清场。
+	manualClaimCleanup bool
+	// manualForce 跳过"等 audio 流结束"直接进入停写交接。
+	manualForce bool
+	// lastCancelReason / lastCancelAt 最近一次手动切换被中止的原因与时刻，供状态 API 展示。
+	lastCancelReason string
+	lastCancelAt     time.Time
+	// lastLease / lastLeaseAt 最近一次成功读到的租约缓存，供状态 API 展示（避免额外外呼）。
+	lastLease   Lease
+	lastLeaseAt time.Time
+	// autoFailback 自动回切闸门（查 system_settings），nil 视为恒 true。
+	// 手动把 preferred 节点切走后置 false，否则 ~60s 内会被自动切回。
+	autoFailback func() bool
+	// onPreferredYield 在 preferred 节点让位（进入停写）前调用，负责把
+	// 自动回切闸门写成关闭（落 system_settings，经 LiteFS 复制到对端）。
+	// 放在 beginDrain 而非 completeHandoff：写入必须发生在对端追平校验之前，
+	// 才能保证它一定被复制走，而不是留在旧主上被交接后的重新同步丢弃。
+	onPreferredYield func() error
 }
 
 // New 构造 Agent。cfg.LeaseEnabled() 为 false 时返回 (nil, nil)，调用方按未启用处理。
@@ -229,6 +256,7 @@ func (a *Agent) tickPrimary(ctx context.Context, peer PeerStatus) {
 
 	lease, err := a.readLease(ctx)
 	if err == nil {
+		a.cacheLease(lease)
 		now := a.cf.Now()
 
 		// 已被对端接管：租约是权威，立即让位，绝不与新主并存。
@@ -246,6 +274,12 @@ func (a *Agent) tickPrimary(ctx context.Context, peer PeerStatus) {
 		}
 		a.markSafe()
 		a.maintainARecord(ctx, now)
+		// 手动交接优先于 TXT 请求：两者目的相同（都是交给对端），
+		// 手动路径不读写 handoff 记录，避免与挑战者协议纠缠。
+		if a.manualHandoffRequested() {
+			a.progressManualHandoff(ctx, peer, now)
+			return
+		}
 		a.handleHandoffRequest(ctx, peer, now)
 		return
 	}
@@ -364,10 +398,17 @@ func (a *Agent) handleHandoffRequest(ctx context.Context, peer PeerStatus, now t
 		return
 	}
 
+	a.progressHandoff(ctx, peer, now, h.Force)
+}
+
+// progressHandoff 推进一次交接（TXT 请求与管理员手动交接的共同主体）。
+// force 为 true 时跳过"等 audio 流结束"阶段直接停写；drain / 追平 / 交接
+// 的零数据丢失流程不受 force 影响。
+func (a *Agent) progressHandoff(ctx context.Context, peer PeerStatus, now time.Time, force bool) {
 	a.mu.Lock()
 	if a.handoffSince.IsZero() {
 		a.handoffSince = now
-		log.Printf("[ha] 收到 %s 的交还请求，开始准备交接", h.Want)
+		log.Printf("[ha] 开始准备把领导权交给 %s", a.cfg.PeerID)
 	}
 	waited := now.Sub(a.handoffSince)
 	draining := !a.drainSince.IsZero()
@@ -380,7 +421,7 @@ func (a *Agent) handleHandoffRequest(ctx context.Context, peer PeerStatus, now t
 	// 等 audio 桥接流跑完再交接：broker 是纯内存 io.Pipe，强切会把正在传输的
 	// 音频流拦腰截断，任务只能重跑。超过上限则不再等，避免长尾任务无限期阻塞回切。
 	if !draining {
-		if busy := a.currentBusyStreams(); busy > 0 && waited < failbackMaxWait {
+		if busy := a.currentBusyStreams(); !force && busy > 0 && waited < failbackMaxWait {
 			log.Printf("[ha] 交接等待中: 仍有 %d 条 audio 流进行中（已等 %v）", busy, waited.Truncate(time.Second))
 			return
 		}
@@ -419,6 +460,22 @@ func (a *Agent) enforceDrainTimeout() {
 
 // beginDrain 进入停写阶段：停止接受新写入，让对端有机会追平。
 func (a *Agent) beginDrain(now time.Time) {
+	// preferred 节点让位只可能出自手动切换（自动回切永远是把领导权交还给
+	// preferred），停写前先关掉自动回切闸门，否则本节点重启成 replica 后
+	// ~60s 就会自动把领导权要回来，手动切换形同虚设。
+	if a.cfg.Preferred {
+		a.mu.Lock()
+		hook := a.onPreferredYield
+		a.mu.Unlock()
+		if hook != nil {
+			if err := hook(); err != nil {
+				log.Printf("[ha] 关闭自动回切闸门失败（交接后可能被自动切回）: %v", err)
+			} else {
+				log.Printf("[ha] 已关闭自动回切闸门（可在管理面板重新开启）")
+			}
+		}
+	}
+
 	a.mu.Lock()
 	a.drainSince = now
 	a.mu.Unlock()
@@ -427,7 +484,30 @@ func (a *Agent) beginDrain(now time.Time) {
 }
 
 // cancelHandoff 撤销交接并恢复写入。
+// 若有管理员手动切换在进行，一并中止并记录原因（供状态 API 展示 aborted）。
 func (a *Agent) cancelHandoff(reason string) {
+	a.mu.Lock()
+	active := !a.handoffSince.IsZero() || !a.drainSince.IsZero()
+	manual := a.manualHandoff
+	a.handoffSince = time.Time{}
+	a.drainSince = time.Time{}
+	if manual {
+		a.manualHandoff = false
+		a.manualForce = false
+		a.lastCancelReason = reason
+		a.lastCancelAt = time.Now()
+	}
+	a.mu.Unlock()
+	if !active && !manual {
+		return
+	}
+	a.lfs.SetDraining(false)
+	log.Printf("[ha] 交接中止: %s", reason)
+}
+
+// pauseHandoff 暂停交接进度并恢复写入，但保留手动切换请求本身——
+// 用于对端探测抖动这类可自愈的情况，下个 tick 自动重试。
+func (a *Agent) pauseHandoff(reason string) {
 	a.mu.Lock()
 	active := !a.handoffSince.IsZero() || !a.drainSince.IsZero()
 	a.handoffSince = time.Time{}
@@ -437,7 +517,7 @@ func (a *Agent) cancelHandoff(reason string) {
 		return
 	}
 	a.lfs.SetDraining(false)
-	log.Printf("[ha] 交接中止: %s", reason)
+	log.Printf("[ha] 交接暂缓: %s", reason)
 }
 
 // completeHandoff 执行交接：把租约写给对端、切 DNS、退出让位。
@@ -472,6 +552,7 @@ func (a *Agent) tickReplica(ctx context.Context, peer PeerStatus) {
 		log.Printf("[ha] 读取租约失败（维持 replica）: %v", err)
 		return
 	}
+	a.cacheLease(lease)
 	now := a.cf.Now()
 
 	// 租约已指向本节点（多为交接完成）：升主。
@@ -486,6 +567,14 @@ func (a *Agent) tickReplica(ctx context.Context, peer PeerStatus) {
 	a.mu.Unlock()
 
 	if a.tryClaim(ctx, lease, peer, now) {
+		return
+	}
+	// 撤销手动升主后的清场（写空记录）也在 tick 循环里做：
+	// 本节点对 _ha-handoff 的所有写入都收口在这一个 goroutine，避免写竞态。
+	if a.runManualClaimCleanup(ctx) {
+		return
+	}
+	if a.maybeRequestManualTakeover(ctx, lease, now) {
 		return
 	}
 	a.maybeRequestFailback(ctx, lease, peer, now)
@@ -549,6 +638,14 @@ func (a *Agent) tryClaim(ctx context.Context, lease Lease, peer PeerStatus, now 
 // 只写 _ha-handoff 记录、不碰 _ha-lease：租约永远只由当前 owner 写，
 // 两条记录各自单写入者是本方案规避 Cloudflare 无 CAS 的核心手段。
 func (a *Agent) maybeRequestFailback(ctx context.Context, lease Lease, peer PeerStatus, now time.Time) {
+	// 管理员手动把 preferred 节点切走后会关掉这个闸门（system_settings.haAutoFailback），
+	// 否则本节点会在 ~60s 后自动把领导权要回来，手动切换形同虚设。
+	a.mu.Lock()
+	gate := a.autoFailback
+	a.mu.Unlock()
+	if gate != nil && !gate() {
+		return
+	}
 	if !a.cfg.Preferred || !lease.Valid(now) || lease.Owner != a.cfg.PeerID {
 		return
 	}

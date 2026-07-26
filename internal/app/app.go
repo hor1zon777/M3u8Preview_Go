@@ -20,6 +20,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/hor1zon777/m3u8-preview-go/internal/config"
+	"github.com/hor1zon777/m3u8-preview-go/internal/ha"
 	"github.com/hor1zon777/m3u8-preview-go/internal/handler"
 	"github.com/hor1zon777/m3u8-preview-go/internal/litefs"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
@@ -58,9 +59,10 @@ type Deps struct {
 	// 让调用方无需到处判空。
 	LiteFS *litefs.Provider
 
-	// HAEpoch 由 internal/ha 在启用租约仲裁后注入，供 /api/health 上报租约世代号。
-	// nil 表示未启用租约仲裁。
-	HAEpoch func() int64
+	// HAAgent 由 cmd/server/main.go 在 Build 之后注入（Agent 的构造依赖 Deps.LiteFS）。
+	// nil 表示未启用租约仲裁；其全部方法都能安全地零值调用。
+	// /api/health 与 /admin/ha/* 都通过闭包延迟读取本字段。
+	HAAgent *ha.Agent
 }
 
 // NewDeps 构造跨请求 singleton。
@@ -164,9 +166,8 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 				st.BusyStreams = b.PendingFetches()
 			}
 		}
-		if deps.HAEpoch != nil {
-			st.Epoch = deps.HAEpoch()
-		}
+		// Epoch 对 nil Agent 安全返回 0（未启用租约仲裁）。
+		st.Epoch = deps.HAAgent.Epoch()
 		return st
 	}))
 
@@ -353,6 +354,31 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	adminGroup := v1.Group("/admin")
 	adminGroup.Use(middleware.Authenticate(authDeps), requireAdmin)
 	adminH.Register(adminGroup)
+
+	// ---- 高可用管理 ----
+	// 刻意挂在 r 而非 v1 上：不继承 RequirePrimary 写闸门。
+	// 切换请求必须能在 replica 上发出（replica 侧"升本机为主"只写 Cloudflare TXT，
+	// 不写本地库），也不能被前端 api.ts 对 NODE_READ_ONLY 503 的自动重试静默重放。
+	// 限流与鉴权与 v1 admin 组保持一致。
+	haH := handler.NewHAHandler(
+		func() *ha.Agent { return deps.HAAgent }, // main.go 在 Build 后注入，闭包延迟读取
+		deps.LiteFS, cfg.HA, adminSvc,
+		func() int {
+			if deps.SubtitleSvc != nil {
+				if b := deps.SubtitleSvc.AudioBroker(); b != nil {
+					return b.PendingFetches()
+				}
+			}
+			return 0
+		},
+	)
+	haGroup := r.Group("/api/v1/admin/ha")
+	haGroup.Use(
+		middleware.ConditionalRateLimit(deps.RateLimitCache, globalLimiterMW, nil),
+		middleware.Authenticate(authDeps),
+		requireAdmin,
+	)
+	haH.Register(haGroup)
 
 	// ---- Backup 模块（阶段 I-2）----
 	// 传入 SubtitlesDir 让 backup 服务能定位 VTT 文件（用户可能配置 SUBTITLE_DIR 指向 uploadsDir 外部）。

@@ -1,12 +1,13 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { Film, Users, FolderOpen, Play, Settings, Download, Shield, Activity, X, Plus } from 'lucide-react';
+import { Film, Users, FolderOpen, Play, Settings, Download, Shield, Activity, X, Plus, Network } from 'lucide-react';
 import { adminApi } from '../services/adminApi.js';
 import { MediaThumbnail } from '../components/media/MediaThumbnail.js';
 import { BackupSection } from '../components/admin/BackupSection.js';
 import { PosterSection } from '../components/admin/PosterSection.js';
 import { SystemInfoCard } from '../components/admin/SystemInfoCard.js';
+import { HaSetupHintCard } from '../components/admin/HaSetupHintCard.js';
 
 export function AdminDashboardPage() {
   const queryClient = useQueryClient();
@@ -165,6 +166,9 @@ export function AdminDashboardPage() {
         <h1 className="text-2xl font-bold text-white">管理面板</h1>
       </div>
 
+      {/* 首次部署引导：未配置完整 HA 且未忽略时展示 */}
+      <HaSetupHintCard />
+
       {/* Stats Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         {statCards.map((card) => (
@@ -219,6 +223,16 @@ export function AdminDashboardPage() {
             <h3 className="text-white font-semibold group-hover:text-emby-green-light">批量导入</h3>
           </div>
           <p className="text-emby-text-muted text-sm mt-1">导入M3U8链接</p>
+        </Link>
+        <Link
+          to="/admin/ha"
+          className="bg-emby-bg-card border border-emby-border-subtle rounded-md p-5 hover:border-emby-border-light transition-colors group"
+        >
+          <div className="flex items-center gap-2">
+            <Network className="w-5 h-5 text-emby-text-secondary group-hover:text-emby-green-light" />
+            <h3 className="text-white font-semibold group-hover:text-emby-green-light">高可用管理</h3>
+          </div>
+          <p className="text-emby-text-muted text-sm mt-1">主备节点状态与手动切换</p>
         </Link>
       </div>
 
