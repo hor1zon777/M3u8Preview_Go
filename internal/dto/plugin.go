@@ -25,6 +25,10 @@ type PluginInfo struct {
 	Enabled     bool               `json:"enabled"`
 	Healthy     bool               `json:"healthy"`
 	Status      []PluginStatusItem `json:"status"`
+	// External 管理员导入的声明式外部插件（可删除）；内置插件为 false。
+	External bool `json:"external"`
+	// Homepage 外部插件的可选主页外链（仅展示）。
+	Homepage string `json:"homepage,omitempty"`
 }
 
 // PluginSetEnabledRequest 切换启用开关请求体。

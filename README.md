@@ -13,7 +13,8 @@ M3u8Preview 的 Go 版**全栈**项目（Gin 后端 + React/Vite 前端 + nginx�
   - [m3u8-preview-worker](../m3u8-preview-worker) — GPU 机：通过服务端 broker 实时拉 FLAC + ASR + 翻译 + 写 VTT
   - 服务端只做任务派发 + broker 实时桥接（**0 持久化音频文件**）+ VTT 仓库；保留本地 whisper.cpp 兼容模式
   - 协议详见 [`docs/worker-protocol.md`](docs/worker-protocol.md)；架构详见 [`m3u8-preview-worker/docs/distributed-worker.md`](../m3u8-preview-worker/docs/distributed-worker.md)
-- **插件中心**：可选功能模块统一以插件形式管理（`internal/plugin` 编译期注册表 + admin 启用开关 + 运行状态摘要），字幕 worker 是第一个插件，入口 `/admin/plugins`
+- **插件中心**：可选功能模块统一以插件形式管理（`internal/plugin` 编译期注册表 + admin 启用开关 + 运行状态摘要），字幕 worker 是第一个插件，入口 `/admin/plugins`；支持导入**声明式外部插件**（manifest.json 描述外部服务集成，可选健康检查，不含可执行代码），格式见 [`docs/external-plugin-manifest.md`](docs/external-plugin-manifest.md)
+- **应用内自更新**：管理面板检查 GitHub Release 新版本并一键更新，容器内下载校验 → 进程自退重启装载，**无需手动执行 docker 命令**；连续启动失败自动回滚镜像版本，见 [`docs/self-update.md`](docs/self-update.md)
 - **高可用**（可选）：两台 VPS 主备自动切换 —— LiteFS 复制 SQLite + Cloudflare DNS TXT 租约仲裁，不需要第三台机器。不启用时完全是单机部署，见 [`docs/ha-failover.md`](docs/ha-failover.md)
 - **目标**：单仓库一键 `docker compose up` 即获得完整服务
 
@@ -120,9 +121,9 @@ docker compose -f docker-compose.dev.yml up --build
 
 ## 版本号
 
-单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.3.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
+单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.4.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
 
-**发版时只需改 `VERSION` 一个文件**，其余全部自动：
+**发版时只需改 `VERSION` 一个文件**（并打 `v<VERSION>` tag——CI 会自动创建带自更新产物的 GitHub Release，release job 校验两者一致），其余全部自动：
 
 | 字段 | 来源 |
 |---|---|
@@ -133,7 +134,7 @@ docker compose -f docker-compose.dev.yml up --build
 三者由 `-ldflags -X` 注入 `internal/version` 包，通过无鉴权的 `GET /api/health` 暴露：
 
 ```json
-{ "status": "ok", "version": "0.3.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
+{ "status": "ok", "version": "0.4.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
 ```
 
 ### 显示位置

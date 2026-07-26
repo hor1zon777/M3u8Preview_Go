@@ -39,6 +39,8 @@ type HAPeerInfo struct {
 	TXID                string `json:"txid,omitempty"`
 	Draining            bool   `json:"draining"`
 	BusyStreams         int    `json:"busyStreams"`
+	// Version 对端自报的应用版本（滚动升级时对照双端版本）。
+	Version             string `json:"version,omitempty"`
 	ConsecutiveFailures int    `json:"consecutiveFailures"`
 	// LastProbeAt RFC3339；空串表示还没探测过。
 	LastProbeAt string `json:"lastProbeAt,omitempty"`

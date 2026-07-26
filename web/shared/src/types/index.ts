@@ -648,6 +648,26 @@ export interface PluginInfo {
   enabled: boolean;
   healthy: boolean;
   status: PluginStatusItem[];
+  /** 管理员导入的声明式外部插件（可删除）；内置插件为 false。 */
+  external?: boolean;
+  /** 外部插件的可选主页外链（仅展示）。 */
+  homepage?: string;
+}
+
+/** 外部插件 manifest（schemaVersion 1），导入弹窗本地预览用。 */
+export interface ExternalPluginManifest {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  description?: string;
+  version: string;
+  /** lucide 图标名（小写）。 */
+  icon?: string;
+  category?: string;
+  /** 可选：外部服务健康检查地址，插件卡片按它显示健康状态。 */
+  healthUrl?: string;
+  /** 可选：仅展示用主页外链。 */
+  homepage?: string;
 }
 
 // ============ 高可用管理 ============
@@ -683,6 +703,8 @@ export interface HaPeerInfo {
   txid?: string;
   draining: boolean;
   busyStreams: number;
+  /** 对端自报的应用版本（滚动升级时对照双端版本）。 */
+  version?: string;
   consecutiveFailures: number;
   /** RFC3339；缺省表示还没探测过。 */
   lastProbeAt?: string;
@@ -719,4 +741,59 @@ export interface HaStatus {
   peer?: HaPeerInfo;
   lease?: HaLeaseInfo;
   switch: HaSwitchInfo;
+}
+
+// ============ 应用内自更新 ============
+
+/** 更新状态机取值（对齐 internal/update/manager.go 的 State* 常量）。 */
+export type UpdateState =
+  | 'idle'
+  | 'checking'
+  | 'update-available'
+  | 'downloading'
+  | 'verifying'
+  | 'staged'
+  | 'restarting'
+  | 'failed';
+
+/** 最新 Release 摘要。 */
+export interface UpdateReleaseInfo {
+  version: string;
+  /** 发布说明（服务端已截断，纯文本渲染）。 */
+  notes?: string;
+  publishedAt?: string;
+  assetSize: number;
+}
+
+/** 下载进度（字节）。 */
+export interface UpdateProgress {
+  downloadedBytes: number;
+  totalBytes: number;
+}
+
+/** 已暂存待重启生效的版本。 */
+export interface UpdateStagedInfo {
+  version: string;
+  stagedAt: string;
+}
+
+/** 更新失败信息（code 机器可读）。 */
+export interface UpdateErrorInfo {
+  code: string;
+  message: string;
+}
+
+/** GET /admin/update/status 响应。 */
+export interface UpdateStatus {
+  currentVersion: string;
+  commit?: string;
+  enabled: boolean;
+  /** enabled=false 的原因："dev-build"（开发构建）/ "env-disabled"（UPDATE_DISABLED）。 */
+  disabledReason?: 'dev-build' | 'env-disabled';
+  state: UpdateState;
+  lastCheckedAt?: string;
+  latest?: UpdateReleaseInfo;
+  progress?: UpdateProgress;
+  staged?: UpdateStagedInfo;
+  error?: UpdateErrorInfo;
 }

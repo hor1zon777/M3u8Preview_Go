@@ -272,20 +272,25 @@ type Config struct {
 	ECDHPrivateKeyPath   string
 	ThumbnailConcurrency int
 	PosterConcurrency    int
+	// PluginHealthAllowPrivate 允许外部插件的 healthUrl 指向内网/保留地址
+	// （自托管场景健康检查内网服务常见）。默认 false：拒绝内网并用 SafeFetch 防 SSRF。
+	PluginHealthAllowPrivate bool
+	// UpdateDisabled 关闭应用内自更新（检查与安装均拒绝）的逃生开关。
+	UpdateDisabled bool
 	// HA 主备高可用；未配置时全部为零值，行为与改造前完全一致。
 	HA HAConfig
 }
 
 // 已知的弱默认值：这些值出现在生产必须 fatal
 var weakDefaults = map[string]bool{
-	"change-me-in-production":                             true,
-	"change-me-in-production-refresh":                     true,
-	"change-me-proxy-secret-in-production":                true,
-	"dev-jwt-secret":                                      true,
-	"dev-jwt-refresh-secret":                              true,
-	"dev-proxy-secret":                                    true,
-	"m3u8preview-docker-default-secret-key-change-me":     true,
-	"m3u8preview-docker-default-refresh-key-change-me":    true,
+	"change-me-in-production":                          true,
+	"change-me-in-production-refresh":                  true,
+	"change-me-proxy-secret-in-production":             true,
+	"dev-jwt-secret":                                   true,
+	"dev-jwt-refresh-secret":                           true,
+	"dev-proxy-secret":                                 true,
+	"m3u8preview-docker-default-secret-key-change-me":  true,
+	"m3u8preview-docker-default-refresh-key-change-me": true,
 }
 
 // Load 读取 .env 并返回 Config。projectRoot 用来定位 .env 文件；传空时取可执行文件所在目录的上级。
@@ -334,14 +339,16 @@ func Load(projectRoot string) (*Config, error) {
 		Bcrypt: BcryptConfig{
 			SaltRounds: 12,
 		},
-		TrustCDN:             parseBoolDefault(os.Getenv("TRUST_CDN"), true),
-		CookieSecure:         parseCookieSecure(os.Getenv("COOKIE_SECURE"), getenv("CORS_ORIGIN", "http://localhost:5173")),
-		CookieSecureAuto:     os.Getenv("COOKIE_SECURE") == "",
-		UploadsDir:           getenv("UPLOADS_DIR", filepath.Join(projectRoot, "uploads")),
-		DataDir:              getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
-		PublicBaseURL:        strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
-		ThumbnailConcurrency: clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
-		PosterConcurrency:    clamp(atoiDefault(os.Getenv("POSTER_MIGRATION_CONCURRENCY"), 2), 1, 10),
+		TrustCDN:                 parseBoolDefault(os.Getenv("TRUST_CDN"), true),
+		PluginHealthAllowPrivate: parseBoolDefault(os.Getenv("PLUGIN_HEALTH_ALLOW_PRIVATE"), false),
+		UpdateDisabled:           parseBoolDefault(os.Getenv("UPDATE_DISABLED"), false),
+		CookieSecure:             parseCookieSecure(os.Getenv("COOKIE_SECURE"), getenv("CORS_ORIGIN", "http://localhost:5173")),
+		CookieSecureAuto:         os.Getenv("COOKIE_SECURE") == "",
+		UploadsDir:               getenv("UPLOADS_DIR", filepath.Join(projectRoot, "uploads")),
+		DataDir:                  getenv("DATA_DIR", filepath.Join(projectRoot, "data")),
+		PublicBaseURL:            strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		ThumbnailConcurrency:     clamp(atoiDefault(os.Getenv("THUMBNAIL_CONCURRENCY"), 5), 1, 20),
+		PosterConcurrency:        clamp(atoiDefault(os.Getenv("POSTER_MIGRATION_CONCURRENCY"), 2), 1, 10),
 		Subtitle: SubtitleConfig{
 			Enabled:              parseBoolDefault(os.Getenv("SUBTITLE_ENABLED"), false),
 			WhisperBin:           getenv("SUBTITLE_WHISPER_BIN", "whisper-cli"),
@@ -387,9 +394,9 @@ func Load(projectRoot string) (*Config, error) {
 
 	// HA：全部可选。LITEFS_DIR 未设置时整块保持零值，服务行为与单机部署一致。
 	cfg.HA = HAConfig{
-		LiteFSDir:       strings.TrimRight(os.Getenv("LITEFS_DIR"), "/"),
-		NodeID:          strings.TrimSpace(os.Getenv("HA_NODE_ID")),
-		PeerID:          strings.TrimSpace(os.Getenv("HA_PEER_ID")),
+		LiteFSDir:        strings.TrimRight(os.Getenv("LITEFS_DIR"), "/"),
+		NodeID:           strings.TrimSpace(os.Getenv("HA_NODE_ID")),
+		PeerID:           strings.TrimSpace(os.Getenv("HA_PEER_ID")),
 		Preferred:        parseBoolDefault(os.Getenv("HA_PREFERRED"), false),
 		ForceRole:        strings.ToLower(strings.TrimSpace(os.Getenv("HA_FORCE_ROLE"))),
 		PeerBaseURL:      strings.TrimRight(os.Getenv("HA_PEER_BASE_URL"), "/"),
@@ -399,11 +406,11 @@ func Load(projectRoot string) (*Config, error) {
 		PeerPublicIP:     strings.TrimSpace(os.Getenv("HA_PEER_PUBLIC_IP")),
 		RoleFilePath:     os.Getenv("HA_ROLE_FILE"),
 		SelfPublicIP:     strings.TrimSpace(os.Getenv("HA_SELF_PUBLIC_IP")),
-		CFAPIToken:      strings.TrimSpace(os.Getenv("CF_API_TOKEN")),
-		CFZoneID:        strings.TrimSpace(os.Getenv("CF_ZONE_ID")),
-		CFRecordName:    strings.TrimSpace(os.Getenv("HA_DNS_RECORD")),
-		CFLeaseRecord:   strings.TrimSpace(os.Getenv("HA_LEASE_RECORD")),
-		CFHandoffRecord: strings.TrimSpace(os.Getenv("HA_HANDOFF_RECORD")),
+		CFAPIToken:       strings.TrimSpace(os.Getenv("CF_API_TOKEN")),
+		CFZoneID:         strings.TrimSpace(os.Getenv("CF_ZONE_ID")),
+		CFRecordName:     strings.TrimSpace(os.Getenv("HA_DNS_RECORD")),
+		CFLeaseRecord:    strings.TrimSpace(os.Getenv("HA_LEASE_RECORD")),
+		CFHandoffRecord:  strings.TrimSpace(os.Getenv("HA_HANDOFF_RECORD")),
 	}
 	if cfg.HA.RoleFilePath == "" {
 		cfg.HA.RoleFilePath = filepath.Join(cfg.DataDir, "litefs-role")

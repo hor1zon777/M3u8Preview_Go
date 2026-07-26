@@ -104,6 +104,7 @@ func (h *HAHandler) status(c *gin.Context) {
 				TXID:                snap.Peer.TXID,
 				Draining:            snap.Peer.Draining,
 				BusyStreams:         snap.Peer.BusyStreams,
+				Version:             snap.Peer.Version,
 				ConsecutiveFailures: snap.PeerFailures,
 				LastProbeAt:         snap.PeerProbedAt.UTC().Format(time.RFC3339),
 			}

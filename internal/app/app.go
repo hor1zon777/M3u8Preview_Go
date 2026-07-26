@@ -27,7 +27,9 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/model"
 	"github.com/hor1zon777/m3u8-preview-go/internal/plugin"
 	"github.com/hor1zon777/m3u8-preview-go/internal/service"
+	"github.com/hor1zon777/m3u8-preview-go/internal/update"
 	"github.com/hor1zon777/m3u8-preview-go/internal/util"
+	"github.com/hor1zon777/m3u8-preview-go/internal/version"
 )
 
 // Deps 是跨请求复用的 singleton 集合。
@@ -63,6 +65,10 @@ type Deps struct {
 	// nil 表示未启用租约仲裁；其全部方法都能安全地零值调用。
 	// /api/health 与 /admin/ha/* 都通过闭包延迟读取本字段。
 	HAAgent *ha.Agent
+
+	// UpdateMgr 应用内自更新状态机（Build 内构造）。
+	// main.go 的 select 消费 RestartRequested() 通道执行进程自退。
+	UpdateMgr *update.Manager
 }
 
 // NewDeps 构造跨请求 singleton。
@@ -380,6 +386,21 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	)
 	haH.Register(haGroup)
 
+	// ---- 应用内自更新 ----
+	// 同样挂在 r 而非 v1 上（不受 RequirePrimary 写闸门）：滚动升级要求先在
+	// replica 节点上执行更新——apply 只写本机 /data 的暂存目录，不写 SQLite；
+	// 也不能被前端对 NODE_READ_ONLY 503 的自动重试静默重放。
+	deps.UpdateMgr = update.New(cfg.DataDir, version.Version, version.Commit, cfg.UpdateDisabled)
+	deps.UpdateMgr.Start()
+	updateH := handler.NewUpdateHandler(deps.UpdateMgr)
+	updateGroup := r.Group("/api/v1/admin/update")
+	updateGroup.Use(
+		middleware.ConditionalRateLimit(deps.RateLimitCache, globalLimiterMW, nil),
+		middleware.Authenticate(authDeps),
+		requireAdmin,
+	)
+	updateH.Register(updateGroup)
+
 	// ---- Backup 模块（阶段 I-2）----
 	// 传入 SubtitlesDir 让 backup 服务能定位 VTT 文件（用户可能配置 SUBTITLE_DIR 指向 uploadsDir 外部）。
 	backupSvc := service.NewBackupService(db, cfg.UploadsDir, cfg.Subtitle.SubtitlesDir)
@@ -460,7 +481,20 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	if err := pluginReg.Register(plugin.NewSubtitleWorkerPlugin(subtitleSvc)); err != nil {
 		log.Fatalf("[plugin] register subtitle-worker: %v", err)
 	}
-	pluginH := handler.NewPluginHandler(pluginReg)
+
+	// 声明式外部插件：启动时从 DB 装载注册。单条失败只告警不 fatal——
+	// 一条脏记录不该阻断整个服务启动（内置插件注册失败才是编码错误）。
+	extPluginSvc := service.NewExternalPluginService(db, cfg.PluginHealthAllowPrivate)
+	if recs, err := extPluginSvc.ListAll(); err != nil {
+		log.Printf("[plugin] 装载外部插件失败: %v", err)
+	} else {
+		for i := range recs {
+			if err := pluginReg.Register(plugin.NewExternal(extPluginSvc, recs[i])); err != nil {
+				log.Printf("[plugin] 注册外部插件 %s 失败: %v", recs[i].ID, err)
+			}
+		}
+	}
+	pluginH := handler.NewPluginHandler(pluginReg, extPluginSvc)
 	pluginGroup := v1.Group("/admin/plugins")
 	pluginGroup.Use(middleware.Authenticate(authDeps), requireAdmin)
 	pluginH.Register(pluginGroup)

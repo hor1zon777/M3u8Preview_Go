@@ -52,6 +52,16 @@ RUN VERSION="$(cat VERSION)" \
       -o /out/server ./cmd/server
 
 # ====================================================================
+# Stage 2.5: Release 产物导出。
+# 仅 CI 的 release job 以 --target artifacts 提取（server 二进制 + 前端 dist，
+# 打包进 GitHub Release 供应用内自更新下载）；默认构建目标仍是最后的 runner，
+# 本 stage 对镜像构建零影响。
+# ====================================================================
+FROM scratch AS artifacts
+COPY --from=go-builder /out/server /server
+COPY --from=web-builder /web/client/dist /web-dist
+
+# ====================================================================
 # Stage 3: Runtime，体积 ≈ 90MB（alpine + ffmpeg + su-exec + 前端 dist）
 # ====================================================================
 FROM alpine:3.20 AS runner
@@ -79,6 +89,9 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
  && chown -R appuser:appgroup /data /app/uploads /app/web
 
 COPY --from=go-builder /out/server /app/server
+# 镜像自带的版本号副本：entrypoint 的自更新装载日志用（权威判定在
+# `server update-preflight` 子命令里，它直接用 ldflags 注入的版本）。
+COPY VERSION /app/VERSION
 # 前端构建产物：同时拷到 dist 与 dist-image。
 # dist-image 是镜像内的只读副本，entrypoint 每次启动会同步到挂载的 client-dist volume，
 # 这样重建镜像后 volume 里的旧 dist 也会被刷新（Docker 命名卷仅首次从镜像初始化）。

@@ -39,6 +39,8 @@ type PeerStatus struct {
 	BusyStreams int
 	// Epoch 对端观察到的租约世代号。
 	Epoch int64
+	// Version 对端自报的应用版本（滚动升级时管理面板展示双端版本用）。
+	Version string
 	// Err 探测失败原因，供日志排查。
 	Err error
 }
@@ -134,6 +136,7 @@ func (p *Prober) fetch(ctx context.Context) PeerStatus {
 		Draining    bool   `json:"draining"`
 		BusyStreams int    `json:"busyStreams"`
 		Epoch       int64  `json:"epoch"`
+		Version     string `json:"version"`
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {
@@ -151,6 +154,7 @@ func (p *Prober) fetch(ctx context.Context) PeerStatus {
 		Draining:    body.Draining,
 		BusyStreams: body.BusyStreams,
 		Epoch:       body.Epoch,
+		Version:     body.Version,
 	}
 }
 

@@ -58,6 +58,13 @@ type Plugin interface {
 	Status() Status
 }
 
+// ExternalMarker 标记"管理员导入的声明式外部插件"（见 external.go）。
+// handler 借类型断言区分内置/外部：只有外部插件允许删除，
+// 内置插件的删除保护放在 handler 而非 Registry——注册表不该知道谁是内置。
+type ExternalMarker interface {
+	IsExternal() bool
+}
+
 // Registry 线程安全的插件注册表。注册发生在启动期（app.Build），
 // 查询发生在请求期，读多写少，用 RWMutex 足够。
 type Registry struct {
@@ -107,4 +114,22 @@ func (r *Registry) Get(id string) (Plugin, bool) {
 	defer r.mu.RUnlock()
 	p, ok := r.byID[id]
 	return p, ok
+}
+
+// Unregister 按 ID 摘除插件（外部插件删除时用），返回是否存在。
+// 注册表本身不区分内置/外部——调用方（handler）负责内置插件的删除保护。
+func (r *Registry) Unregister(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.byID[id]; !ok {
+		return false
+	}
+	delete(r.byID, id)
+	for i, p := range r.ordered {
+		if p.Meta().ID == id {
+			r.ordered = append(r.ordered[:i], r.ordered[i+1:]...)
+			break
+		}
+	}
+	return true
 }

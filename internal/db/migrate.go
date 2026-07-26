@@ -31,6 +31,8 @@ func allModels() []any {
 		// 远程字幕 worker：先建 token 表（worker 表外键引用它）
 		&model.SubtitleWorkerToken{},
 		&model.SubtitleWorker{},
+		// 插件中心导入的声明式外部插件
+		&model.ExternalPlugin{},
 	}
 }
 

@@ -8,6 +8,7 @@ import { BackupSection } from '../components/admin/BackupSection.js';
 import { PosterSection } from '../components/admin/PosterSection.js';
 import { SystemInfoCard } from '../components/admin/SystemInfoCard.js';
 import { HaSetupHintCard } from '../components/admin/HaSetupHintCard.js';
+import { UpdateCard } from '../components/admin/UpdateCard.js';
 
 export function AdminDashboardPage() {
   const queryClient = useQueryClient();
@@ -619,6 +620,9 @@ export function AdminDashboardPage() {
           </div>
         </div>
       </div>
+
+      {/* 软件更新（检查版本 / 一键更新） */}
+      <UpdateCard />
 
       <SystemInfoCard />
     </div>

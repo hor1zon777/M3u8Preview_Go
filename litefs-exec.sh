@@ -10,8 +10,10 @@
 # 实测发现 appuser 无法写入时，设 LITEFS_RUN_AS_ROOT=1 即可改为 root 运行。
 set -eu
 
+# RUN_SERVER 由 docker-entrypoint.sh 导出（litefs mount 会把环境透传到这里）：
+# 自更新装载生效时指向容器层的 /app/server-staged，否则回退镜像内 /app/server。
 if [ "${LITEFS_RUN_AS_ROOT:-0}" = "1" ] || [ "$(id -u)" -ne 0 ]; then
-  exec /app/server
+  exec "${RUN_SERVER:-/app/server}"
 fi
 
-exec su-exec appuser:appgroup /app/server
+exec su-exec appuser:appgroup "${RUN_SERVER:-/app/server}"

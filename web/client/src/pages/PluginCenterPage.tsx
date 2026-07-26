@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import {
@@ -9,9 +10,28 @@ import {
   CircleCheck,
   TriangleAlert,
   CirclePause,
+  Upload,
+  Trash2,
+  ExternalLink,
+  Server,
+  Database,
+  Globe,
+  Cloud,
+  Activity,
+  Shield,
+  Bot,
+  Webhook,
+  HardDrive,
+  Monitor,
+  Link2,
+  Plug,
+  Radio,
+  Cpu,
+  Box,
 } from 'lucide-react';
 import { pluginApi } from '../services/pluginApi.js';
 import { Toggle } from '../components/ui/Toggle.js';
+import { PluginImportModal } from '../components/admin/PluginImportModal.js';
 import type { PluginInfo, PluginStatusItem } from '@m3u8-preview/shared';
 
 /**
@@ -20,6 +40,7 @@ import type { PluginInfo, PluginStatusItem } from '@m3u8-preview/shared';
  *
  * 插件的详情管理页由前端按 id 映射（PLUGIN_DETAIL_ROUTES）；
  * 后端新注册而前端尚无对应页面的插件只展示卡片（开关 + 状态可用）。
+ * 管理员也可导入声明式外部插件（manifest.json），卡片带"外部"徽标并可删除。
  */
 
 /** 插件 id → 详情管理页路由。新插件有管理界面时在此登记。 */
@@ -27,13 +48,35 @@ const PLUGIN_DETAIL_ROUTES: Record<string, string> = {
   'subtitle-worker': '/admin/plugins/subtitle-worker',
 };
 
-/** 插件 id → 卡片图标；未登记时兜底 Puzzle。 */
+/** 插件 id → 卡片图标；未登记时按 Meta.Icon 名称查 ICON_BY_NAME，最后兜底 Puzzle。 */
 const PLUGIN_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
   'subtitle-worker': Subtitles,
 };
 
+/** Meta.Icon（lucide 名）→ 组件的精选静态映射：外部插件声明图标用。
+ *  刻意不做动态 import 全量 lucide——静态白名单才能被 tree-shaking。 */
+const ICON_BY_NAME: Record<string, React.ComponentType<{ className?: string }>> = {
+  server: Server,
+  database: Database,
+  globe: Globe,
+  cloud: Cloud,
+  activity: Activity,
+  shield: Shield,
+  bot: Bot,
+  webhook: Webhook,
+  'hard-drive': HardDrive,
+  monitor: Monitor,
+  link: Link2,
+  plug: Plug,
+  radio: Radio,
+  cpu: Cpu,
+  box: Box,
+  subtitles: Subtitles,
+};
+
 export function PluginCenterPage() {
   const queryClient = useQueryClient();
+  const [importOpen, setImportOpen] = useState(false);
 
   const { data: plugins = [], isLoading, refetch, isFetching } = useQuery({
     queryKey: ['admin', 'plugins'],
@@ -50,13 +93,31 @@ export function PluginCenterPage() {
           <h1 className="text-2xl font-semibold text-white">插件中心</h1>
           <span className="text-sm text-emby-text-secondary">{plugins.length} 个插件</span>
         </div>
-        <button
-          onClick={() => refetch()}
-          className="px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors flex items-center gap-2"
-        >
-          <RefreshCw className={`w-4 h-4 ${isFetching ? 'animate-spin' : ''}`} /> 刷新
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setImportOpen(true)}
+            className="px-3 py-1.5 text-sm rounded-md bg-emby-green text-white hover:bg-emby-green-dark transition-colors flex items-center gap-2"
+          >
+            <Upload className="w-4 h-4" /> 导入插件
+          </button>
+          <button
+            onClick={() => refetch()}
+            className="px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors flex items-center gap-2"
+          >
+            <RefreshCw className={`w-4 h-4 ${isFetching ? 'animate-spin' : ''}`} /> 刷新
+          </button>
+        </div>
       </div>
+
+      {importOpen && (
+        <PluginImportModal
+          onClose={() => setImportOpen(false)}
+          onImported={() => {
+            setImportOpen(false);
+            queryClient.invalidateQueries({ queryKey: ['admin', 'plugins'] });
+          }}
+        />
+      )}
 
       {isLoading ? (
         <div className="py-16 text-center text-emby-text-secondary text-sm">
@@ -88,7 +149,8 @@ export function PluginCenterPage() {
 }
 
 function PluginCard({ plugin, onChanged }: { plugin: PluginInfo; onChanged: (next: PluginInfo) => void }) {
-  const Icon = PLUGIN_ICONS[plugin.id] ?? Puzzle;
+  const queryClient = useQueryClient();
+  const Icon = PLUGIN_ICONS[plugin.id] ?? ICON_BY_NAME[plugin.icon] ?? Puzzle;
   const detailRoute = PLUGIN_DETAIL_ROUTES[plugin.id];
 
   const toggleMutation = useMutation({
@@ -102,6 +164,24 @@ function PluginCard({ plugin, onChanged }: { plugin: PluginInfo; onChanged: (nex
       alert(msg);
     },
   });
+
+  const removeMutation = useMutation({
+    mutationFn: () => pluginApi.remove(plugin.id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin', 'plugins'] }),
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error
+        ?? (err as { message?: string })?.message
+        ?? '删除失败';
+      alert(msg);
+    },
+  });
+
+  function handleRemove() {
+    if (removeMutation.isPending) return;
+    if (!confirm(`删除外部插件「${plugin.name}」？只移除插件声明，不影响外部服务本身。`)) return;
+    removeMutation.mutate();
+  }
 
   function handleToggle() {
     if (toggleMutation.isPending) return;
@@ -124,6 +204,11 @@ function PluginCard({ plugin, onChanged }: { plugin: PluginInfo; onChanged: (nex
             <span className="px-1.5 py-0.5 text-[10px] rounded bg-emby-bg-elevated border border-emby-border text-emby-text-secondary font-mono">
               {plugin.version}
             </span>
+            {plugin.external && (
+              <span className="px-1.5 py-0.5 text-[10px] rounded bg-blue-500/10 border border-blue-500/30 text-blue-400">
+                外部
+              </span>
+            )}
           </div>
           <div className="text-[11px] text-emby-text-muted mt-0.5">{plugin.category}</div>
         </div>
@@ -155,6 +240,29 @@ function PluginCard({ plugin, onChanged }: { plugin: PluginInfo; onChanged: (nex
           >
             进入管理 <ChevronRight className="w-4 h-4" />
           </Link>
+        ) : plugin.external ? (
+          <div className="flex items-center gap-2">
+            {plugin.homepage && (
+              <a
+                href={plugin.homepage}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 px-3 py-2 text-sm rounded-md bg-emby-bg-elevated border border-emby-border text-emby-text-primary hover:bg-emby-bg-input transition-colors flex items-center justify-center gap-1.5"
+              >
+                <ExternalLink className="w-3.5 h-3.5" /> 主页
+              </a>
+            )}
+            <button
+              onClick={handleRemove}
+              disabled={removeMutation.isPending}
+              className="flex-1 px-3 py-2 text-sm rounded-md border border-red-500/40 text-red-400 hover:bg-red-500/10 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {removeMutation.isPending
+                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                : <Trash2 className="w-3.5 h-3.5" />}
+              删除
+            </button>
+          </div>
         ) : (
           <div className="text-center text-[11px] text-emby-text-muted py-2">该插件没有独立管理界面</div>
         )}

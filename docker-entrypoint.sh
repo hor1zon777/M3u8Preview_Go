@@ -22,10 +22,39 @@ mkdir -p "$DATA_DIR" "$UPLOADS_DIR/posters" "$UPLOADS_DIR/thumbnails" "$WEB_DIST
 #      在 root 阶段直接放开权限，确保 appuser 可读写。
 chmod -R 777 "$DATA_DIR" "$UPLOADS_DIR" 2>/dev/null || true
 
+# 1.7) 应用内自更新的 staged 装载（见 docs/self-update.md）。
+#      判定逻辑（semver 比较 / 哈希自检 / 启动尝试计数）全部在 Go 子命令
+#      update-preflight 里——执行它的永远是镜像内二进制，其自身版本即镜像版本。
+#      通过预检时把 staged 二进制 cp 到容器层再执行（/data 可能挂了 noexec），
+#      并把启动尝试计数 +1；server 监听成功后会清零计数，连续 3 次失败则
+#      下次预检自动弃用 staged 回退镜像版——不改变任何既有安全边界：
+#      cp 由 root 完成，appuser 仍然无法写 /app。
+RUN_SERVER="/app/server"
+UPDATES_DIR="$DATA_DIR/updates"
+STAGED_DIR="$UPDATES_DIR/staged"
+if [ "$(id -u)" -eq 0 ] && [ -f "$STAGED_DIR/server" ]; then
+  if /app/server update-preflight; then
+    cp -f "$STAGED_DIR/server" /app/server-staged
+    chmod 0755 /app/server-staged
+    RUN_SERVER="/app/server-staged"
+    n=$(cat "$UPDATES_DIR/attempts" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$UPDATES_DIR/attempts"
+    echo "[entrypoint] 自更新: 使用暂存版本 $(cat "$STAGED_DIR/VERSION" 2>/dev/null || echo '?')（镜像版 $(cat /app/VERSION 2>/dev/null || echo '?')，第 $((n + 1)) 次启动尝试）"
+  else
+    echo "[entrypoint] 自更新: 暂存版本未通过预检，使用镜像内版本"
+  fi
+fi
+export RUN_SERVER
+
 # 2) 同步前端构建产物到 volume。
 #    Docker 命名卷仅在首次从镜像初始化，后续重建镜像不会自动更新；
 #    这里每次启动都 rsync 式覆盖，确保 nginx 挂到的 volume 永远是最新一次 build。
-if [ -d "$WEB_DIST_IMAGE_DIR" ]; then
+#    staged 更新生效时改用 staged 内的 web-dist——前端与二进制必须同源切换，
+#    否则新后端配旧前端会出现 API 不匹配。
+if [ "$RUN_SERVER" = "/app/server-staged" ] && [ -d "$STAGED_DIR/web-dist" ]; then
+  rm -rf "${WEB_DIST_DIR:?}"/*
+  cp -a "$STAGED_DIR/web-dist"/. "$WEB_DIST_DIR"/
+elif [ -d "$WEB_DIST_IMAGE_DIR" ]; then
   rm -rf "${WEB_DIST_DIR:?}"/*
   cp -a "$WEB_DIST_IMAGE_DIR"/. "$WEB_DIST_DIR"/
 fi
@@ -109,4 +138,10 @@ if [ -n "${LITEFS_DIR:-}" ]; then
   exec litefs mount
 fi
 
+# 自更新装载生效时，把启动目标换成容器层的 staged 二进制副本。
+# （单机路径；HA 路径由 litefs-exec.sh 读同一个 RUN_SERVER 环境变量。）
+if [ "$RUN_SERVER" != "/app/server" ] && [ "$1" = "/app/server" ]; then
+  shift
+  set -- "$RUN_SERVER" "$@"
+fi
 exec su-exec appuser:appgroup "$@"

@@ -8,10 +8,10 @@ type fakePlugin struct {
 	enabled bool
 }
 
-func (f *fakePlugin) Meta() Meta                { return Meta{ID: f.id, Name: "fake-" + f.id} }
-func (f *fakePlugin) Enabled() bool             { return f.enabled }
-func (f *fakePlugin) SetEnabled(v bool) error   { f.enabled = v; return nil }
-func (f *fakePlugin) Status() Status            { return Status{Healthy: true} }
+func (f *fakePlugin) Meta() Meta              { return Meta{ID: f.id, Name: "fake-" + f.id} }
+func (f *fakePlugin) Enabled() bool           { return f.enabled }
+func (f *fakePlugin) SetEnabled(v bool) error { f.enabled = v; return nil }
+func (f *fakePlugin) Status() Status          { return Status{Healthy: true} }
 
 func TestRegistryRegisterAndGet(t *testing.T) {
 	r := NewRegistry()
@@ -45,6 +45,34 @@ func TestRegistryRejectsInvalid(t *testing.T) {
 	}
 	if err := r.Register(&fakePlugin{id: "dup"}); err == nil {
 		t.Fatalf("register 重复 ID 应报错")
+	}
+}
+
+func TestRegistryUnregister(t *testing.T) {
+	r := NewRegistry()
+	for _, id := range []string{"a", "b", "c"} {
+		if err := r.Register(&fakePlugin{id: id}); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+
+	if !r.Unregister("b") {
+		t.Fatalf("Unregister(b) 应返回 true")
+	}
+	if _, ok := r.Get("b"); ok {
+		t.Fatalf("Unregister 后 Get(b) 不应命中")
+	}
+	// ordered 与 byID 必须同步移除，且剩余顺序保持
+	got := r.List()
+	if len(got) != 2 || got[0].Meta().ID != "a" || got[1].Meta().ID != "c" {
+		t.Fatalf("Unregister 后顺序错乱: %v", got)
+	}
+	if r.Unregister("missing") {
+		t.Fatalf("Unregister 不存在的 ID 应返回 false")
+	}
+	// 摘除后同 ID 可重新注册（覆盖导入失败重试的场景）
+	if err := r.Register(&fakePlugin{id: "b"}); err != nil {
+		t.Fatalf("Unregister 后重新注册应成功: %v", err)
 	}
 }
 

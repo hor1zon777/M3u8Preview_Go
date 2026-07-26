@@ -21,4 +21,21 @@ export const pluginApi = {
     );
     return data.data!;
   },
+
+  /** 导入声明式外部插件（manifest.json）。overwrite=true 时对同 id 外部插件按升级处理。 */
+  async importManifest(file: File, overwrite = false): Promise<PluginInfo> {
+    const form = new FormData();
+    form.append('file', file);
+    const { data } = await api.post<ApiResponse<PluginInfo>>(
+      `/admin/plugins/import${overwrite ? '?overwrite=true' : ''}`,
+      form,
+      { headers: { 'Content-Type': 'multipart/form-data' } },
+    );
+    return data.data!;
+  },
+
+  /** 删除外部插件（内置插件服务端拒绝）。 */
+  async remove(id: string): Promise<void> {
+    await api.delete(`/admin/plugins/${encodeURIComponent(id)}`);
+  },
 };

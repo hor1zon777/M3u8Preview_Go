@@ -67,3 +67,82 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+  # 打 v* tag 时创建 GitHub Release，附应用内自更新所需的产物：
+  #   m3u8preview_<tag>_linux_amd64.tar.gz  （server 二进制 + 前端 dist + 版本元数据）
+  #   checksums.txt                          （sha256，客户端下载后必须校验）
+  # 产物通过 --target artifacts 从同一份 Dockerfile 构建提取（复用 gha 缓存），
+  # 与推送到 GHCR 的镜像内容必然同源。
+  release:
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 防呆：tag 必须等于 v<VERSION> 或其预发版本（v<VERSION>-rc.1 等），
+      # 否则发出去的产物版本号自相矛盾。
+      - name: Verify VERSION matches tag
+        run: |
+          VER="$(cat VERSION)"
+          case "${GITHUB_REF_NAME}" in
+            "v${VER}"|"v${VER}-"*) echo "tag ${GITHUB_REF_NAME} 与 VERSION ${VER} 一致" ;;
+            *) echo "::error::tag ${GITHUB_REF_NAME} 与 VERSION 文件 ${VER} 不一致"; exit 1 ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare build metadata
+        id: buildmeta
+        run: |
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release artifacts
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: artifacts
+          build-args: |
+            GIT_COMMIT=${{ steps.buildmeta.outputs.commit }}
+            BUILD_TIME=${{ steps.buildmeta.outputs.time }}
+          outputs: type=local,dest=./artifacts
+          cache-from: type=gha
+          platforms: linux/amd64
+
+      - name: Pack tarball + checksums
+        id: pack
+        run: |
+          # 包内版本号取 VERSION 文件（与二进制 ldflags 注入值一致）；
+          # 资产文件名取 tag（预发 tag 会带 -rc 后缀，便于区分）。
+          VER="$(cat VERSION)"
+          mkdir pkg
+          cp artifacts/server pkg/server
+          cp -r artifacts/web-dist pkg/web-dist
+          printf '%s\n' "$VER" > pkg/VERSION
+          printf '{"version":"%s","commit":"%s","buildTime":"%s"}\n' \
+            "$VER" "${{ steps.buildmeta.outputs.commit }}" "${{ steps.buildmeta.outputs.time }}" > pkg/release.json
+          NAME="m3u8preview_${GITHUB_REF_NAME#v}_linux_amd64.tar.gz"
+          tar -czf "$NAME" -C pkg .
+          sha256sum "$NAME" > checksums.txt
+          echo "asset=$NAME" >> "$GITHUB_OUTPUT"
+
+      # 含连字符的 tag（v0.4.0-rc.1）标记为 prerelease：
+      # 不会被 releases/latest 选中，可安全地用来演练发布流程。
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXTRA=""
+          case "${GITHUB_REF_NAME}" in *-*) EXTRA="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            $EXTRA \
+            "${{ steps.pack.outputs.asset }}" checksums.txt

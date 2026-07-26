@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/ha"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
 	"github.com/hor1zon777/m3u8-preview-go/internal/service"
+	"github.com/hor1zon777/m3u8-preview-go/internal/update"
 	"github.com/hor1zon777/m3u8-preview-go/internal/version"
 )
 
@@ -42,6 +44,17 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "ha-resolve-role" {
 		runResolveRole(projectRoot)
 		return
+	}
+	// update-preflight 同样由 entrypoint 在启动主进程前调用（以 root）：
+	// 判定 /data 下暂存的自更新版本是否可装载，退出码 0=用 staged / 1=用镜像版。
+	// 执行本子命令的永远是镜像内二进制，version.Version 即镜像版本。
+	if len(os.Args) > 1 && os.Args[1] == "update-preflight" {
+		cfg, err := config.Load(projectRoot)
+		if err != nil {
+			log.Printf("[update-preflight] 加载配置失败: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(update.RunPreflight(cfg.DataDir, version.Version))
 	}
 
 	cfg := config.MustLoad(projectRoot)
@@ -105,12 +118,21 @@ func main() {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
+	// 显式两步监听而非 ListenAndServe：成功绑定端口即判定"本次启动成功"，
+	// 立刻清空自更新的启动尝试计数——崩溃循环的定义就是走不到这一步
+	// （见 internal/update/preflight.go 的回滚闭环）。
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+	update.MarkStartupOK(cfg.DataDir)
+
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("Server running on http://%s", addr)
 		log.Printf("Environment: %s", cfg.NodeEnv)
 		log.Printf("Version: %s (built %s)", version.String(), version.BuildTime)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 	}()
@@ -125,6 +147,7 @@ func main() {
 			log.Printf("forced shutdown: %v", err)
 		}
 		haAgent.Close()
+		deps.UpdateMgr.Close()
 		// 停止字幕 worker（取消运行中的 ffmpeg/whisper 子进程）
 		if deps != nil && deps.SubtitleSvc != nil {
 			deps.SubtitleSvc.Stop()
@@ -146,6 +169,11 @@ func main() {
 		// mount。因此这里主动退出，由 litefs 跟随退出、容器 restart 策略拉起，
 		// entrypoint 重新决议角色后以新身份挂载。
 		log.Printf("[ha] %s；退出进程以新角色重启", reason)
+		shutdown()
+	case <-deps.UpdateMgr.RestartRequested():
+		// 新版本已暂存到 /data/updates/staged：退出进程，容器 restart 策略拉起后
+		// entrypoint 经 update-preflight 判定并装载新版（与 HA 切换同一重启路径）。
+		log.Printf("[update] 新版本已暂存；退出进程以装载更新")
 		shutdown()
 	}
 }
