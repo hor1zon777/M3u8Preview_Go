@@ -24,6 +24,7 @@ import (
 	"github.com/hor1zon777/m3u8-preview-go/internal/litefs"
 	"github.com/hor1zon777/m3u8-preview-go/internal/middleware"
 	"github.com/hor1zon777/m3u8-preview-go/internal/model"
+	"github.com/hor1zon777/m3u8-preview-go/internal/plugin"
 	"github.com/hor1zon777/m3u8-preview-go/internal/service"
 	"github.com/hor1zon777/m3u8-preview-go/internal/util"
 )
@@ -425,6 +426,18 @@ func Build(cfg *config.Config, db *gorm.DB) (*gin.Engine, *Deps) {
 	workerGroup := v1.Group("/worker")
 	workerGroup.Use(middleware.RequireWorkerAuth(db))
 	subtitleWorkerH.Register(workerGroup)
+
+	// ---- 插件中心 ----
+	// 可选功能模块统一注册为插件（编译期注册，见 internal/plugin 包注释）。
+	// 字幕 worker 是第一个插件；新增插件在此 Register 即可出现在前端插件中心。
+	pluginReg := plugin.NewRegistry()
+	if err := pluginReg.Register(plugin.NewSubtitleWorkerPlugin(subtitleSvc)); err != nil {
+		log.Fatalf("[plugin] register subtitle-worker: %v", err)
+	}
+	pluginH := handler.NewPluginHandler(pluginReg)
+	pluginGroup := v1.Group("/admin/plugins")
+	pluginGroup.Use(middleware.Authenticate(authDeps), requireAdmin)
+	pluginH.Register(pluginGroup)
 
 	r.NoRoute(spaFallback(cfg))
 

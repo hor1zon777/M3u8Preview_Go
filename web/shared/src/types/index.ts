@@ -624,3 +624,28 @@ export interface AdminAlert {
   level: 'info' | 'warn' | 'error';
   message: string;
 }
+
+// ============ 插件中心 ============
+
+/** 插件卡片上的一行运行时指标（如「在线 Worker: 2 / 3」）。 */
+export interface PluginStatusItem {
+  label: string;
+  value: string;
+  /** 前端着色提示；缺省为中性色。 */
+  tone?: 'ok' | 'warn' | 'error';
+}
+
+/** GET /admin/plugins 列表项：静态元数据 + 启用状态 + 运行时状态快照。 */
+export interface PluginInfo {
+  /** kebab-case 唯一 ID，同时是详情管理页的前端路由映射键。 */
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  /** lucide 图标名提示；前端可按 id 覆盖映射。 */
+  icon: string;
+  category: string;
+  enabled: boolean;
+  healthy: boolean;
+  status: PluginStatusItem[];
+}

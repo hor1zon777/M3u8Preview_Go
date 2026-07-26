@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { createPortal } from 'react-dom';
+import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Subtitles,
@@ -17,11 +18,19 @@ import {
   X,
   Eye,
   EyeOff,
+  ArrowLeft,
+  ListChecks,
+  Cpu,
 } from 'lucide-react';
 import { subtitleApi } from '../services/subtitleApi.js';
 import { categoryApi } from '../services/categoryApi.js';
-import type { SubtitleJob, SubtitleStatus, SubtitleSettings, SubtitleSettingsUpdate } from '@m3u8-preview/shared';
+import { pluginApi } from '../services/pluginApi.js';
+import type { SubtitleJob, SubtitleStatus, SubtitleSettings, SubtitleSettingsUpdate, PluginInfo } from '@m3u8-preview/shared';
 import { SubtitleWorkersPanel } from '../components/admin/SubtitleWorkersPanel.js';
+import { Toggle } from '../components/ui/Toggle.js';
+
+/** 本页对应的插件 ID（与后端 internal/plugin/subtitle_worker.go 的 Meta.ID 一致）。 */
+const PLUGIN_ID = 'subtitle-worker';
 
 const STATUS_FILTERS: Array<{ value: string; label: string }> = [
   { value: '', label: '全部' },
@@ -46,16 +55,17 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 /**
- * 独立的字幕管理面板。
- * 功能：
- *   - 顶部 5 张状态卡 + 当前配置（脱敏）
- *   - 列表分页 + 状态筛选 + 搜索
- *   - 单条：重试 / 删除 / 切换禁用
- *   - 批量：重试全部失败 / 重新生成全部
- *   - 失败任务的错误信息弹窗
+ * 「字幕 Worker」插件的管理详情页（原独立字幕管理页整体迁入插件中心）。
+ *
+ * 结构：
+ *   - 插件页头：返回插件中心 + 名称/版本 + 启用开关 + 刷新 / 配置按钮
+ *   - Tab「任务管理」：状态卡 + 筛选/搜索/批量工具栏 + 任务列表分页
+ *   - Tab「Worker 节点」：在线 worker / FLAC 转交队列 / Token 管理（SubtitleWorkersPanel）
+ *   - 配置弹窗：whisper / 翻译参数（启用开关已上移到页头，不在弹窗内）
  */
-export function AdminSubtitlesPage() {
+export function SubtitleWorkerPluginPage() {
   const queryClient = useQueryClient();
+  const [tab, setTab] = useState<'jobs' | 'workers'>('jobs');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [statusFilter, setStatusFilter] = useState('');
@@ -66,6 +76,13 @@ export function AdminSubtitlesPage() {
   const [showSettings, setShowSettings] = useState(false);
   // 跨页保留的选中 mediaId 集合
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  // 插件元数据 + 启用状态（与 settings.enabled 同一底层值 subtitle.enabled）
+  const { data: plugins } = useQuery({
+    queryKey: ['admin', 'plugins'],
+    queryFn: () => pluginApi.list(),
+  });
+  const pluginInfo = plugins?.find((p) => p.id === PLUGIN_ID);
 
   const { data: queue, refetch: refetchQueue } = useQuery({
     queryKey: ['admin', 'subtitle', 'queue'],
@@ -141,6 +158,35 @@ export function AdminSubtitlesPage() {
     return () => clearSelection();
   }, []);
 
+  // 插件启用开关：走插件中心 API，与插件卡片行为一致；
+  // enabled 与 /admin/subtitle/settings 是同一底层值，两组缓存都要刷新。
+  const pluginToggleMutation = useMutation({
+    mutationFn: (enabled: boolean) => pluginApi.setEnabled(PLUGIN_ID, enabled),
+    onSuccess: (next) => {
+      queryClient.setQueryData<PluginInfo[]>(['admin', 'plugins'], (old) =>
+        (old ?? []).map((it) => (it.id === next.id ? next : it)),
+      );
+      queryClient.invalidateQueries({ queryKey: ['admin', 'subtitle'] });
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error
+        ?? (err as { message?: string })?.message
+        ?? '操作失败';
+      alert(msg);
+    },
+  });
+
+  const pluginEnabled = pluginInfo?.enabled ?? settings?.enabled ?? false;
+
+  function handlePluginToggle() {
+    if (pluginToggleMutation.isPending) return;
+    if (pluginEnabled && !confirm('停用「字幕 Worker」插件？停用后字幕端点将返回 503，worker 不再领取任务。')) {
+      return;
+    }
+    pluginToggleMutation.mutate(!pluginEnabled);
+  }
+
   const retryMutation = useMutation({
     mutationFn: (mediaId: string) => subtitleApi.retry(mediaId),
     onSuccess: () => {
@@ -179,7 +225,7 @@ export function AdminSubtitlesPage() {
   // 批量禁用 / 取消 / 删除：三者共用一个轻量 mutation，
   // 调用时通过 op 参数路由到对应 service 方法，便于在按钮上展示统一的"处理中"态。
   const batchOpMutation = useMutation({
-    mutationFn: async ({ op, mediaIds, disabled }: {
+    mutationFn: async ({ op, mediaIds }: {
       op: 'disable' | 'enable' | 'cancel' | 'delete';
       mediaIds: string[];
       disabled?: boolean;
@@ -227,381 +273,420 @@ export function AdminSubtitlesPage() {
 
   return (
     <div className="px-4 sm:px-6 lg:px-8 py-6 max-w-[1400px] mx-auto">
-      {/* 标题区 */}
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-3">
-          <Subtitles className="w-7 h-7 text-emby-green" />
-          <h1 className="text-2xl font-semibold text-white">字幕管理</h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => {
-              refetch();
-              refetchQueue();
-            }}
-            className="px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors flex items-center gap-2"
-          >
-            <RefreshCw className="w-4 h-4" /> 刷新
-          </button>
-          <button
-            onClick={() => setShowSettings(true)}
-            className="px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors flex items-center gap-2"
-          >
-            <SettingsIcon className="w-4 h-4" /> 配置
-          </button>
-        </div>
-      </div>
-
-      {/* 状态卡 */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
-        <StatCard label="排队中" value={queue?.pending ?? 0} color="text-yellow-400" />
-        <StatCard label="处理中" value={queue?.running ?? 0} color="text-blue-400" />
-        <StatCard label="已完成" value={queue?.done ?? 0} color="text-emby-green" />
-        <StatCard label="失败" value={queue?.failed ?? 0} color="text-red-400" />
-        <StatCard label="已禁用" value={queue?.disabled ?? 0} color="text-emby-text-muted" />
-      </div>
-
-      {/* 远程 worker + token 管理 */}
-      <SubtitleWorkersPanel />
-
-      {/* 配置开关提示 */}
-      {settings && !settings.enabled && (
-        <div className="mb-6 px-4 py-3 rounded-md bg-yellow-900/30 border border-yellow-700/50 text-sm text-yellow-300 flex items-center gap-2">
-          <AlertCircle className="w-4 h-4" />
-          字幕功能未启用，点击右上角"配置"打开设置面板，开启"启用"开关并填写 whisper.cpp / 翻译 API 配置后保存即可生效。
-        </div>
-      )}
-
-      {/* 工具栏 */}
-      <div className="flex flex-wrap items-center gap-3 mb-4">
-        <div className="relative flex-1 min-w-[200px]">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-emby-text-muted" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              setPage(1);
-            }}
-            placeholder="按 mediaId 或标题搜索…"
-            className="w-full pl-10 pr-4 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green text-sm"
-          />
-        </div>
-        <select
-          value={categoryFilter}
-          onChange={(e) => {
-            setCategoryFilter(e.target.value);
-            setPage(1);
-          }}
-          className="px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green min-w-[140px]"
-          aria-label="按分类筛选"
+      {/* 插件页头 */}
+      <div className="mb-6">
+        <Link
+          to="/admin/plugins"
+          className="inline-flex items-center gap-1 text-xs text-emby-text-secondary hover:text-white transition-colors mb-3"
         >
-          <option value="">全部分类</option>
-          <option value="_none">未分类</option>
-          {categories.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </select>
-        <select
-          value={statusFilter}
-          onChange={(e) => {
-            setStatusFilter(e.target.value);
-            setPage(1);
-          }}
-          className="px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green"
-        >
-          {STATUS_FILTERS.map((f) => (
-            <option key={f.value} value={f.value}>
-              {f.label}
-            </option>
-          ))}
-        </select>
-        <button
-          disabled={!settings?.enabled || batchMutation.isPending || selectedIds.size === 0}
-          onClick={() => {
-            const ids = Array.from(selectedIds);
-            if (ids.length === 0) return;
-            if (confirm(`对所选 ${ids.length} 条媒体重新生成字幕？`)) {
-              batchMutation.mutate({ mediaIds: ids });
-            }
-          }}
-          className="px-3 py-2 text-sm rounded-md bg-emby-green text-white hover:bg-emby-green-dark disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
-        >
-          <Play className="w-4 h-4" /> 重新生成所选 ({selectedIds.size})
-        </button>
-        {/* 批量禁用 / 取消 / 删除：仅在选中时启用，统一通过 batchOpMutation 路由 */}
-        <button
-          disabled={!settings?.enabled || batchOpMutation.isPending || selectedIds.size === 0}
-          onClick={() => runBatchOp('disable', `禁用所选 ${selectedIds.size} 条字幕任务？禁用后 worker 将不再处理。`)}
-          className="px-3 py-2 text-sm rounded-md bg-zinc-700 text-white hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
-        >
-          <PauseCircle className="w-4 h-4" /> 禁用所选 ({selectedIds.size})
-        </button>
-        <button
-          disabled={!settings?.enabled || batchOpMutation.isPending || selectedIds.size === 0}
-          onClick={() => runBatchOp('cancel', `取消所选 ${selectedIds.size} 条字幕任务？排队 / 处理中 / 失败的会被标记为已禁用，已完成的不变。`)}
-          className="px-3 py-2 text-sm rounded-md bg-orange-600/80 text-white hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
-        >
-          <XCircle className="w-4 h-4" /> 取消所选 ({selectedIds.size})
-        </button>
-        <button
-          disabled={batchOpMutation.isPending || selectedIds.size === 0}
-          onClick={() => runBatchOp('delete', `删除所选 ${selectedIds.size} 条字幕任务及其 VTT 文件？此操作不可撤销。`)}
-          className="px-3 py-2 text-sm rounded-md bg-red-700/80 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-          title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
-        >
-          <Trash2 className="w-4 h-4" /> 删除所选 ({selectedIds.size})
-        </button>
-        <button
-          disabled={!settings?.enabled || batchMutation.isPending}
-          onClick={() => {
-            if (confirm('重试所有失败任务？')) batchMutation.mutate({ onlyFailed: true });
-          }}
-          className="px-3 py-2 text-sm rounded-md bg-yellow-600/80 text-white hover:bg-yellow-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-        >
-          <RotateCcw className="w-4 h-4" /> 重试全部失败
-        </button>
-        <button
-          disabled={!settings?.enabled || batchMutation.isPending}
-          onClick={() => {
-            const label = categoryFilter === ''
-              ? '全部 ACTIVE 媒体'
-              : categoryFilter === '_none'
-              ? '所有未分类媒体'
-              : `分类 "${categories.find((c) => c.id === categoryFilter)?.name ?? categoryFilter}"`;
-            if (confirm(`对${label}重新生成字幕？这会重置已完成的任务。`)) {
-              if (categoryFilter === '') batchMutation.mutate({ all: true });
-              else batchMutation.mutate({ categoryId: categoryFilter });
-            }
-          }}
-          className="px-3 py-2 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-        >
-          <RefreshCw className="w-4 h-4" />
-          {categoryFilter === '' ? '重新生成全部' : '按当前分类重新生成'}
-        </button>
-      </div>
-
-      {/* 选择条 */}
-      {selectedIds.size > 0 && (
-        <div className="mb-3 px-4 py-2 rounded-md bg-emby-green/10 border border-emby-green/40 text-sm text-white flex items-center gap-3">
-          <span className="text-emby-green font-medium">已选 {selectedIds.size} 条媒体</span>
-          <span className="text-emby-text-secondary text-xs">跨页保留，点"重新生成所选"批量入队</span>
-          <button
-            onClick={clearSelection}
-            className="ml-auto px-2 py-1 rounded text-xs bg-emby-bg-card border border-emby-border hover:bg-emby-bg-elevated text-emby-text-primary flex items-center gap-1"
-          >
-            <X className="w-3 h-3" /> 清空
-          </button>
-        </div>
-      )}
-
-      {/* 列表 */}
-      <div className="bg-emby-bg-card border border-emby-border rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-emby-bg-elevated text-emby-text-secondary text-xs uppercase">
-              <tr>
-                <th className="text-left pl-4 pr-2 py-3 w-10">
-                  <input
-                    type="checkbox"
-                    aria-label="全选当前页"
-                    title="全选当前页"
-                    checked={allCurrentPageSelected}
-                    ref={(el) => {
-                      // 部分选中显示 indeterminate（半选）
-                      if (el) el.indeterminate = !allCurrentPageSelected && someCurrentPageSelected;
-                    }}
-                    onChange={toggleSelectCurrentPage}
-                    disabled={items.length === 0}
-                    className="w-4 h-4 cursor-pointer accent-emby-green"
-                  />
-                </th>
-                <th className="text-left px-4 py-3">媒体</th>
-                <th className="text-left px-4 py-3">分类</th>
-                <th className="text-left px-4 py-3">状态</th>
-                <th className="text-left px-4 py-3">阶段</th>
-                <th className="text-left px-4 py-3">进度</th>
-                <th className="text-left px-4 py-3">语言</th>
-                <th className="text-left px-4 py-3">段落</th>
-                <th className="text-left px-4 py-3">模型</th>
-                <th className="text-left px-4 py-3">更新时间</th>
-                <th className="text-right px-4 py-3">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {isLoading ? (
-                <tr>
-                  <td colSpan={11} className="text-center py-12 text-emby-text-secondary">
-                    <Loader2 className="w-5 h-5 inline animate-spin mr-2" />
-                    加载中...
-                  </td>
-                </tr>
-              ) : items.length === 0 ? (
-                <tr>
-                  <td colSpan={11} className="text-center py-12 text-emby-text-secondary">
-                    暂无字幕任务
-                  </td>
-                </tr>
-              ) : (
-                items.map((job) => {
-                  const checked = selectedIds.has(job.mediaId);
-                  return (
-                  <tr
-                    // MISSING 行的 job.id 为空，用 mediaId 作 key 兜底避免 React 重复 key 警告
-                    key={job.id || `media-${job.mediaId}`}
-                    className={`border-t border-emby-border hover:bg-emby-bg-elevated/50 ${checked ? 'bg-emby-green/5' : ''}`}
-                  >
-                    <td className="pl-4 pr-2 py-3">
-                      <input
-                        type="checkbox"
-                        aria-label={`选择 ${job.mediaTitle ?? job.mediaId}`}
-                        checked={checked}
-                        onChange={() => toggleSelect(job.mediaId)}
-                        className="w-4 h-4 cursor-pointer accent-emby-green"
-                      />
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="text-white font-medium truncate max-w-[280px]" title={job.mediaTitle ?? job.mediaId}>
-                        {job.mediaTitle || '(媒体已删除)'}
-                      </div>
-                      <div className="text-xs text-emby-text-muted font-mono truncate max-w-[280px]" title={job.mediaId}>
-                        {job.mediaId}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-xs text-emby-text-secondary truncate max-w-[140px]" title={job.categoryName ?? '未分类'}>
-                      {job.categoryName ? (
-                        <span className="px-2 py-0.5 rounded bg-emby-bg-elevated border border-emby-border">{job.categoryName}</span>
-                      ) : (
-                        <span className="text-emby-text-muted">未分类</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge status={job.status} />
-                    </td>
-                    <td className="px-4 py-3 text-emby-text-secondary">
-                      {STAGE_LABELS[job.stage] ?? job.stage}
-                    </td>
-                    <td className="px-4 py-3">
-                      <ProgressBar value={job.progress} status={job.status} />
-                    </td>
-                    <td className="px-4 py-3 text-emby-text-secondary text-xs">
-                      {job.sourceLang} → {job.targetLang}
-                    </td>
-                    <td className="px-4 py-3 text-emby-text-secondary tabular-nums">{job.segmentCount}</td>
-                    <td className="px-4 py-3 text-xs text-emby-text-muted">
-                      {job.asrModel && <div className="truncate max-w-[160px]" title={job.asrModel}>ASR: {job.asrModel}</div>}
-                      {job.mtModel && <div className="truncate max-w-[160px]" title={job.mtModel}>MT: {job.mtModel}</div>}
-                    </td>
-                    <td className="px-4 py-3 text-emby-text-secondary text-xs">
-                      {new Date(job.updatedAt).toLocaleString('zh-CN')}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => setDetailJob(job)}
-                          title="任务详情"
-                          className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary transition-colors"
-                        >
-                          <Eye className="w-4 h-4" />
-                        </button>
-                        {job.status === 'FAILED' && (
-                          <button
-                            onClick={() => setErrorDetail(job)}
-                            title="查看错误"
-                            className="p-1.5 rounded hover:bg-red-900/40 text-red-400 transition-colors"
-                          >
-                            <AlertCircle className="w-4 h-4" />
-                          </button>
-                        )}
-                        <button
-                          disabled={!settings?.enabled || job.status === 'RUNNING'}
-                          onClick={() => retryMutation.mutate(job.mediaId)}
-                          title="重新生成"
-                          className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                        >
-                          <RotateCcw className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() =>
-                            setDisabledMutation.mutate({
-                              mediaId: job.mediaId,
-                              disabled: job.status !== 'DISABLED',
-                            })
-                          }
-                          title={job.status === 'DISABLED' ? '启用' : '禁用'}
-                          className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary transition-colors"
-                        >
-                          <PauseCircle className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => {
-                            if (confirm('删除此字幕任务和已生成的 VTT 文件？')) {
-                              deleteMutation.mutate(job.mediaId);
-                            }
-                          }}
-                          title="删除"
-                          className="p-1.5 rounded hover:bg-red-900/40 text-red-400 transition-colors"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* 分页 */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-emby-border bg-emby-bg-elevated/40 text-sm">
-          <div className="flex items-center gap-2 text-emby-text-secondary">
-            共 {data?.total ?? 0} 条
-            <select
-              value={pageSize}
-              onChange={(e) => {
-                setPageSize(Number(e.target.value));
-                setPage(1);
-              }}
-              className="ml-2 px-2 py-1 bg-emby-bg-input border border-emby-border rounded text-xs text-white"
-            >
-              <option value={10}>10</option>
-              <option value={20}>20</option>
-              <option value={50}>50</option>
-              <option value={100}>100</option>
-              <option value={200}>200</option>
-              <option value={500}>500</option>
-              <option value={1000}>1000</option>
-            </select>
-            条/页
+          <ArrowLeft className="w-3.5 h-3.5" /> 返回插件中心
+        </Link>
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-3">
+            <Subtitles className="w-7 h-7 text-emby-green" />
+            <h1 className="text-2xl font-semibold text-white">{pluginInfo?.name ?? '字幕 Worker'}</h1>
+            <span className="px-1.5 py-0.5 text-[10px] rounded bg-emby-bg-card border border-emby-border text-emby-text-secondary font-mono">
+              {pluginInfo?.version ?? 'v3'}
+            </span>
+            <Toggle
+              checked={pluginEnabled}
+              pending={pluginToggleMutation.isPending}
+              onToggle={handlePluginToggle}
+              label={pluginEnabled ? '停用插件' : '启用插件'}
+            />
           </div>
           <div className="flex items-center gap-2">
             <button
-              disabled={page <= 1}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              className="px-3 py-1 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              onClick={() => {
+                refetch();
+                refetchQueue();
+              }}
+              className="px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors flex items-center gap-2"
             >
-              上一页
+              <RefreshCw className="w-4 h-4" /> 刷新
             </button>
-            <span className="text-emby-text-secondary">
-              第 {page} / {totalPages} 页
-            </span>
             <button
-              disabled={page >= totalPages}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              className="px-3 py-1 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              onClick={() => setShowSettings(true)}
+              className="px-3 py-1.5 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated transition-colors flex items-center gap-2"
             >
-              下一页
+              <SettingsIcon className="w-4 h-4" /> 配置
             </button>
           </div>
         </div>
       </div>
+
+      {/* 配置开关提示（跨 Tab 显示） */}
+      {settings && !settings.enabled && (
+        <div className="mb-6 px-4 py-3 rounded-md bg-yellow-900/30 border border-yellow-700/50 text-sm text-yellow-300 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4" />
+          插件未启用，打开页头的开关启用后，在右上角「配置」中填写 whisper.cpp / 翻译 API 参数即可使用。
+        </div>
+      )}
+
+      {/* Tab 切换 */}
+      <div className="flex items-center gap-1 mb-6 border-b border-emby-border">
+        <TabButton
+          active={tab === 'jobs'}
+          onClick={() => setTab('jobs')}
+          icon={<ListChecks className="w-4 h-4" />}
+          label="任务管理"
+        />
+        <TabButton
+          active={tab === 'workers'}
+          onClick={() => setTab('workers')}
+          icon={<Cpu className="w-4 h-4" />}
+          label="Worker 节点"
+        />
+      </div>
+
+      {tab === 'workers' && (
+        /* 远程 worker + token 管理 */
+        <SubtitleWorkersPanel />
+      )}
+
+      {tab === 'jobs' && (
+        <>
+          {/* 状态卡 */}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+            <StatCard label="排队中" value={queue?.pending ?? 0} color="text-yellow-400" />
+            <StatCard label="处理中" value={queue?.running ?? 0} color="text-blue-400" />
+            <StatCard label="已完成" value={queue?.done ?? 0} color="text-emby-green" />
+            <StatCard label="失败" value={queue?.failed ?? 0} color="text-red-400" />
+            <StatCard label="已禁用" value={queue?.disabled ?? 0} color="text-emby-text-muted" />
+          </div>
+
+          {/* 工具栏 */}
+          <div className="flex flex-wrap items-center gap-3 mb-4">
+            <div className="relative flex-1 min-w-[200px]">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-emby-text-muted" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => {
+                  setSearch(e.target.value);
+                  setPage(1);
+                }}
+                placeholder="按 mediaId 或标题搜索…"
+                className="w-full pl-10 pr-4 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white placeholder-emby-text-muted focus:outline-none focus:ring-2 focus:ring-emby-green text-sm"
+              />
+            </div>
+            <select
+              value={categoryFilter}
+              onChange={(e) => {
+                setCategoryFilter(e.target.value);
+                setPage(1);
+              }}
+              className="px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green min-w-[140px]"
+              aria-label="按分类筛选"
+            >
+              <option value="">全部分类</option>
+              <option value="_none">未分类</option>
+              {categories.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+            <select
+              value={statusFilter}
+              onChange={(e) => {
+                setStatusFilter(e.target.value);
+                setPage(1);
+              }}
+              className="px-3 py-2 bg-emby-bg-input border border-emby-border rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emby-green"
+            >
+              {STATUS_FILTERS.map((f) => (
+                <option key={f.value} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+            <button
+              disabled={!settings?.enabled || batchMutation.isPending || selectedIds.size === 0}
+              onClick={() => {
+                const ids = Array.from(selectedIds);
+                if (ids.length === 0) return;
+                if (confirm(`对所选 ${ids.length} 条媒体重新生成字幕？`)) {
+                  batchMutation.mutate({ mediaIds: ids });
+                }
+              }}
+              className="px-3 py-2 text-sm rounded-md bg-emby-green text-white hover:bg-emby-green-dark disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+              title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+            >
+              <Play className="w-4 h-4" /> 重新生成所选 ({selectedIds.size})
+            </button>
+            {/* 批量禁用 / 取消 / 删除：仅在选中时启用，统一通过 batchOpMutation 路由 */}
+            <button
+              disabled={!settings?.enabled || batchOpMutation.isPending || selectedIds.size === 0}
+              onClick={() => runBatchOp('disable', `禁用所选 ${selectedIds.size} 条字幕任务？禁用后 worker 将不再处理。`)}
+              className="px-3 py-2 text-sm rounded-md bg-zinc-700 text-white hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+              title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+            >
+              <PauseCircle className="w-4 h-4" /> 禁用所选 ({selectedIds.size})
+            </button>
+            <button
+              disabled={!settings?.enabled || batchOpMutation.isPending || selectedIds.size === 0}
+              onClick={() => runBatchOp('cancel', `取消所选 ${selectedIds.size} 条字幕任务？排队 / 处理中 / 失败的会被标记为已禁用，已完成的不变。`)}
+              className="px-3 py-2 text-sm rounded-md bg-orange-600/80 text-white hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+              title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+            >
+              <XCircle className="w-4 h-4" /> 取消所选 ({selectedIds.size})
+            </button>
+            <button
+              disabled={batchOpMutation.isPending || selectedIds.size === 0}
+              onClick={() => runBatchOp('delete', `删除所选 ${selectedIds.size} 条字幕任务及其 VTT 文件？此操作不可撤销。`)}
+              className="px-3 py-2 text-sm rounded-md bg-red-700/80 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+              title={selectedIds.size === 0 ? '请先勾选要处理的媒体' : `已选 ${selectedIds.size} 条`}
+            >
+              <Trash2 className="w-4 h-4" /> 删除所选 ({selectedIds.size})
+            </button>
+            <button
+              disabled={!settings?.enabled || batchMutation.isPending}
+              onClick={() => {
+                if (confirm('重试所有失败任务？')) batchMutation.mutate({ onlyFailed: true });
+              }}
+              className="px-3 py-2 text-sm rounded-md bg-yellow-600/80 text-white hover:bg-yellow-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+            >
+              <RotateCcw className="w-4 h-4" /> 重试全部失败
+            </button>
+            <button
+              disabled={!settings?.enabled || batchMutation.isPending}
+              onClick={() => {
+                const label = categoryFilter === ''
+                  ? '全部 ACTIVE 媒体'
+                  : categoryFilter === '_none'
+                  ? '所有未分类媒体'
+                  : `分类 "${categories.find((c) => c.id === categoryFilter)?.name ?? categoryFilter}"`;
+                if (confirm(`对${label}重新生成字幕？这会重置已完成的任务。`)) {
+                  if (categoryFilter === '') batchMutation.mutate({ all: true });
+                  else batchMutation.mutate({ categoryId: categoryFilter });
+                }
+              }}
+              className="px-3 py-2 text-sm rounded-md bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+            >
+              <RefreshCw className="w-4 h-4" />
+              {categoryFilter === '' ? '重新生成全部' : '按当前分类重新生成'}
+            </button>
+          </div>
+
+          {/* 选择条 */}
+          {selectedIds.size > 0 && (
+            <div className="mb-3 px-4 py-2 rounded-md bg-emby-green/10 border border-emby-green/40 text-sm text-white flex items-center gap-3">
+              <span className="text-emby-green font-medium">已选 {selectedIds.size} 条媒体</span>
+              <span className="text-emby-text-secondary text-xs">跨页保留，点"重新生成所选"批量入队</span>
+              <button
+                onClick={clearSelection}
+                className="ml-auto px-2 py-1 rounded text-xs bg-emby-bg-card border border-emby-border hover:bg-emby-bg-elevated text-emby-text-primary flex items-center gap-1"
+              >
+                <X className="w-3 h-3" /> 清空
+              </button>
+            </div>
+          )}
+
+          {/* 列表 */}
+          <div className="bg-emby-bg-card border border-emby-border rounded-lg overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-emby-bg-elevated text-emby-text-secondary text-xs uppercase">
+                  <tr>
+                    <th className="text-left pl-4 pr-2 py-3 w-10">
+                      <input
+                        type="checkbox"
+                        aria-label="全选当前页"
+                        title="全选当前页"
+                        checked={allCurrentPageSelected}
+                        ref={(el) => {
+                          // 部分选中显示 indeterminate（半选）
+                          if (el) el.indeterminate = !allCurrentPageSelected && someCurrentPageSelected;
+                        }}
+                        onChange={toggleSelectCurrentPage}
+                        disabled={items.length === 0}
+                        className="w-4 h-4 cursor-pointer accent-emby-green"
+                      />
+                    </th>
+                    <th className="text-left px-4 py-3">媒体</th>
+                    <th className="text-left px-4 py-3">分类</th>
+                    <th className="text-left px-4 py-3">状态</th>
+                    <th className="text-left px-4 py-3">阶段</th>
+                    <th className="text-left px-4 py-3">进度</th>
+                    <th className="text-left px-4 py-3">语言</th>
+                    <th className="text-left px-4 py-3">段落</th>
+                    <th className="text-left px-4 py-3">模型</th>
+                    <th className="text-left px-4 py-3">更新时间</th>
+                    <th className="text-right px-4 py-3">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {isLoading ? (
+                    <tr>
+                      <td colSpan={11} className="text-center py-12 text-emby-text-secondary">
+                        <Loader2 className="w-5 h-5 inline animate-spin mr-2" />
+                        加载中...
+                      </td>
+                    </tr>
+                  ) : items.length === 0 ? (
+                    <tr>
+                      <td colSpan={11} className="text-center py-12 text-emby-text-secondary">
+                        暂无字幕任务
+                      </td>
+                    </tr>
+                  ) : (
+                    items.map((job) => {
+                      const checked = selectedIds.has(job.mediaId);
+                      return (
+                      <tr
+                        // MISSING 行的 job.id 为空，用 mediaId 作 key 兜底避免 React 重复 key 警告
+                        key={job.id || `media-${job.mediaId}`}
+                        className={`border-t border-emby-border hover:bg-emby-bg-elevated/50 ${checked ? 'bg-emby-green/5' : ''}`}
+                      >
+                        <td className="pl-4 pr-2 py-3">
+                          <input
+                            type="checkbox"
+                            aria-label={`选择 ${job.mediaTitle ?? job.mediaId}`}
+                            checked={checked}
+                            onChange={() => toggleSelect(job.mediaId)}
+                            className="w-4 h-4 cursor-pointer accent-emby-green"
+                          />
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="text-white font-medium truncate max-w-[280px]" title={job.mediaTitle ?? job.mediaId}>
+                            {job.mediaTitle || '(媒体已删除)'}
+                          </div>
+                          <div className="text-xs text-emby-text-muted font-mono truncate max-w-[280px]" title={job.mediaId}>
+                            {job.mediaId}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-emby-text-secondary truncate max-w-[140px]" title={job.categoryName ?? '未分类'}>
+                          {job.categoryName ? (
+                            <span className="px-2 py-0.5 rounded bg-emby-bg-elevated border border-emby-border">{job.categoryName}</span>
+                          ) : (
+                            <span className="text-emby-text-muted">未分类</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <StatusBadge status={job.status} />
+                        </td>
+                        <td className="px-4 py-3 text-emby-text-secondary">
+                          {STAGE_LABELS[job.stage] ?? job.stage}
+                        </td>
+                        <td className="px-4 py-3">
+                          <ProgressBar value={job.progress} status={job.status} />
+                        </td>
+                        <td className="px-4 py-3 text-emby-text-secondary text-xs">
+                          {job.sourceLang} → {job.targetLang}
+                        </td>
+                        <td className="px-4 py-3 text-emby-text-secondary tabular-nums">{job.segmentCount}</td>
+                        <td className="px-4 py-3 text-xs text-emby-text-muted">
+                          {job.asrModel && <div className="truncate max-w-[160px]" title={job.asrModel}>ASR: {job.asrModel}</div>}
+                          {job.mtModel && <div className="truncate max-w-[160px]" title={job.mtModel}>MT: {job.mtModel}</div>}
+                        </td>
+                        <td className="px-4 py-3 text-emby-text-secondary text-xs">
+                          {new Date(job.updatedAt).toLocaleString('zh-CN')}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center justify-end gap-1">
+                            <button
+                              onClick={() => setDetailJob(job)}
+                              title="任务详情"
+                              className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary transition-colors"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+                            {job.status === 'FAILED' && (
+                              <button
+                                onClick={() => setErrorDetail(job)}
+                                title="查看错误"
+                                className="p-1.5 rounded hover:bg-red-900/40 text-red-400 transition-colors"
+                              >
+                                <AlertCircle className="w-4 h-4" />
+                              </button>
+                            )}
+                            <button
+                              disabled={!settings?.enabled || job.status === 'RUNNING'}
+                              onClick={() => retryMutation.mutate(job.mediaId)}
+                              title="重新生成"
+                              className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                            >
+                              <RotateCcw className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() =>
+                                setDisabledMutation.mutate({
+                                  mediaId: job.mediaId,
+                                  disabled: job.status !== 'DISABLED',
+                                })
+                              }
+                              title={job.status === 'DISABLED' ? '启用' : '禁用'}
+                              className="p-1.5 rounded hover:bg-emby-bg-elevated text-emby-text-secondary transition-colors"
+                            >
+                              <PauseCircle className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (confirm('删除此字幕任务和已生成的 VTT 文件？')) {
+                                  deleteMutation.mutate(job.mediaId);
+                                }
+                              }}
+                              title="删除"
+                              className="p-1.5 rounded hover:bg-red-900/40 text-red-400 transition-colors"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* 分页 */}
+            <div className="flex items-center justify-between px-4 py-3 border-t border-emby-border bg-emby-bg-elevated/40 text-sm">
+              <div className="flex items-center gap-2 text-emby-text-secondary">
+                共 {data?.total ?? 0} 条
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    setPage(1);
+                  }}
+                  className="ml-2 px-2 py-1 bg-emby-bg-input border border-emby-border rounded text-xs text-white"
+                >
+                  <option value={10}>10</option>
+                  <option value={20}>20</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={200}>200</option>
+                  <option value={500}>500</option>
+                  <option value={1000}>1000</option>
+                </select>
+                条/页
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  disabled={page <= 1}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  className="px-3 py-1 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  上一页
+                </button>
+                <span className="text-emby-text-secondary">
+                  第 {page} / {totalPages} 页
+                </span>
+                <button
+                  disabled={page >= totalPages}
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  className="px-3 py-1 rounded bg-emby-bg-card border border-emby-border text-emby-text-primary hover:bg-emby-bg-elevated disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* 错误详情弹窗 */}
       {errorDetail && (
@@ -656,6 +741,33 @@ export function AdminSubtitlesPage() {
         />
       )}
     </div>
+  );
+}
+
+/** Tab 切换按钮（下划线风格）。 */
+function TabButton({
+  active,
+  onClick,
+  icon,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-4 py-2.5 text-sm flex items-center gap-2 border-b-2 -mb-px transition-colors ${
+        active
+          ? 'border-emby-green text-white font-medium'
+          : 'border-transparent text-emby-text-secondary hover:text-white'
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
   );
 }
 
@@ -758,7 +870,7 @@ function SubtitleSettingsModal({
 }) {
   // 受控表单。初始值用服务端最新配置；翻译 API Key 字段保留服务端脱敏占位，
   // 用户没改时不会回传，避免覆盖真实值（service 端也对 "***" 做了忽略保护）。
-  const [enabled, setEnabled] = useState(settings.enabled);
+  // 注：启用开关已上移到插件页头 / 插件中心卡片，这里只管 whisper / 翻译参数。
   const [whisperBin, setWhisperBin] = useState(settings.whisperBin);
   const [whisperModel, setWhisperModel] = useState(settings.whisperModel);
   const [whisperLanguage, setWhisperLanguage] = useState(settings.whisperLanguage);
@@ -789,7 +901,6 @@ function SubtitleSettingsModal({
     const patch: SubtitleSettingsUpdate = {};
 
     // 仅在和服务端值不同的字段加入 patch，减少误覆盖
-    if (enabled !== settings.enabled) patch.enabled = enabled;
     if (whisperBin !== settings.whisperBin) patch.whisperBin = whisperBin;
     if (whisperModel !== settings.whisperModel) patch.whisperModel = whisperModel;
     if (whisperLanguage !== settings.whisperLanguage) patch.whisperLanguage = whisperLanguage;
@@ -836,16 +947,6 @@ function SubtitleSettingsModal({
   return (
     <Modal onClose={onClose} title="字幕配置（网页编辑）">
       <form onSubmit={handleSubmit} className="space-y-4 text-sm">
-        {/* 开关组 */}
-        <div className="grid grid-cols-1 gap-3">
-          <ToggleRow
-            label="启用字幕生成"
-            hint="关闭后所有字幕端点返回 503，worker 不消费任务。启用后字幕仅在管理员手动选中并点击「重新生成所选」时才会入队。"
-            checked={enabled}
-            onChange={setEnabled}
-          />
-        </div>
-
         {/* Whisper.cpp */}
         <fieldset className="border border-emby-border rounded-md p-3 space-y-3">
           <legend className="px-2 text-xs text-emby-text-secondary">whisper.cpp（本地 ASR）</legend>
@@ -968,7 +1069,7 @@ function SubtitleSettingsModal({
 
         <p className="text-xs text-emby-text-muted">
           配置即时生效，下一条字幕任务即应用新值；不会中断正在运行的任务。
-          部署相关字段（如本地 worker 开关、心跳超时）仍由 .env 控制。
+          插件启用/停用在页头或插件中心的开关处控制；部署相关字段（如本地 worker 开关、心跳超时）仍由 .env 控制。
         </p>
 
         <div className="flex justify-end gap-2 pt-2">
@@ -1002,33 +1103,6 @@ function FieldRow({ label, hint, children }: { label: string; hint?: string; chi
       <div className="text-emby-text-secondary text-xs mb-1">{label}</div>
       {children}
       {hint && <div className="text-[11px] text-emby-text-muted mt-1">{hint}</div>}
-    </label>
-  );
-}
-
-function ToggleRow({
-  label,
-  hint,
-  checked,
-  onChange,
-}: {
-  label: string;
-  hint?: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <label className="flex items-start gap-3 px-3 py-2 rounded-md bg-emby-bg-input border border-emby-border cursor-pointer">
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 w-4 h-4 accent-emby-green cursor-pointer"
-      />
-      <div className="flex-1">
-        <div className="text-white text-sm">{label}</div>
-        {hint && <div className="text-[11px] text-emby-text-muted mt-0.5">{hint}</div>}
-      </div>
     </label>
   );
 }
@@ -1214,7 +1288,6 @@ function PhaseBlock({
         {stages.map((s, idx) => {
           const isPast = phaseDone || (currentInPhaseIdx >= 0 && idx < currentInPhaseIdx);
           const isCur = currentInPhaseIdx === idx && !phaseDone;
-          const isFuture = !isPast && !isCur;
           return (
             <div key={s} className="flex items-center gap-1">
               <span
@@ -1229,7 +1302,7 @@ function PhaseBlock({
               <span
                 className={`text-[11px] ${
                   isPast ? 'text-white' : isCur ? 'text-white font-medium' : 'text-emby-text-muted'
-                } ${isFuture ? '' : ''}`}
+                }`}
               >
                 {stageLabels[s] ?? s}
               </span>

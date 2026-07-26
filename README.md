@@ -13,6 +13,7 @@ M3u8Preview 的 Go 版**全栈**项目（Gin 后端 + React/Vite 前端 + nginx�
   - [m3u8-preview-worker](../m3u8-preview-worker) — GPU 机：通过服务端 broker 实时拉 FLAC + ASR + 翻译 + 写 VTT
   - 服务端只做任务派发 + broker 实时桥接（**0 持久化音频文件**）+ VTT 仓库；保留本地 whisper.cpp 兼容模式
   - 协议详见 [`docs/worker-protocol.md`](docs/worker-protocol.md)；架构详见 [`m3u8-preview-worker/docs/distributed-worker.md`](../m3u8-preview-worker/docs/distributed-worker.md)
+- **插件中心**：可选功能模块统一以插件形式管理（`internal/plugin` 编译期注册表 + admin 启用开关 + 运行状态摘要），字幕 worker 是第一个插件，入口 `/admin/plugins`
 - **高可用**（可选）：两台 VPS 主备自动切换 —— LiteFS 复制 SQLite + Cloudflare DNS TXT 租约仲裁，不需要第三台机器。不启用时完全是单机部署，见 [`docs/ha-failover.md`](docs/ha-failover.md)
 - **目标**：单仓库一键 `docker compose up` 即获得完整服务
 
@@ -119,7 +120,7 @@ docker compose -f docker-compose.dev.yml up --build
 
 ## 版本号
 
-单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.1.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
+单一事实来源是仓库根目录的 **`VERSION`** 文件（当前 `0.2.0`）。前后端同镜像发布，这一个版本号覆盖两端；`web/*/package.json` 里的 version 不参与，改它没有任何效果。
 
 **发版时只需改 `VERSION` 一个文件**，其余全部自动：
 
@@ -132,7 +133,7 @@ docker compose -f docker-compose.dev.yml up --build
 三者由 `-ldflags -X` 注入 `internal/version` 包，通过无鉴权的 `GET /api/health` 暴露：
 
 ```json
-{ "status": "ok", "version": "0.1.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
+{ "status": "ok", "version": "0.2.0", "commit": "877c77a", "buildTime": "2026-07-26T14:30:00Z" }
 ```
 
 ### 显示位置
@@ -379,6 +380,7 @@ m3u8-preview-go/
 │   │   └── resolve.go          # 开机角色决议（"谁是主"的唯一判定入口）
 │   ├── handler/                # HTTP handlers（按模块拆分）
 │   │   ├── health.go           # /api/health：版本 + 主备角色 + 复制位点
+│   │   ├── plugin.go           # /admin/plugins 插件中心端点
 │   │   ├── subtitle.go         # /subtitle/* + /admin/subtitle/* 端点
 │   │   └── subtitle_worker.go  # /worker/* 端点（远程 GPU worker）
 │   ├── litefs/                 # 读 .primary / <db>-pos 感知角色；写闸门唯一收口
@@ -389,6 +391,8 @@ m3u8-preview-go/
 │   │   ├── subtitle.go         # subtitle_jobs + subtitle_vtts 表
 │   │   └── subtitle_worker.go  # subtitle_workers / subtitle_worker_tokens 表
 │   ├── parser/                 # CSV / Excel / JSON / Text 导入解析
+│   ├── plugin/                 # 插件中心：Plugin 接口 + 编译期注册表
+│   │   └── subtitle_worker.go  # 字幕 worker 插件适配器（包装 SubtitleService）
 │   ├── service/                # 业务层（无依赖 Gin）
 │   │   ├── subtitle.go         # 字幕任务调度 + 远程 worker 协议实现
 │   │   ├── subtitle_vtt.go     # 字幕正文存取（写双份 / 读优先库 / 幂等回填）
@@ -421,7 +425,9 @@ m3u8-preview-go/
 │           ├── components/HaSwitchingBanner.tsx           # 主备切换提示条
 │           ├── components/admin/SubtitleWorkersPanel.tsx  # 在线 worker / token 面板
 │           ├── components/admin/SystemInfoCard.tsx        # 版本 / 提交 / 构建时间 / 节点角色
-│           ├── pages/AdminSubtitlesPage.tsx               # 字幕任务管理面板
+│           ├── pages/PluginCenterPage.tsx                 # 插件中心（卡片 + 启用开关 + 状态摘要）
+│           ├── pages/SubtitleWorkerPluginPage.tsx         # 字幕 Worker 插件详情页（任务管理 / Worker 节点）
+│           ├── services/pluginApi.ts                      # 插件注册表前端 API
 │           ├── services/subtitleApi.ts                    # 字幕相关前端 API
 │           ├── components/ hooks/ pages/ services/ stores/
 │           └── main.tsx
@@ -456,6 +462,7 @@ m3u8-preview-go/
 | `/api/v1/import/*` | preview / execute / logs / template |
 | `/api/v1/proxy/sign`、`/proxy/m3u8` | HMAC 签名 + SSRF 代理 |
 | `/api/v1/subtitle/:mediaId/status`、`/subtitle/vtt/:mediaId` | 字幕状态查询 + HMAC 签名 VTT 拉取 |
+| `/api/v1/admin/plugins` | **插件中心**：插件列表（meta + 启用状态 + 运行状态摘要）/ `PUT /:id/enabled` 启用开关 |
 | `/api/v1/admin/subtitle/*` | 字幕任务列表 / 详情 / 重试 / 删除 / 禁用 / 批量重生 / 队列概况 / 配置回显 / 在线 worker / worker token CRUD |
 | `/api/v1/worker/*` | **远程字幕 worker 专用**：register / claim / heartbeat / complete / fail / retry（`mwt_xxx` Bearer 鉴权） |
 | `/api/v1/admin/*` | dashboard / users / settings / media batch / activity / thumbnails / posters / backup |
@@ -557,7 +564,7 @@ m3u8-preview-go/
 
 ### 字幕功能（v3 分布式 worker broker 架构）
 
-> 默认架构下，**所有 ASR / 翻译 / 模型 / 默认语言** 等字幕参数都在 admin 面板「字幕管理」中配置，不再走环境变量；此处仅是开关 + 路径 + 心跳超时。
+> 默认架构下，**所有 ASR / 翻译 / 模型 / 默认语言** 等字幕参数都在 admin 面板「插件中心 → 字幕 Worker」中配置，不再走环境变量；此处仅是开关 + 路径 + 心跳超时。
 
 **v3 关键设计**：
 - 任务派发按 worker capabilities：`audio_extract`（下载抽音）/ `asr_subtitle`（ASR + 翻译）
@@ -590,7 +597,7 @@ m3u8-preview-go/
 
 #### Admin UI（v3 新增）
 
-「字幕管理」面板顶部展示：
+「插件中心 → 字幕 Worker → Worker 节点」Tab 展示：
 - **AlertsBar**：自动检测"无 audio worker / subtitle worker 在线 + 有任务等待"等异常并以橙色横幅展示
 - **WorkersOnlineCard**：worker 列表，每条显示 capability badge（蓝色"下载抽音"/ 紫色"ASR 字幕"）
 - **IntermediatePoolCard**：v3 broker 模式标注"FLAC 留 audio worker 本地，服务端 0 落盘"，显示当前等待 ASR 的任务数 + 总字节估算
@@ -864,18 +871,29 @@ docker compose logs -f app | grep '\[subtitle\]'
 
 启动时 worker 会扫描所有 `status=ACTIVE` 的媒体，给没有字幕的逐个入队（单线程 CPU 跑，不会过载）。
 
-### 四、字幕管理面板
+### 四、插件中心与字幕 Worker 插件
 
-管理员登录后访问 `/admin/subtitles`：
+字幕功能以「插件」形式集成。管理员登录后访问 `/admin/plugins`（Header 菜单「插件中心」）：
+
+- 插件卡片：名称 / 版本 / 分类 / 描述 + **启用开关** + 运行状态摘要（在线 Worker、排队/处理中、告警数）
+- 「进入管理」打开插件详情页 `/admin/plugins/subtitle-worker`（旧地址 `/admin/subtitles` 自动跳转）
+
+插件详情页分两个 Tab：
+
+**任务管理 Tab**：
 
 - 顶部 5 张状态卡：排队中 / 处理中 / 已完成 / 失败 / 已禁用 计数
 - 列表分页 + **分类筛选** + 状态筛选 + 搜索（按 mediaId 或标题）
 - **行勾选 + 全选当前页（带 indeterminate 半选态）+ 跨页保留选择**
 - 每行操作：**重新生成 / 禁用切换 / 删除（含 VTT 文件）/ 失败时查看错误信息**
 - 顶部按钮：**重新生成所选（按 mediaId 数组）/ 重试全部失败 / 重新生成全部 / 按当前分类重新生成**
-- 配置弹窗：当前生效的 whisper / 翻译配置回显（API Key 已脱敏）
+- 配置弹窗：当前生效的 whisper / 翻译配置回显（API Key 已脱敏）；启用/停用由页头开关控制
+
+**Worker 节点 Tab**：在线 worker 列表 / FLAC 转交队列 / Worker Token 管理（详见上文 Admin UI 小节）。
 
 数据每 5 秒自动刷新，可手动点 "刷新" 立即更新。
+
+> 插件注册表 API：`GET /api/v1/admin/plugins`（列表 + 状态摘要）、`PUT /api/v1/admin/plugins/:id/enabled`（启用开关）。后端在 `internal/plugin` 编译期注册插件，新增可选功能模块可按同一模式接入插件中心。
 
 ### 四.1、播放页字幕设置
 

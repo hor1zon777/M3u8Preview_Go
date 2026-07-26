@@ -30,7 +30,8 @@ import { AdminCategoriesPage } from './pages/AdminCategoriesPage.js';
 import { AdminTagsPage } from './pages/AdminTagsPage.js';
 import { AdminUserDetailPage } from './pages/AdminUserDetailPage.js';
 import { AdminActivityPage } from './pages/AdminActivityPage.js';
-import { AdminSubtitlesPage } from './pages/AdminSubtitlesPage.js';
+import { PluginCenterPage } from './pages/PluginCenterPage.js';
+import { SubtitleWorkerPluginPage } from './pages/SubtitleWorkerPluginPage.js';
 import './index.css';
 import { clearPendingScrollRestore, getPendingScrollRestore, getSavedRouteScrollPosition, buildRouteKey } from './lib/utils.js';
 
@@ -143,7 +144,10 @@ function AppRoutes() {
         <Route path="/admin/media" element={<ProtectedRoute requireAdmin><AdminMediaPage /></ProtectedRoute>} />
         <Route path="/admin/categories" element={<ProtectedRoute requireAdmin><AdminCategoriesPage /></ProtectedRoute>} />
         <Route path="/admin/tags" element={<ProtectedRoute requireAdmin><AdminTagsPage /></ProtectedRoute>} />
-        <Route path="/admin/subtitles" element={<ProtectedRoute requireAdmin><AdminSubtitlesPage /></ProtectedRoute>} />
+        <Route path="/admin/plugins" element={<ProtectedRoute requireAdmin><PluginCenterPage /></ProtectedRoute>} />
+        <Route path="/admin/plugins/subtitle-worker" element={<ProtectedRoute requireAdmin><SubtitleWorkerPluginPage /></ProtectedRoute>} />
+        {/* 旧字幕管理入口：整体迁入插件中心后保留 redirect 兼容书签/旧链接 */}
+        <Route path="/admin/subtitles" element={<Navigate to="/admin/plugins/subtitle-worker" replace />} />
         <Route path="/import" element={<ProtectedRoute requireAdmin><ImportPage /></ProtectedRoute>} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

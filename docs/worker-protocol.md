@@ -19,7 +19,7 @@
 
 ### 1.1 Token 获取
 
-Token 由服务器管理员在 admin 面板「字幕管理 → Worker Token 管理」中生成。
+Token 由服务器管理员在 admin 面板「插件中心 → 字幕 Worker → Worker 节点 → Worker Token 管理」中生成。
 
 - **格式**：`mwt_<base32 32 字符>`，例如 `mwt_abc12345defghi67890jklmnopqrstuv`
 - **明文仅在创建时返回一次**，服务器存储 bcrypt(token) + 前 12 位前缀
